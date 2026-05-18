@@ -8,6 +8,7 @@ import {
   listTree,
   previewUrl
 } from './workspace'
+import { appendObservation, getNow, observationsPath } from './aios'
 
 export interface ToolContext {
   conversationId: string
@@ -353,6 +354,36 @@ export const TOOLS: Record<string, ToolSpec> = {
     example: '<action name="open_preview"></action>',
     mode: 'code',
     run: openPreview
+  },
+  // Patch 16 (AIOS init) — Gemma's persistent observation log + temporal grounding tool
+  aios_observe: {
+    name: 'aios_observe',
+    description:
+      'Save an observation, pattern, or insight to your persistent log (survives across sessions). Use when you notice something worth remembering: a recurring user preference, a useful pattern, an anti-pattern to avoid, a project-context fact, or a self-correction lesson. Brief is good.',
+    params: [
+      {
+        name: 'text',
+        description: 'The observation to record. One or two sentences. Include the WHY when relevant.',
+        required: true,
+        multiline: true
+      }
+    ],
+    example:
+      '<action name="aios_observe">\n<text>Bear prefers single-patch commits over batched ones. Reason: easier rollback and review.</text>\n</action>',
+    mode: 'both',
+    run: async (args, ctx) => {
+      const text = String(args.text ?? '').trim()
+      return appendObservation(text, ctx.conversationId)
+    }
+  },
+  aios_now: {
+    name: 'aios_now',
+    description:
+      'Get the current date, time, and timezone. Use when you need to confirm currency for time-sensitive reasoning, compute elapsed time, or anchor an observation. The system prompt also includes this at session start but may be stale in long conversations.',
+    params: [],
+    example: '<action name="aios_now"></action>',
+    mode: 'both',
+    run: async () => getNow()
   }
 }
 
@@ -401,10 +432,10 @@ function groundingPrinciples(): string {
   return [
     'GROUNDING (read first, applies always)',
     '- You are an honest partner, not a know-it-all. The most valuable thing you can do is be CLEAR about what you actually know vs. what you would be guessing.',
-    '- You do not currently have live web, news, or weather tools. These ARE on the roadmap and will be added. Until then, if asked about current events / "this week" / today\'s prices / real-time anything: say so plainly ("I don\'t have a web tool yet to verify that") and offer what you know from training data instead.',
-    '- Distinguish what you were TRAINED on (qualify as "based on training data through ~[your cutoff]") from what you can OBSERVE now (this conversation, attached images, and the date above).',
+    '- For current events, "this week", today\'s prices, real-time data: if you have a web tool (web_search, fetch_url) USE it to verify before answering. If no web tool is available in this session, say so plainly and offer training-data context instead.',
+    '- Distinguish what you were TRAINED on (qualify as "based on training data through ~[your cutoff]") from what you can OBSERVE now (this conversation, attached images, tool results, and the date above).',
     '- When uncertain, say so explicitly — prefix with "[Uncertain]" or "I\'m not sure, but". Fluent confidence is worth nothing if wrong.',
-    '- Prefer "I don\'t know" or "I can\'t verify that yet" over plausible-sounding invention.'
+    '- Never fabricate specific stories, papers, version numbers, or dates. "I don\'t know" or "I can\'t verify that" beats plausible-sounding invention every time.'
   ].join('\n')
 }
 
@@ -427,10 +458,29 @@ function partnerContext(): string {
   ].join('\n')
 }
 
+/**
+ * Patch 16 (AIOS init): system-prompt awareness of the persistent
+ * observation log + temporal grounding tool. This is Gemma's first
+ * bridge into the broader AIOS pattern surface — observations she
+ * captures here are durable across sessions.
+ */
+function aiosSubsystem(): string {
+  return [
+    'AIOS — your persistent memory beyond this conversation',
+    `- You have an append-only observation log at: ${observationsPath()}`,
+    '- Write to it with `aios_observe` when you notice: a recurring Bear preference, a useful pattern, an anti-pattern to avoid, a project-context fact, a self-correction lesson. Brief entries are best.',
+    '- Use `aios_now` to confirm the current date/time/timezone — useful for long conversations, elapsed-time reasoning, or anchoring observations.',
+    '- Observations survive across sessions. Past Gemma sessions have already written to this file (or will start now). Treat the log as our shared institutional memory.',
+    '- Don\'t spam it: only write what a future Gemma session would genuinely benefit from knowing.'
+  ].join('\n')
+}
+
 export function chatSystemPrompt(enableTools: boolean): string {
   const now = new Date().toISOString()
   const day = new Date().toLocaleDateString('en-US', { weekday: 'long' })
   if (!enableTools) {
+    // No tools mode — no aios_observe/aios_now available, so skip the AIOS
+    // section. Partner context + grounding still apply.
     return [
       "You are Gemma, an AI assistant running 100% locally on the user's Mac.",
       `Current date/time: ${now} (${day}). Timezone: ${tz()}.`,
@@ -449,6 +499,8 @@ export function chatSystemPrompt(enableTools: boolean): string {
     groundingPrinciples(),
     '',
     partnerContext(),
+    '',
+    aiosSubsystem(),
     '',
     'TOOL USE',
     '========',
@@ -481,6 +533,8 @@ export function codeSystemPrompt(workspacePath: string, previewHref: string): st
     groundingPrinciples(),
     '',
     partnerContext(),
+    '',
+    aiosSubsystem(),
     '',
     'WHAT TO BUILD',
     'You build small apps, pages, demos, and scripts. Quality matters — the user is watching.',
