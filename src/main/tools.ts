@@ -8,7 +8,16 @@ import {
   listTree,
   previewUrl
 } from './workspace'
-import { appendObservation, getNow, observationsPath } from './aios'
+import { appendObservation, observationsPath } from './aios'
+import {
+  loadTemporalContext,
+  loadPartnerProfile,
+  risePrinciples,
+  readIppFile,
+  editIppFile,
+  appendIppFile,
+  IPP_FILES
+} from './aios-integration'
 
 export interface ToolContext {
   conversationId: string
@@ -379,11 +388,89 @@ export const TOOLS: Record<string, ToolSpec> = {
   aios_now: {
     name: 'aios_now',
     description:
-      'Get the current date, time, and timezone. Use when you need to confirm currency for time-sensitive reasoning, compute elapsed time, or anchor an observation. The system prompt also includes this at session start but may be stale in long conversations.',
+      'Get the current date, time, timezone, and date-reference map (yesterday, this Monday, last Friday, etc.) from the canonical temporal-intelligence source. Use for time-sensitive reasoning or to refresh in long conversations.',
     params: [],
     example: '<action name="aios_now"></action>',
     mode: 'both',
-    run: async () => getNow()
+    run: async () => {
+      const block = loadTemporalContext()
+      return block || `Current ISO time: ${new Date().toISOString()}`
+    }
+  },
+  // Patch 17 (AIOS integration) — read/write into Bear's intelligence-partner files.
+  // Whitelist enforced in aios-integration.ts; section-based edits only (no full rewrites).
+  ipp_read: {
+    name: 'ipp_read',
+    description: `Read one of Bear's intelligence-partner files in full. Allowed names: ${IPP_FILES.join(', ')}. Use before ipp_edit to find the exact passage to patch.`,
+    params: [
+      {
+        name: 'file',
+        description: `short name without .md (one of: ${IPP_FILES.join(', ')})`,
+        required: true
+      }
+    ],
+    example: '<action name="ipp_read">\n<file>preferences</file>\n</action>',
+    mode: 'both',
+    run: async (args) => readIppFile(String(args.file ?? '').trim())
+  },
+  ipp_append: {
+    name: 'ipp_append',
+    description:
+      'Append a timestamped entry to one of Bear\'s intelligence-partner files (typically `memory` for session learnings). The entry is added at the end under a "## YYYY-MM-DD — Gemma" heading.',
+    params: [
+      {
+        name: 'file',
+        description: `short name without .md (one of: ${IPP_FILES.join(', ')})`,
+        required: true
+      },
+      {
+        name: 'content',
+        description: 'the entry body in markdown',
+        required: true,
+        multiline: true
+      }
+    ],
+    example:
+      '<action name="ipp_append">\n<file>memory</file>\n<content>\nNew preference observed today: Bear wants Gemma to write IPP files herself, not just propose.\n</content>\n</action>',
+    mode: 'both',
+    run: async (args) => {
+      const file = String(args.file ?? '').trim()
+      const content = typeof args.content === 'string' ? args.content : ''
+      return appendIppFile(file, content)
+    }
+  },
+  ipp_edit: {
+    name: 'ipp_edit',
+    description:
+      'Surgical section-based patch on an intelligence-partner file (per IPP ideal #6 — never full rewrites). old_string must appear EXACTLY once. Always ipp_read first to copy the exact text. For soul.md and ideals.md (HIGH/CRITICAL tiers), confirm with Bear before editing.',
+    params: [
+      {
+        name: 'file',
+        description: `short name without .md (one of: ${IPP_FILES.join(', ')})`,
+        required: true
+      },
+      {
+        name: 'old_string',
+        description: 'exact text to replace (must be unique in file)',
+        required: true,
+        multiline: true
+      },
+      {
+        name: 'new_string',
+        description: 'replacement text',
+        required: true,
+        multiline: true
+      }
+    ],
+    example:
+      '<action name="ipp_edit">\n<file>preferences</file>\n<old_string>- Python over shell for anything beyond simple glue.</old_string>\n<new_string>- Python over shell for anything beyond simple glue (TypeScript for Electron-side scripts).</new_string>\n</action>',
+    mode: 'both',
+    run: async (args) => {
+      const file = String(args.file ?? '').trim()
+      const oldStr = typeof args.old_string === 'string' ? args.old_string : ''
+      const newStr = typeof args.new_string === 'string' ? args.new_string : ''
+      return editIppFile(file, oldStr, newStr)
+    }
   }
 }
 
@@ -459,46 +546,82 @@ function partnerContext(): string {
 }
 
 /**
- * Patch 16 (AIOS init): system-prompt awareness of the persistent
- * observation log + temporal grounding tool. This is Gemma's first
- * bridge into the broader AIOS pattern surface — observations she
- * captures here are durable across sessions.
+ * Patch 17 (AIOS integration): bridges Gemma into Bear's existing
+ * subsystems instead of reinventing them. Surfaces:
+ *   - Temporal block from the canonical temporal-intelligence script
+ *   - Reference to the loaded intelligence-partner profile (injected above)
+ *   - Memory tools (ipp_*, aios_observe) and their write boundaries
  */
 function aiosSubsystem(): string {
   return [
-    'AIOS — your persistent memory beyond this conversation',
-    `- You have an append-only observation log at: ${observationsPath()}`,
-    '- Write to it with `aios_observe` when you notice: a recurring Bear preference, a useful pattern, an anti-pattern to avoid, a project-context fact, a self-correction lesson. Brief entries are best.',
-    '- Use `aios_now` to confirm the current date/time/timezone — useful for long conversations, elapsed-time reasoning, or anchoring observations.',
-    '- Observations survive across sessions. Past Gemma sessions have already written to this file (or will start now). Treat the log as our shared institutional memory.',
-    '- Don\'t spam it: only write what a future Gemma session would genuinely benefit from knowing.'
+    'YOUR MEMORY SURFACE',
+    '',
+    'Bear\'s intelligence-partner files (read at chat start, shown in PARTNER PROFILE above): you can WRITE to these.',
+    `- Allowed files: ${IPP_FILES.map((f) => `${f}.md`).join(', ')} — under ~/.intelligence_partner/`,
+    '- Use `ipp_read` to fetch a file in full, `ipp_append` to add a timestamped entry (typical for memory.md), `ipp_edit` for section-based surgical patches.',
+    '- Section-based patches only — never rewrite a whole file. Honor each file\'s own header tier:',
+    '    • memory.md: LOW — append observations freely',
+    '    • preferences.md, comms.md: MEDIUM — propose-then-apply for substantive changes',
+    '    • soul.md, ideals.md: HIGH/CRITICAL — confirm with Bear before editing',
+    '',
+    'Your local scratch notebook (separate from IPP):',
+    `- Append-only log at ${observationsPath()}, written via \`aios_observe\`. Use for ad-hoc notes that don\'t rise to IPP-worthy.`,
+    '',
+    'Temporal grounding:',
+    '- Use `aios_now` to refresh date/time/week-anchors from the canonical temporal-intelligence source.',
+    '',
+    'HARD BOUNDARIES — do not write to:',
+    '- `~/Skills/` (sacrosanct master library)',
+    '- The partnership KG (`kg-arch-enterprise` default DB)',
+    '- IPP via Python scripts (files yes, `partnership_state.py` no — that\'s Bear-and-Claude\'s state machine)'
   ].join('\n')
 }
 
-export function chatSystemPrompt(enableTools: boolean): string {
+function temporalBlock(): string {
+  const block = loadTemporalContext()
+  if (block) return block
+  // Fallback if temporal-intelligence script is unavailable
   const now = new Date().toISOString()
   const day = new Date().toLocaleDateString('en-US', { weekday: 'long' })
+  return `Current date/time: ${now} (${day}). Timezone: ${tz()}.`
+}
+
+function partnerProfileBlock(): string {
+  const body = loadPartnerProfile()
+  if (!body) return ''
+  return ['PARTNER PROFILE (from ~/.intelligence_partner/ — your durable record of Bear)', '', body].join('\n')
+}
+
+export function chatSystemPrompt(enableTools: boolean): string {
   if (!enableTools) {
-    // No tools mode — no aios_observe/aios_now available, so skip the AIOS
-    // section. Partner context + grounding still apply.
+    // No tools mode — IPP tools unavailable, so skip the AIOS subsystem
+    // teach. Temporal + grounding + partner context still apply.
     return [
       "You are Gemma, an AI assistant running 100% locally on the user's Mac.",
-      `Current date/time: ${now} (${day}). Timezone: ${tz()}.`,
+      temporalBlock(),
       '',
       groundingPrinciples(),
       '',
       partnerContext(),
+      '',
+      partnerProfileBlock(),
+      '',
+      risePrinciples(),
       '',
       'Be clear, concise, and helpful. Use markdown for formatting when useful.'
     ].join('\n')
   }
   return [
     "You are Gemma, an AI assistant running 100% locally on the user's Mac.",
-    `Current date/time: ${now} (${day}). Timezone: ${tz()}.`,
+    temporalBlock(),
     '',
     groundingPrinciples(),
     '',
     partnerContext(),
+    '',
+    partnerProfileBlock(),
+    '',
+    risePrinciples(),
     '',
     aiosSubsystem(),
     '',
@@ -524,15 +647,18 @@ export function chatSystemPrompt(enableTools: boolean): string {
 }
 
 export function codeSystemPrompt(workspacePath: string, previewHref: string): string {
-  const now = new Date().toISOString()
-  const day = new Date().toLocaleDateString('en-US', { weekday: 'long' })
   return [
     "You are Gemma, a local coding agent running entirely on the user's Mac.",
-    `Date: ${now} (${day}). Workspace: ${workspacePath}. Preview: ${previewHref}`,
+    `Workspace: ${workspacePath}. Preview: ${previewHref}`,
+    temporalBlock(),
     '',
     groundingPrinciples(),
     '',
     partnerContext(),
+    '',
+    partnerProfileBlock(),
+    '',
+    risePrinciples(),
     '',
     aiosSubsystem(),
     '',
