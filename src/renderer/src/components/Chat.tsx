@@ -207,6 +207,22 @@ export default function Chat({ model, onSwitchModel }: Props) {
     setStreaming(false)
   }
 
+  // Patch 9: invoked from the Reconnect button on an errored assistant
+  // message. Restart the MLX server (main emits setup:status during the
+  // restart, so the Setup screen handles its own visibility), then re-run
+  // the same regenerate path so the user's last message gets a fresh try.
+  async function handleReconnect(): Promise<void> {
+    if (streaming) return
+    try {
+      await window.api.reconnectMLX()
+    } catch {
+      // Main has already emitted a setup:status error event — bail without
+      // regenerating so the user can see what went wrong.
+      return
+    }
+    await handleRegenerate()
+  }
+
   async function handleRegenerate(): Promise<void> {
     if (streaming) return
     const conv = conversations.find((c) => c.id === activeId)
@@ -251,6 +267,7 @@ export default function Chat({ model, onSwitchModel }: Props) {
             streaming={streaming}
             mode={activeConversation.mode}
             onRegenerate={handleRegenerate}
+            onReconnect={handleReconnect}
           />
           <Composer
             onSend={handleSend}
@@ -470,12 +487,14 @@ function MessageList({
   messages,
   streaming,
   mode,
-  onRegenerate
+  onRegenerate,
+  onReconnect
 }: {
   messages: ChatMessage[]
   streaming: boolean
   mode: AgentMode
   onRegenerate: () => void
+  onReconnect: () => void
 }) {
   const ref = useRef<HTMLDivElement>(null)
   const atBottomRef = useRef(true)
@@ -513,6 +532,11 @@ function MessageList({
                 onRegenerate={
                   !streaming && m.role === 'assistant' && i === messages.length - 1
                     ? onRegenerate
+                    : undefined
+                }
+                onReconnect={
+                  !streaming && m.role === 'assistant' && i === messages.length - 1
+                    ? onReconnect
                     : undefined
                 }
               />

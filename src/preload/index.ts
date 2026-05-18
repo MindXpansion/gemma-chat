@@ -12,6 +12,11 @@ const api = {
 
   switchModel: (model: string): Promise<void> => ipcRenderer.invoke('model:switch', model),
 
+  // Patch 9: explicit Reconnect — restart the currently-loaded MLX server
+  // when the model has died or is unresponsive (paired with Patch 7's 90s
+  // timeout error). Main emits setup:status during restart.
+  reconnectMLX: (): Promise<{ ok: true }> => ipcRenderer.invoke('mlx:reconnect'),
+
   checkMLX: (): Promise<{ hasMLX: boolean }> => ipcRenderer.invoke('setup:status'),
 
   onSetupStatus: (cb: (s: SetupStatus) => void): (() => void) => {

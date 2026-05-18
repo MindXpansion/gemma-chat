@@ -94,6 +94,10 @@ function send(channel: string, payload: unknown): void {
 }
 
 let mlxPython: string | null = null
+// Patch 9: remembered so the renderer's "Reconnect" action can restart the
+// same model the user was last running, without round-tripping through the
+// renderer state. Updated whenever startServer succeeds.
+let currentModel: string | null = null
 
 async function ensureMLXRunning(model: string): Promise<string> {
   let mlx = locateMLX()
@@ -134,6 +138,7 @@ async function ensureMLXRunning(model: string): Promise<string> {
       progress: p.progress
     })
   })
+  currentModel = model
   return pythonToUse
 }
 
@@ -508,6 +513,7 @@ app.whenReady().then(async () => {
           progress: p.progress
         })
       })
+      currentModel = model
       send('setup:status', { stage: 'ready', message: 'Ready to chat.' })
     } catch (e) {
       send('setup:status', {
@@ -515,6 +521,32 @@ app.whenReady().then(async () => {
         message: 'Model switch failed',
         error: (e as Error).message
       })
+    }
+  })
+
+  // Patch 9: explicit Reconnect. Surfaces in the renderer when an assistant
+  // message ends with the Patch 7 timeout error (or any "⚠️" error). Stops
+  // any stale MLX subprocess, then starts a fresh one with the model the
+  // user was last running. Same setup:status channel the Setup screen uses,
+  // so progress is visible if a download has to repeat.
+  ipcMain.handle('mlx:reconnect', async () => {
+    if (!currentModel) {
+      throw new Error('No model has been started yet — open Setup and pick a model.')
+    }
+    const label = AVAILABLE_MODELS.find((m) => m.name === currentModel)?.label ?? currentModel
+    send('setup:status', { stage: 'starting-mlx', message: `Reconnecting to ${label}…` })
+    try {
+      await stopServer()
+      await ensureMLXRunning(currentModel)
+      send('setup:status', { stage: 'ready', message: 'Ready to chat.' })
+      return { ok: true }
+    } catch (e) {
+      send('setup:status', {
+        stage: 'error',
+        message: 'Reconnect failed',
+        error: (e as Error).message
+      })
+      throw e
     }
   })
 

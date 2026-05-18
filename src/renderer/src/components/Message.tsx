@@ -8,6 +8,7 @@ interface Props {
   isLast: boolean
   streaming: boolean
   onRegenerate?: () => void
+  onReconnect?: () => void
 }
 
 interface Parsed {
@@ -35,8 +36,13 @@ function parseThinking(content: string): Parsed {
 export default function Message({
   message,
   streaming,
-  onRegenerate
+  onRegenerate,
+  onReconnect
 }: Props) {
+  // Patch 9: an error message from main (Patch 7 timeout, /chat HTTP 500,
+  // etc.) gets appended to the assistant message content prefixed with ⚠️.
+  // When that's present on a settled message, surface the Reconnect button.
+  const hasError = message.done === true && message.content.includes('⚠️')
   const isUser = message.role === 'user'
   const parsed = useMemo(() => parseThinking(message.content), [message.content])
   const html = useMemo(() => {
@@ -99,7 +105,20 @@ export default function Message({
         )}
 
         {onRegenerate && (
-          <div className="mt-2 flex gap-1 opacity-0 transition group-hover:opacity-100">
+          <div
+            className={`mt-2 flex gap-1 transition ${
+              hasError ? 'opacity-100' : 'opacity-0 group-hover:opacity-100'
+            }`}
+          >
+            {hasError && onReconnect && (
+              <button
+                onClick={onReconnect}
+                className="rounded-md border border-amber-400/30 bg-amber-400/10 px-2 py-1 text-[11px] text-amber-200 hover:bg-amber-400/20"
+                title="Restart the model runtime and retry this message"
+              >
+                ⟳ Reconnect
+              </button>
+            )}
             <button
               onClick={onRegenerate}
               className="rounded-md px-2 py-1 text-[11px] text-ink-400 hover:bg-white/5 hover:text-white"
