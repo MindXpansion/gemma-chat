@@ -41,7 +41,7 @@ export type AgentMode = 'chat' | 'code'
 
 export interface ChatRequest {
   conversationId: string
-  messages: Array<{ role: Role; content: string; toolCalls?: ToolCall[] }>
+  messages: Array<{ role: Role; content: string; toolCalls?: ToolCall[]; images?: string[] }>
   model: string
   enableTools: boolean
   mode: AgentMode

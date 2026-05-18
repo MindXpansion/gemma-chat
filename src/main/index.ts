@@ -181,7 +181,9 @@ async function handleChat(req: ChatRequest, channel: string): Promise<void> {
     }
 
     for (const m of req.messages) {
-      baseMessages.push({ role: m.role as MLXChatMessage['role'], content: m.content })
+      const msg: MLXChatMessage = { role: m.role as MLXChatMessage['role'], content: m.content }
+      if (m.images && m.images.length > 0) msg.images = m.images
+      baseMessages.push(msg)
       if (m.toolCalls) {
         for (const tc of m.toolCalls) {
           if (tc.result != null) {

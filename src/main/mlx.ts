@@ -436,11 +436,20 @@ export async function* chatStream(
     headers: { 'content-type': 'application/json' },
     body: JSON.stringify({
       model: opts.model,
-      messages: opts.messages.map((m) => ({
-        role: m.role,
-        content: m.content
-      })),
+      messages: opts.messages.map((m) => {
+        if (!m.images || m.images.length === 0) {
+          return { role: m.role, content: m.content }
+        }
+        // Gemma 4 best practice: images first, text last (per E4B-it model card).
+        const parts: Array<
+          | { type: 'image_url'; image_url: { url: string } }
+          | { type: 'text'; text: string }
+        > = m.images.map((url) => ({ type: 'image_url', image_url: { url } }))
+        if (m.content) parts.push({ type: 'text', text: m.content })
+        return { role: m.role, content: parts }
+      }),
       stream: true,
+      stream_options: { include_usage: true },
       temperature: opts.temperature ?? 0.7,
       max_tokens: 8192
     }),
@@ -465,6 +474,12 @@ export async function* chatStream(
           delta?: { content?: string; role?: string }
           finish_reason?: string | null
         }>
+        usage?: { prompt_tokens?: number; completion_tokens?: number; total_tokens?: number }
+      }
+      // Dev-mode silent-image-drop detector: <50 prompt tokens for an image
+      // request means images were stripped before reaching the model.
+      if (parsed.usage?.prompt_tokens != null) {
+        console.log(`[mlx] usage: prompt=${parsed.usage.prompt_tokens} completion=${parsed.usage.completion_tokens ?? '?'}`)
       }
       const choice = parsed.choices?.[0]
       if (choice?.delta?.content) {
