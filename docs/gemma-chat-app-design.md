@@ -1881,4 +1881,292 @@ Section 6 complete. Section 7 (renderer entry + Setup/Chat/App — the deep dive
 
 ---
 
-## (Sections 7 and 9–10 will be filled in as the file-by-file deep dive continues.)
+# Section 7 — Renderer: Entry, App, Setup, Chat
+
+**Files in this section:**
+- `src/renderer/index.html` (13 lines) — HTML shell + CSP
+- `src/renderer/src/main.tsx` (10 lines) — React entry
+- `src/renderer/src/App.tsx` (161 lines) — top-level state machine, routes between Setup and Chat
+- `src/renderer/src/components/Setup.tsx` (232 lines) — first-run/welcome + the stage progress UI (the lying-spinner screen)
+- `src/renderer/src/components/Chat.tsx` (591 lines) — conversation surface, stream consumer, layout
+
+These four files together are 994 lines and own the entire user-facing experience. Anywhere the user is confused, frustrated, or stuck, the cause lives here or just below in the IPC bridge.
+
+## 7.1 `src/renderer/index.html` — and a correction to §2
+
+```html
+<meta http-equiv="Content-Security-Policy" content="
+  default-src 'self';
+  style-src 'self' 'unsafe-inline';
+  script-src 'self' 'wasm-unsafe-eval' blob:;
+  worker-src 'self' blob:;
+  font-src 'self' data:;
+  img-src 'self' data: https: http://127.0.0.1:*;
+  frame-src http://127.0.0.1:*;
+  connect-src 'self' ws: http://127.0.0.1:*
+    https://huggingface.co https://*.huggingface.co https://*.hf.co
+    https://cdn-lfs.huggingface.co https://cdn.jsdelivr.net;
+" />
+```
+
+**Correction to §2.2:** I claimed there's no CSP anywhere. That was wrong — CSP is set here via meta tag (just not via Electron's `session` API). The policy is real and meaningful:
+
+- `default-src 'self'` — locks down everything by default to same-origin.
+- `style-src 'self' 'unsafe-inline'` — inline styles allowed (Tailwind generates many, plus the workspace HTTP server's placeholder/directory pages use inline styles when rendered in iframes — wait, no, the iframe has its own document, so inline style there is gated by its own CSP, which is none. Still: the renderer-side inline styles are why this is needed).
+- `script-src 'self' 'wasm-unsafe-eval' blob:` — `wasm-unsafe-eval` is for `@huggingface/transformers` WASM kernels; `blob:` is for worker construction.
+- `worker-src 'self' blob:` — same, workers from blob URLs.
+- `font-src 'self' data:` — `data:` URIs for inline fonts.
+- `img-src 'self' data: https: http://127.0.0.1:*` — wildcard `https:` is loose (any HTTPS image) but plausibly needed for `fetch_url` results that contain remote images in chat history. Localhost wildcard covers the workspace HTTP server's served images.
+- `frame-src http://127.0.0.1:*` — the Canvas iframe loads from the workspace server only.
+- `connect-src` — `self`, websockets (for Vite dev HMR), localhost (workspace server), HF domains (model downloads from in-renderer transformers.js if ever used), and `cdn.jsdelivr.net` (likely for the `@huggingface/transformers` package's auxiliary fetches).
+
+**The `img-src https:` wildcard is the only meaningfully loose entry.** Tightening it would require enumerating expected image sources. Captured as low-priority §Hardening — the alternative (block `https:` images outright) is too restrictive for the chat feature.
+
+**No `script-src` permits any external CDN** — all JS executes from the renderer bundle or in-process. Good.
+
+`<div id="root"></div>` + `<script type="module" src="/src/main.tsx"></script>` is standard React/Vite shape.
+
+## 7.2 `src/renderer/src/main.tsx` — React entry
+
+```tsx
+createRoot(document.getElementById('root')!).render(
+  <StrictMode>
+    <App />
+  </StrictMode>
+)
+```
+
+Standard React 19 mount. **StrictMode is on**, which means in dev mode every component renders + cleans up + re-renders to catch subscription bugs. This is relevant for `App.tsx`'s setup-status subscription (§7.3) — the double-render in StrictMode means the subscribe/unsubscribe pair runs twice, which can mask order-of-operations bugs that only surface in production. Worth knowing.
+
+`styles.css` (Tailwind + custom) is imported here.
+
+## 7.3 `src/renderer/src/App.tsx` — the top-level state machine
+
+### State shape (lines 6–11)
+
+```ts
+type AppState =
+  | { phase: 'boot' }
+  | { phase: 'setup'; status: SetupStatus; model: string }
+  | { phase: 'ready'; model: string }
+  | { phase: 'switching'; model: string; toModel: string; status: SetupStatus }
+```
+
+Four phases. Discriminated by `phase`. Stored as a single `useState`.
+
+- **`boot`**: just-mounted, nothing decided. Shows `BootSplash` (a shimmer line).
+- **`setup`**: first-run, install-in-progress, model download, or post-error. Shows `Setup`.
+- **`ready`**: Setup completed; shows `Chat`.
+- **`switching`**: user picked a different model while in `ready`; shows `Chat` (so they keep their context visible) with a modal `SwitchingOverlay`.
+
+### Mount effect (lines 15–73)
+
+Runs once on mount.
+
+1. **Subscribes to `onRawChunk`** — forwards raw model tokens to `console.log('[gemma]', chunk)` for devtools debugging. The only consumer of `chat:raw` (see §2.7).
+2. **Subscribes to `onSetupStatus`** — the meaty handler (lines 23–45):
+   - On `stage === 'ready'`: transition to `ready` phase. If previous was `switching`, use `toModel`; if previous was `setup`, use that model; otherwise fall back to `DEFAULT_MODEL`.
+   - On `stage === 'error'` while `switching`: revert to `ready` with the previous model (so a failed switch doesn't dump the user back to Setup — they keep the model they had).
+   - If currently `switching`: keep `switching` phase, update its `status`.
+   - Otherwise (default for all other transitions): go to `setup` phase.
+3. **Auto-start logic** (lines 47–67):
+   - List local models via `api.listLocalModels()`.
+   - Check if `DEFAULT_MODEL` (or any version-suffixed variant like `DEFAULT_MODEL:v2`) is among them.
+   - If yes, and `api.checkMLX()` reports `hasMLX: true` — auto-start setup immediately (no Welcome screen). State goes to `{ phase: 'setup', stage: 'starting-mlx', ... }`.
+   - If either check fails: stop at `{ stage: 'checking', message: 'Welcome' }` which `Setup.tsx` interprets as "show the Welcome screen."
+4. **Cleanup:** unsubscribes both listeners on unmount.
+
+**StrictMode side-effect:** In dev, the cleanup-then-rerun pattern fires `unsub()` mid-init, then the second mount re-subscribes. This is correct under React 19 — the listeners support repeated subscribe/unsubscribe — but if `api.listLocalModels()` or `api.checkMLX()` is slow, the first call's `setState` may land *after* the second mount's `unsub` already fired, depending on ordering. In practice the listener pattern is robust to this; worth knowing during debugging.
+
+### `handleSwitchModel` (lines 75–87)
+
+Guard: only switches if currently `ready` and the model actually changed. Otherwise transitions to `switching` phase and calls `api.switchModel`. The eventual `setup:status: 'ready'` brings us to `ready` with `toModel`; an `error` brings us back to `ready` with the previous model.
+
+### Render branches (lines 89–128)
+
+- `boot` → `<BootSplash />` (shimmer bar centered)
+- `setup` → `<Setup status model onModelChange onStart />`. `onStart` triggers `api.startSetup(model)` and resets state to `checking`.
+- `switching` → `<Chat>` + `<SwitchingOverlay status>` (a modal with the same progress UI as Setup, but overlaid so the conversation stays visible).
+- `ready` → `<Chat>` alone.
+
+The `key="setup" | "switching" | "chat"` on the outer divs is what triggers the fade-in animations on phase transitions.
+
+### `SwitchingOverlay` (lines 139–161)
+
+Fixed full-screen modal with a backdrop blur. Shows the status message and a progress bar if `progress != null && > 0`. **Identical lying-spinner risk** — if a model switch stalls, this overlay sits on top of the chat indefinitely with no client-side timeout.
+
+## 7.4 `src/renderer/src/components/Setup.tsx` — the lying-spinner UI
+
+### Top-level (`Setup`, lines 23–84)
+
+Two branches:
+1. `status.stage === 'checking' && status.message === 'Welcome'` → render `<WelcomeScreen>`. (This is the magic-message convention to distinguish "the user just opened the app for the first time" from "we're in the middle of a setup operation that's currently in the checking stage." Captured for §Hardening — a real enum/explicit flag would be clearer than the string-match.)
+2. Otherwise → render the "Setting things up" screen with `<StageList>`, optional progress bar, and the error block.
+
+### `WelcomeScreen` (lines 86–156)
+
+The model picker. Renders all four `AVAILABLE_MODELS` with their label, size badge, "Recommended" pill, and description. Selected model gets a brighter border. Bottom button: `Download {selectedLabel} · {selectedSize}` → calls `onStart(selected.name)` which triggers `api.startSetup`.
+
+**Default selected:** `AVAILABLE_MODELS[1]` — the E4B model (matches `DEFAULT_MODEL` in shared types). Defensive — the user can pick any model from the list.
+
+### `StageList` (lines 158–200) — the central UI for the lying spinner
+
+Renders four stages: `installing-mlx`, `starting-mlx`, `downloading-model`, `ready`. For each, computes its visual state by comparing the stage's order index against `order.indexOf(status.stage)`:
+- `idx < currentIdx` → done (white checkmark)
+- `idx === currentIdx` → active (pulsing white dot)
+- `idx > currentIdx` → pending (empty circle)
+
+The active stage shows `status.message` instead of its default label. So during a download stall, the user sees:
+- Install MLX runtime → done ✓
+- Start runtime & load model → done ✓
+- Download model → **active, pulsing**, text: "Loading Gemma 4 E4B… (first run downloads the model)" or some HF tqdm message
+- Ready to chat → pending
+
+Plus a progress bar at 12% that doesn't move.
+
+**This is what the user sees during the HF Xet stall** (§3.6's Case B). **No element in this UI hints that anything might be wrong.** The pulsing dot communicates "we're working on it"; the progress bar communicates "we know where you are"; the message communicates "this is normal." All three are wrong.
+
+### Error block (lines 68–79)
+
+When `status.stage === 'error'`: shows a red-bordered box with `status.error` and a "Try again" button that calls `onStart(model)` again. So once we DO eventually hit the 10-min `waitForHealth` timeout (or detect the subprocess crash), the user gets a clean retry path.
+
+### Hardening — concrete recipe for fixing the lying spinner in this file
+
+A minimal client-side fix (~25 lines added to `Setup.tsx`) would:
+1. Capture the timestamp of the last meaningful `status` update (anything that changes `progress` or `message`).
+2. Run a `setInterval` that compares `Date.now() - lastUpdate`.
+3. If > 30 seconds while `isWorking` and `progress < 1`, render a yellow warning under the progress bar: "This is taking longer than expected. Check console for details, or click Try again if you'd like."
+4. If > 90 seconds, surface a more prominent banner with an explicit "Cancel and retry" option.
+
+Combined with the `HF_HUB_ENABLE_HF_TRANSFER=1` fix in §3, this would convert the worst user experience the app has into a recoverable one.
+
+## 7.5 `src/renderer/src/components/Chat.tsx` — the 591-line conversation surface
+
+This is the largest renderer file and owns the entire chat experience: conversation list, message rendering, streaming consumption, model picker, mode toggle, canvas resize, suggestions empty state. Five distinct concerns interleaved in one file.
+
+### 7.5.1 `Conversation` type and persistence (lines 14–53)
+
+```ts
+interface Conversation {
+  id: string
+  title: string
+  messages: ChatMessage[]
+  createdAt: number
+  mode: AgentMode
+  canvasOpen?: boolean
+}
+```
+
+Persisted to `localStorage[STORAGE_KEY]` where `STORAGE_KEY = 'gemma-chat:conversations:v2'`. The `:v2` suffix implies a prior schema migration (v1 → v2). `loadConversations` defensively backfills `mode ?? 'code'` for any pre-mode v2 records.
+
+`newConversation`:
+- `id` shape: `c_${Date.now()}_${rand6}` — **identical pattern to what the main process uses for workspace dirs** (§5). This is what ties a Chat conversation to its workspace.
+- Default `mode: 'code'`, `canvasOpen: mode === 'code'` — Build mode opens the Canvas by default.
+
+### 7.5.2 State (lines 60–66)
+
+```ts
+const [conversations, setConversations] = useState(...)
+const [activeId, setActiveId] = useState(...)
+const [streaming, setStreaming] = useState(false)
+const streamRef = useRef<{ abort: boolean }>({ abort: false })
+```
+
+- `streamRef.abort` is a mutable flag for in-flight chunk rejection. Set true by `handleStop`. Each chunk handler short-circuits if `streamRef.current.abort` is true. **Does not actually abort the underlying request** — `api.abortChat` does that. The ref just prevents UI updates after the user clicked Stop.
+
+### 7.5.3 `saveConversations` on every change (lines 73–75)
+
+```ts
+useEffect(() => { saveConversations(conversations) }, [conversations])
+```
+
+**This runs on every keystroke during streaming**, since each token chunk mutates `conversations` (via setState). For a long-running tool-heavy generation, that's thousands of `JSON.stringify` + `localStorage.setItem` calls. Captured for §Hardening — debounce to ~500ms. localStorage is small (5–10 MB depending on browser); a sufficiently long conversation could exceed the quota, in which case `setItem` throws silently (the `catch` block).
+
+### 7.5.4 `handleSend(input)` (lines 111–202) — the central streaming consumer
+
+The choreography:
+
+1. **Guard:** `!input.trim() || streaming` → no-op.
+2. **Build messages:**
+   - `userMsg` with the input.
+   - `assistantMsg` empty, with `activity: { kind: 'thinking' }`.
+3. **Update conversation:**
+   - If conversation has no messages yet, derive `title` from the first 48 chars of the user input.
+   - Append both messages.
+4. **Build history** for the IPC request: maps `conv.messages + [userMsg]` to the `{role, content, toolCalls}` shape `ChatRequest` expects.
+5. **Set `streaming: true`**, reset `streamRef.current.abort = false`.
+6. **`await api.sendChat(req, onChunk)`** with a closure-over-state chunk handler.
+
+The chunk handler is the discriminated-union switch:
+- `'token'`: append `chunk.text` to the last (assistant) message's `content`.
+- `'tool_call'`: push the call onto the assistant's `toolCalls`, with `running: true`.
+- `'tool_result'`: find by `id`, clear `running`, set `result`/`error`.
+- `'activity'`: replace the assistant's `activity`.
+- `'done'`: mark `done: true`, activity → `idle`.
+- `'error'`: mark `done`, activity `idle`, append `\n\n⚠️ {error}` to content.
+
+**Implementation pattern worth flagging:** the entire chunk handler is **one giant `setConversations` per chunk**. Each chunk triggers a top-level state update, a re-render of the conversation list, and (per the useEffect above) a localStorage write. For a 4000-token generation that's 4000 state updates. Captured for §Hardening — batching tokens via `requestAnimationFrame` or a buffered ref would significantly reduce render pressure, especially noticeable on the Build tab where Canvas re-renders on `workspace:changed`.
+
+`finally`: `setStreaming(false)`. Always runs.
+
+**No client-side timeout on the await.** This is the cousin failure to the lying spinner: if `sendChat`'s underlying stream never emits `done` or `error`, the await hangs forever and the user is stuck in `streaming: true` state with no way to escape except `handleStop`. The stop button exists in the Composer, so the user has recourse — but a graceful timeout would be a smaller cognitive load.
+
+### 7.5.5 `handleStop` (lines 204–208) and `handleRegenerate` (lines 210–224)
+
+- **Stop:** set `streamRef.abort = true`, call `api.abortChat`, set `streaming: false`. The abort propagates to main's `AbortController` (§2.7) which causes the underlying fetch to MLX to throw `AbortError`, which `handleChat` (§2.5) maps to a clean `done` chunk.
+- **Regenerate:** find the last user message, pop everything from there back through (and including) the user message itself, then `setTimeout(() => handleSend(lastUser.content), 0)`. The setTimeout 0 defers the resend until after React processes the pop. Standard pattern.
+
+### 7.5.6 `ResizableCanvas` (lines 280–333)
+
+Pointer-event-based horizontal resize. Min 320px, max 900px. `setPointerCapture` ensures the drag continues even if the pointer leaves the handle. Initial width 520px. **The width is not persisted** — closing and reopening the Canvas resets to 520. Captured for §Hardening, minor.
+
+### 7.5.7 `Header` (lines 335–446)
+
+- macOS drag region (`drag` class) wrapping the whole header.
+- Center: mode pills (Chat/Build) — a tiny segmented control.
+- Right: model picker dropdown + Canvas toggle (only in Build mode).
+- Model picker: opens on click, closes on outside click (via document-level mousedown listener). Lists all `AVAILABLE_MODELS` with the active one marked with an emerald check.
+
+### 7.5.8 `MessageList` (lines 469–525)
+
+- `useEffect` tracks "are we at the bottom?" via scroll listener (within 40px counts as "at bottom").
+- On `messages` change, if `atBottomRef.current` is true, scroll to bottom. **This is the right pattern** — only auto-scroll if the user hasn't scrolled up to read earlier content. Common chat-UX trap successfully avoided.
+- Empty → `<EmptyState mode />`.
+- Otherwise: maps messages to `<Message>` components in a max-w-3xl column. Each gets a stagger animation delay based on index.
+
+### 7.5.9 `EmptyState` (lines 527–591)
+
+Big "What should we build?" / "How can I help?" headline + 4 suggestion cards per mode.
+
+**Suggestion-click hack** (lines 570–581):
+```ts
+const ta = document.querySelector<HTMLTextAreaElement>('[data-composer]')
+if (ta) {
+  const setter = Object.getOwnPropertyDescriptor(
+    window.HTMLTextAreaElement.prototype, 'value'
+  )?.set
+  setter?.call(ta, s.prompt)
+  ta.dispatchEvent(new Event('input', { bubbles: true }))
+  ta.focus()
+}
+```
+
+This is the React-rebellion pattern for setting an input's value while triggering React's onChange. It works by using the native HTMLTextAreaElement setter (bypassing React's synthetic value tracker), then dispatching a synthetic input event that React picks up.
+
+**Cross-cutting coupling:** assumes `Composer` renders a `<textarea data-composer>`. Verified in §8. The hack works but it's a Demeter violation — `EmptyState` reaches across the component boundary to manipulate `Composer`'s internal DOM. Captured for §Hardening — lift "set composer text" to a ref or context. Minor; works correctly today.
+
+## §7 Synthesis
+
+1. **`index.html` has a CSP and it's mostly tight.** Corrects my §2 oversight. Only meaningful loose entry is `img-src https:`. The CSP is the strongest production security control the renderer has — preserve it carefully across edits.
+2. **The `App` state machine is sound but the switching-error revert is the one place it gets clever.** Failed model switches preserve the previous model; failed first-setups go back to Welcome. Worth documenting for future maintainers (which is what §7.3 does).
+3. **Setup's StageList is the lying spinner's face.** The fix-recipe in §7.4 is small (~25 lines) and gives the user agency. Pair it with `HF_HUB_ENABLE_HF_TRANSFER=1` from §3 and the worst UX in the app is resolved.
+4. **Chat.tsx is the right place for the streaming-await timeout.** A `Promise.race` between `api.sendChat(...)` and a generous timeout (90–120 s without any chunk arrival) would close the cousin failure cleanly.
+5. **High-frequency state updates during streaming are a perf concern.** Each token = one setConversations + one localStorage write. Batching to rAF or 100ms windows would significantly reduce render pressure, especially in Build mode with the Canvas re-rendering on each `workspace:changed`.
+6. **The suggestion-click DOM hack is a small wart.** Easy to clean up via a `composerRef` lifted to Chat. Low priority.
+7. **`canvasVisible` logic on line 226 is over-complicated.** `(mode === 'code' || canvasOpen === true) && canvasOpen !== false` simplifies to `canvasOpen !== false && (mode === 'code' || canvasOpen === true)` which still has redundancy. The intent appears to be: "Canvas visible unless explicitly closed; default to open in code mode, closed in chat mode." Could be clearer. Captured for §Hardening, cosmetic.
+
+Section 7 complete. Section 8 (Composer, Message, Canvas, Sidebar, whisper — structural depth) is next.
+
+---
+
+## (Section 8 and 9 will be filled in as the deep dive continues.)
