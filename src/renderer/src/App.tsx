@@ -135,9 +135,18 @@ export default function App() {
     )
   }
 
+  // Patch 12: switching/reconnecting/ready all share the same key so React
+  // reconciles the wrapper div in place across phase transitions instead of
+  // unmounting and remounting Chat. Previously each phase had its own key
+  // (`switching`, `reconnecting`, `chat`), so every transition tore down
+  // Chat — wiping conversation state, orphaning the in-flight preload
+  // listener, and stranding handleReconnect's continuation in an unmounted
+  // component. Streamed tokens still arrived but flowed into setState calls
+  // on a dead instance, so the visible Chat (a fresh remount) saw nothing.
+
   if (state.phase === 'switching') {
     return (
-      <div key="switching" className="anim-fade-in h-full w-full">
+      <div key="chat-shell" className="anim-fade-in h-full w-full">
         <Chat model={state.model} onSwitchModel={handleSwitchModel} />
         <SwitchingOverlay status={state.status} />
       </div>
@@ -146,7 +155,7 @@ export default function App() {
 
   if (state.phase === 'reconnecting') {
     return (
-      <div key="reconnecting" className="anim-fade-in h-full w-full">
+      <div key="chat-shell" className="anim-fade-in h-full w-full">
         <Chat model={state.model} onSwitchModel={handleSwitchModel} />
         <SwitchingOverlay status={state.status} />
       </div>
@@ -154,7 +163,7 @@ export default function App() {
   }
 
   return (
-    <div key="chat" className="anim-fade-scale h-full w-full">
+    <div key="chat-shell" className="anim-fade-scale h-full w-full">
       <Chat model={state.model} onSwitchModel={handleSwitchModel} />
     </div>
   )
