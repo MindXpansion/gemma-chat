@@ -3054,6 +3054,27 @@ End of Phase 3 (~2–4 weeks of work, deferred):
 - MCP unlocks 5,800+ servers as installable Skills.
 - Sandbox: true closes the renderer-RCE class.
 
+## 10.8a Phase 2.7 (Neo4j + voyageai RAG) — design landed
+
+`neo4j-kg-architect` subagent produced the full design in `docs/research/05-neo4j-voyageai-rag-design.md` (~1,030 lines). Headline architectural decisions to lock:
+
+| Decision | Choice |
+|---|---|
+| Database isolation | New database `gemma-chat-memory` inside existing `kg-arch-enterprise` Neo4j Desktop Enterprise DBMS. Dedicated `gemma-chat` user with `DENY ALL ON DATABASE neo4j` for defense-in-depth against partnership KG. |
+| Schema | 8 node labels (`:Document`, `:Chunk`, `:Image`, `:Conversation`, `:Turn`, `:Summary`, `:Workspace`, `:Observation`, `:Pattern`), every node temporally grounded with bitemporal `valid_from` / `valid_to`. |
+| Vector indexes | Native Neo4j 5.x HNSW (vector-2.0 provider), 1024-dim cosine, 5 indexes. Projected resource needs at 100 GB target: ~135 GB disk, 8 GB heap + 32 GB page cache. |
+| Embeddings | Three-model strategy at 1024-dim — `voyage-3-large` for prose ($0.18/M tokens; `voyage-4-large` at $0.12/M as the swap-when-stable upgrade), `voyage-code-3` for code, `voyage-multimodal-3` for images ($0.12/M text + $0.60/B pixels). |
+| Honest cost to embed 100 GB | **$3,000–4,800 one-time**, with re-embedding cost on model upgrades. |
+| Retrieval (v1) | pure vector → `rerank-2` → 1-hop Cypher expansion, ~425 ms total latency budget. Hybrid BM25+vector deferred to v2. |
+| Tool surface | 4 ToolSpecs in §10.2.1's Vercel AI SDK v5 / Zod shape — `aios.recall`, `aios.cite`, `aios.search_kg` (read-only via separate Neo4j role), `aios.index`. |
+| AIOS boundary | The new database NEVER reads or writes the existing `kg-arch-enterprise` partnership KG. `.md` files in `.aios/` remain source-of-truth; the graph is a searchable mirror. Matches the hybrid write-boundary call from §10.3.1. |
+| Bootstrap | Index the four Phase 0 research docs first (~$0.04, ~60s) → AIOS rules → `Knowledge_Base/` → demand-driven from there. |
+| Estimated effort | **17–23 dev-days across 6 sub-phases** — the largest Phase 2 item by far. |
+
+Read `docs/research/05-neo4j-voyageai-rag-design.md` for the full spec including Cypher schema, Python ingestion pipeline outlines, dry-run rollback plans, and the recommended `gemma-chat` Neo4j role grants.
+
+---
+
 ## 10.9 What needs your decision before I start coding
 
 1. **Restated write-boundary call** (§10.3.1). Confirm "write freely" stands, or downshift to Research #4's recommendation for v0.2 with a clear escalation path.
