@@ -45,6 +45,13 @@ import {
   wsWriteFile
 } from './workspace'
 import type { ChatRequest, StreamChunk, ToolCall } from '../shared/types'
+import { loadAiosEnv } from './env-loader'
+
+// Patch 18: mirror config-file API keys into process.env so spawned Python
+// scripts (temporal-intelligence, google_maps, weather) inherit them even
+// when launched from Dock/Finder (which doesn't source the login shell).
+const loadedKeys = loadAiosEnv()
+console.log(`[aios-env] Loaded ${loadedKeys.length} key(s): ${loadedKeys.join(', ') || 'none'}`)
 
 let mainWindow: BrowserWindow | null = null
 

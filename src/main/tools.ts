@@ -16,6 +16,12 @@ import {
   readIppFile,
   editIppFile,
   appendIppFile,
+  getWeather,
+  getDirections,
+  getDistance,
+  searchPlaces,
+  episodicRecall,
+  weekSummary,
   IPP_FILES
 } from './aios-integration'
 
@@ -471,6 +477,105 @@ export const TOOLS: Record<string, ToolSpec> = {
       const newStr = typeof args.new_string === 'string' ? args.new_string : ''
       return editIppFile(file, oldStr, newStr)
     }
+  },
+  // Patch 18 (AIOS capability tools) — spatial, weather, episodic recall.
+  // All shell out to canonical scripts under ~/Skills/temporal-intelligence/.
+  aios_weather: {
+    name: 'aios_weather',
+    description:
+      'Get current weather for a location. Defaults to Bear\'s home (Colorado Springs) if no location given. No API key needed — uses Open-Meteo / wttr.in.',
+    params: [
+      {
+        name: 'location',
+        description: 'city name, ZIP, or "lat,lon" — optional (defaults to home)'
+      }
+    ],
+    example: '<action name="aios_weather">\n<location>Denver, CO</location>\n</action>',
+    mode: 'both',
+    run: async (args) => getWeather(String(args.location ?? '').trim() || undefined)
+  },
+  aios_directions: {
+    name: 'aios_directions',
+    description:
+      'Get turn-by-turn directions between two locations via Google Maps. Requires GOOGLE_MAPS_API_KEY (loaded at app startup from ~/.gemma-chat.env or ~/.zshenv).',
+    params: [
+      { name: 'origin', description: 'starting location (address, city, or place name)', required: true },
+      { name: 'destination', description: 'ending location', required: true },
+      { name: 'mode', description: 'driving | walking | bicycling | transit (default driving)' }
+    ],
+    example:
+      '<action name="aios_directions">\n<origin>Colorado Springs, CO</origin>\n<destination>Denver, CO</destination>\n<mode>driving</mode>\n</action>',
+    mode: 'both',
+    run: async (args) =>
+      getDirections(
+        String(args.origin ?? '').trim(),
+        String(args.destination ?? '').trim(),
+        String(args.mode ?? 'driving').trim() || 'driving'
+      )
+  },
+  aios_distance: {
+    name: 'aios_distance',
+    description:
+      'Get distance and travel time between an origin and one or more destinations (Google Maps Distance Matrix). Best tool for "how far is X from Y" questions.',
+    params: [
+      { name: 'origin', description: 'starting location', required: true },
+      {
+        name: 'destinations',
+        description: 'comma-separated list of destinations (one or more)',
+        required: true
+      }
+    ],
+    example:
+      '<action name="aios_distance">\n<origin>Colorado Springs, CO</origin>\n<destinations>Denver, CO, Pueblo, CO</destinations>\n</action>',
+    mode: 'both',
+    run: async (args) => {
+      const origin = String(args.origin ?? '').trim()
+      const destsRaw = String(args.destinations ?? '').trim()
+      const destinations = destsRaw
+        .split(/,(?![^(]*\))/) // simple comma split (good-enough for plain place names)
+        .map((s) => s.trim())
+        .filter((s) => s.length > 0)
+      return getDistance(origin, destinations)
+    }
+  },
+  aios_places: {
+    name: 'aios_places',
+    description:
+      'Search for places (restaurants, businesses, landmarks) via Google Maps. Use `near` to bias by location.',
+    params: [
+      { name: 'query', description: 'what to search for (e.g. "coffee", "Italian restaurant")', required: true },
+      { name: 'near', description: 'location bias (e.g. "Denver, CO") — optional' }
+    ],
+    example:
+      '<action name="aios_places">\n<query>coffee</query>\n<near>Colorado Springs, CO</near>\n</action>',
+    mode: 'both',
+    run: async (args) =>
+      searchPlaces(String(args.query ?? '').trim(), String(args.near ?? '').trim() || undefined)
+  },
+  aios_recall: {
+    name: 'aios_recall',
+    description:
+      'Episodic recall: what was Bear working on a specific day? Queries TaskFlow Pro (his client work tracker). day_expr accepts "yesterday", "last monday", "2026-05-12", etc.',
+    params: [
+      { name: 'day_expr', description: 'day to recall', required: true },
+      { name: 'client', description: 'filter by client code (optional)' }
+    ],
+    example: '<action name="aios_recall">\n<day_expr>last monday</day_expr>\n</action>',
+    mode: 'both',
+    run: async (args) =>
+      episodicRecall(
+        String(args.day_expr ?? '').trim(),
+        String(args.client ?? '').trim() || undefined
+      )
+  },
+  aios_week_summary: {
+    name: 'aios_week_summary',
+    description:
+      'Summarize Bear\'s TaskFlow activity for the current week (Monday through today), grouped by day.',
+    params: [],
+    example: '<action name="aios_week_summary"></action>',
+    mode: 'both',
+    run: async () => weekSummary()
   }
 }
 
@@ -569,6 +674,14 @@ function aiosSubsystem(): string {
     '',
     'Temporal grounding:',
     '- Use `aios_now` to refresh date/time/week-anchors from the canonical temporal-intelligence source.',
+    '',
+    'AIOS capability tools (don\'t reach for web_search when one of these fits):',
+    '- `aios_weather(location?)` — current weather, no API key needed',
+    '- `aios_directions(origin, destination, mode?)` — Google Maps turn-by-turn',
+    '- `aios_distance(origin, destinations)` — distance + travel time for "how far is X from Y"',
+    '- `aios_places(query, near?)` — Google Maps place search (restaurants, businesses, landmarks)',
+    '- `aios_recall(day_expr, client?)` — episodic recall: what Bear was working on a given day (TaskFlow Pro)',
+    '- `aios_week_summary()` — this week\'s TaskFlow activity grouped by day',
     '',
     'HARD BOUNDARIES — do not write to:',
     '- `~/Skills/` (sacrosanct master library)',

@@ -19,6 +19,14 @@ const TEMPORAL_SCRIPT = join(
   homedir(),
   'Skills/temporal-intelligence/scripts/temporal_context.py'
 )
+const WEATHER_SCRIPT = join(
+  homedir(),
+  'Skills/temporal-intelligence/scripts/get_weather.py'
+)
+const MAPS_SCRIPT = join(
+  homedir(),
+  'Skills/temporal-intelligence/scripts/google_maps.py'
+)
 const IPP_DIR = join(homedir(), '.intelligence_partner')
 
 export const IPP_FILES = ['memory', 'preferences', 'comms', 'soul', 'ideals'] as const
@@ -182,6 +190,110 @@ export function appendIppFile(name: string, content: string): string {
   }
   refreshPartnerProfile()
   return `Appended to ${name}.md (${text.length} chars under heading "${stamp} — Gemma").`
+}
+
+// ── AIOS capability tools (Patch 18) ────────────────────────────────────
+
+/**
+ * Generic helper to run a Python script with bounded timeout and return
+ * stdout. process.env is inherited (so GOOGLE_MAPS_API_KEY loaded at boot
+ * by env-loader.ts is visible to the child). Returns a user-facing error
+ * string on failure; never throws.
+ */
+function runPython(script: string, args: string[], timeoutMs: number): string {
+  if (!existsSync(script)) {
+    return `Error: required AIOS script not found at ${script}.`
+  }
+  try {
+    const r = spawnSync('python3', [script, ...args], {
+      timeout: timeoutMs,
+      encoding: 'utf-8',
+      env: process.env
+    })
+    if (r.status !== 0) {
+      const tail = (r.stderr || r.stdout || '').trim().split('\n').slice(-5).join('\n')
+      return `Error (exit ${r.status ?? 'killed'}): ${tail || 'no output'}`
+    }
+    const out = (r.stdout || '').trim()
+    return out || '(no output)'
+  } catch (e) {
+    return `Error: ${(e as Error).message}`
+  }
+}
+
+/**
+ * Wraps get_weather.py. Default location resolves to geo-config home
+ * (Colorado Springs). No API key needed (Open-Meteo + wttr.in fallback).
+ */
+export function getWeather(location?: string): string {
+  const args = ['--format', 'brief']
+  if (location && location.trim()) args.push('--location', location.trim())
+  return runPython(WEATHER_SCRIPT, args, 10_000)
+}
+
+/**
+ * Wraps google_maps.py --directions. Requires GOOGLE_MAPS_API_KEY in env.
+ */
+export function getDirections(origin: string, destination: string, mode = 'driving'): string {
+  if (!origin || !destination) return 'Error: origin and destination are both required.'
+  if (!process.env.GOOGLE_MAPS_API_KEY) {
+    return 'Error: GOOGLE_MAPS_API_KEY not set. Add `GOOGLE_MAPS_API_KEY="..."` to ~/.gemma-chat.env or ~/.zshenv and restart the app.'
+  }
+  return runPython(
+    MAPS_SCRIPT,
+    ['--directions', origin, destination, '--mode', mode, '--format', 'text'],
+    15_000
+  )
+}
+
+/**
+ * Wraps google_maps.py --distance-matrix. First arg is origin, rest are
+ * destinations. Requires GOOGLE_MAPS_API_KEY.
+ */
+export function getDistance(origin: string, destinations: string[]): string {
+  if (!origin || destinations.length === 0) {
+    return 'Error: origin and at least one destination are required.'
+  }
+  if (!process.env.GOOGLE_MAPS_API_KEY) {
+    return 'Error: GOOGLE_MAPS_API_KEY not set. Add `GOOGLE_MAPS_API_KEY="..."` to ~/.gemma-chat.env or ~/.zshenv and restart the app.'
+  }
+  return runPython(
+    MAPS_SCRIPT,
+    ['--distance-matrix', origin, ...destinations, '--format', 'text'],
+    15_000
+  )
+}
+
+/**
+ * Wraps google_maps.py --places. `near` biases the search location.
+ */
+export function searchPlaces(query: string, near?: string): string {
+  if (!query) return 'Error: query is required.'
+  if (!process.env.GOOGLE_MAPS_API_KEY) {
+    return 'Error: GOOGLE_MAPS_API_KEY not set. Add `GOOGLE_MAPS_API_KEY="..."` to ~/.gemma-chat.env or ~/.zshenv and restart the app.'
+  }
+  const args = ['--places', query, '--format', 'text']
+  if (near && near.trim()) args.push('--near', near.trim())
+  return runPython(MAPS_SCRIPT, args, 15_000)
+}
+
+/**
+ * Wraps temporal_context.py --day. Episodic recall against TaskFlow Pro
+ * SQLite. day_expr accepts "yesterday", "last monday", "2026-05-12", etc.
+ */
+export function episodicRecall(dayExpr: string, client?: string): string {
+  if (!dayExpr) return 'Error: day_expr is required (e.g. "yesterday", "last monday", "2026-05-12").'
+  const args = ['--day', dayExpr]
+  if (client && client.trim()) args.push('--client', client.trim())
+  return runPython(TEMPORAL_SCRIPT, args, 10_000)
+}
+
+/**
+ * Wraps temporal_context.py --week. Returns this week's TaskFlow activity
+ * grouped by day.
+ */
+export function weekSummary(): string {
+  return runPython(TEMPORAL_SCRIPT, ['--week'], 10_000)
 }
 
 // ── RISE cognitive protocol (taught via system prompt) ──────────────────
