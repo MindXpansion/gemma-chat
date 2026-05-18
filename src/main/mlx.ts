@@ -3,7 +3,7 @@ import { spawn, ChildProcess, spawnSync } from 'child_process'
 import { join } from 'path'
 import { existsSync, rmSync } from 'fs'
 
-const MLX_PORT = 11434
+const MLX_PORT = 11437
 const MLX_HOST = `127.0.0.1:${MLX_PORT}`
 const MLX_URL = `http://${MLX_HOST}`
 
@@ -128,21 +128,21 @@ export function locateMLX(): MLXStatus | null {
         try { rmSync(venvDir(), { recursive: true, force: true }) } catch { /* ok */ }
         // Fall through to system python detection below
       } else {
-        // Venv Python is compatible — check if mlx_lm is installed
+        // Venv Python is compatible — check if mlx_vlm is installed
         try {
-          const check = spawnSync(vPy, ['-c', 'import mlx_lm; print("ok")'], {
+          const check = spawnSync(vPy, ['-c', 'import mlx_vlm; print("ok")'], {
             timeout: 15000,
             stdio: ['ignore', 'pipe', 'pipe']
           })
           const stdout = check.stdout?.toString().trim() || ''
           if (check.status === 0 && stdout.includes('ok')) {
-            console.log('[mlx] Found mlx-lm in venv')
+            console.log('[mlx] Found mlx-vlm in venv')
             return { python: vPy, installed: true }
           }
         } catch {
-          // venv exists but mlx_lm not importable
+          // venv exists but mlx_vlm not importable
         }
-        // Venv exists but mlx_lm is missing — can still pip install into it
+        // Venv exists but mlx_vlm is missing — can still pip install into it
         return { python: vPy, installed: false }
       }
     } catch {
@@ -159,7 +159,7 @@ export function locateMLX(): MLXStatus | null {
 }
 
 // ---------------------------------------------------------------------------
-// Installation — creates a venv and installs mlx-lm
+// Installation — creates a venv and installs mlx-vlm
 // ---------------------------------------------------------------------------
 
 export type InstallProgress = {
@@ -168,7 +168,7 @@ export type InstallProgress = {
 }
 
 /**
- * Install mlx-lm into a dedicated virtual environment.
+ * Install mlx-vlm into a dedicated virtual environment.
  * Uses --index-url to bypass any corporate pip registries.
  * Returns the venv python path to use for all subsequent operations.
  */
@@ -199,24 +199,24 @@ export async function installMLX(
     '--index-url', 'https://pypi.org/simple/'
   ], onProgress)
 
-  // Step 3: Install mlx-lm (force public PyPI to bypass corporate registries)
-  onProgress({ stage: 'install', message: 'Installing mlx-lm (this may take a few minutes)…' })
+  // Step 3: Install mlx-vlm (force public PyPI to bypass corporate registries)
+  onProgress({ stage: 'install', message: 'Installing mlx-vlm (this may take a few minutes)…' })
   await runProcess(vPy, [
-    '-m', 'pip', 'install', '--upgrade', 'mlx-lm>=0.24.0',
+    '-m', 'pip', 'install', '--upgrade', 'mlx-vlm>=0.5.0',
     '--index-url', 'https://pypi.org/simple/'
   ], onProgress)
 
   // Verify the install worked
-  const check = spawnSync(vPy, ['-c', 'import mlx_lm; print("ok")'], {
+  const check = spawnSync(vPy, ['-c', 'import mlx_vlm; print("ok")'], {
     timeout: 15000,
     stdio: ['ignore', 'pipe', 'pipe']
   })
   if (check.status !== 0 || !check.stdout?.toString().includes('ok')) {
     const err = check.stderr?.toString().slice(-300) || 'unknown error'
-    throw new Error(`mlx-lm installed but failed to import: ${err}`)
+    throw new Error(`mlx-vlm installed but failed to import: ${err}`)
   }
 
-  console.log('[mlx] mlx-lm installed successfully')
+  console.log('[mlx] mlx-vlm installed successfully')
   return vPy
 }
 
@@ -288,11 +288,11 @@ export async function startServer(
   let earlyExit: { code: number | null; stderr: string } | null = null
   let stderrBuf = ''
 
-  console.log(`[mlx] Starting server: ${python} -m mlx_lm.server --model ${model} --port ${MLX_PORT}`)
+  console.log(`[mlx] Starting server: ${python} -m mlx_vlm.server --model ${model} --port ${MLX_PORT}`)
 
   serverProc = spawn(
     python,
-    ['-m', 'mlx_lm.server', '--model', model, '--port', String(MLX_PORT)],
+    ['-m', 'mlx_vlm.server', '--model', model, '--port', String(MLX_PORT)],
     {
       env,
       stdio: ['ignore', 'pipe', 'pipe'],
