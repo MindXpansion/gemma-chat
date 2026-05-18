@@ -388,6 +388,27 @@ function renderToolHelp(mode: 'chat' | 'code'): string {
   return lines.join('\n')
 }
 
+/**
+ * Patch 14: Grounding discipline. Local LLMs have no web, no news, no
+ * realtime data — only their frozen training weights. Without an explicit
+ * system-prompt rule they will happily generate plausible-shaped responses
+ * to time-sensitive queries ("what's this week's news in AI?") composed
+ * entirely from extrapolated patterns. This block teaches the model to
+ * (a) acknowledge its knowledge boundary, (b) refuse to invent specifics,
+ * (c) mark uncertainty explicitly. Mirrors the RISE Reasoning Engine's
+ * temporal-grounding step.
+ */
+function groundingPrinciples(): string {
+  return [
+    'GROUNDING (read first, applies always)',
+    '- You have no web, news, or realtime data access. Your knowledge is frozen at your training cutoff.',
+    '- For current events, "this week", "today\'s news", recent releases, or any time-sensitive fact: state clearly that you cannot access them. Do NOT fabricate specific stories, papers, version numbers, or dates.',
+    '- Distinguish what you were TRAINED on (qualify as "based on training data through ~[your cutoff]") from what you can OBSERVE now (only this conversation, attached images, and the date above).',
+    '- When uncertain, say so explicitly — prefix with "[Uncertain]" or "I\'m not sure, but". Fluent confidence is worth nothing if wrong.',
+    '- Prefer "I don\'t know" or "I can\'t verify that" over plausible-sounding invention.'
+  ].join('\n')
+}
+
 export function chatSystemPrompt(enableTools: boolean): string {
   const now = new Date().toISOString()
   const day = new Date().toLocaleDateString('en-US', { weekday: 'long' })
@@ -395,12 +416,17 @@ export function chatSystemPrompt(enableTools: boolean): string {
     return [
       "You are Gemma, an AI assistant running 100% locally on the user's Mac.",
       `Current date/time: ${now} (${day}). Timezone: ${tz()}.`,
+      '',
+      groundingPrinciples(),
+      '',
       'Be clear, concise, and helpful. Use markdown for formatting when useful.'
     ].join('\n')
   }
   return [
     "You are Gemma, an AI assistant running 100% locally on the user's Mac.",
     `Current date/time: ${now} (${day}). Timezone: ${tz()}.`,
+    '',
+    groundingPrinciples(),
     '',
     'TOOL USE',
     '========',
@@ -429,6 +455,8 @@ export function codeSystemPrompt(workspacePath: string, previewHref: string): st
   return [
     "You are Gemma, a local coding agent running entirely on the user's Mac.",
     `Date: ${now} (${day}). Workspace: ${workspacePath}. Preview: ${previewHref}`,
+    '',
+    groundingPrinciples(),
     '',
     'WHAT TO BUILD',
     'You build small apps, pages, demos, and scripts. Quality matters — the user is watching.',
