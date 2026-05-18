@@ -24,15 +24,37 @@ const api = {
 
   sendChat: async (req: ChatRequest, onChunk: (c: StreamChunk) => void): Promise<void> => {
     const { channel } = (await ipcRenderer.invoke('chat:send', req)) as { channel: string }
+    // Patch 7: client-side dead-man timer. If 90s pass without ANY chunk
+    // from main (token, tool, activity, anything), assume main-side hang
+    // and synthesize an error so the renderer's existing handler unblocks.
+    // Pairs with the abortChat invocation to ensure the main-side
+    // AbortController fires too.
+    const TIMEOUT_MS = 90_000
     return new Promise((resolve) => {
+      let timer: ReturnType<typeof setTimeout> | null = null
+      const armTimer = (): void => {
+        if (timer != null) clearTimeout(timer)
+        timer = setTimeout(() => {
+          ipcRenderer.removeListener(channel, listener)
+          ipcRenderer.invoke('chat:abort', req.conversationId).catch(() => { /* best effort */ })
+          onChunk({
+            type: 'error',
+            error: `No response from model in ${TIMEOUT_MS / 1000}s — the request was aborted. The model server may be hung or out of memory.`
+          })
+          resolve()
+        }, TIMEOUT_MS)
+      }
       const listener = (_: IpcRendererEvent, chunk: StreamChunk): void => {
+        armTimer()
         onChunk(chunk)
         if (chunk.type === 'done' || chunk.type === 'error') {
+          if (timer != null) clearTimeout(timer)
           ipcRenderer.removeListener(channel, listener)
           resolve()
         }
       }
       ipcRenderer.on(channel, listener)
+      armTimer()
     })
   },
 
