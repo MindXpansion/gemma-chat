@@ -35,6 +35,8 @@ export interface ChatMessage {
   model?: string
   done?: boolean
   activity?: AgentActivity
+  /** Patch 13: data URLs (data:image/...;base64,...) attached to user messages for multimodal input */
+  images?: string[]
 }
 
 export type AgentMode = 'chat' | 'code'

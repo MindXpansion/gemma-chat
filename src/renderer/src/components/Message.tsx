@@ -56,10 +56,26 @@ export default function Message({
 
   if (isUser) {
     return (
-      <div className="flex justify-end">
-        <div className="selectable max-w-[78%] rounded-2xl rounded-br-md bg-white/[0.08] px-4 py-2.5 text-[14.5px] leading-relaxed text-white">
-          <div className="whitespace-pre-wrap">{message.content}</div>
-        </div>
+      <div className="flex flex-col items-end gap-1.5">
+        {/* Patch 13: image attachments rendered above the text bubble */}
+        {message.images && message.images.length > 0 && (
+          <div className="flex max-w-[78%] flex-wrap justify-end gap-1.5">
+            {message.images.map((src, i) => (
+              <img
+                key={i}
+                src={src}
+                alt=""
+                className="max-h-48 max-w-[12rem] rounded-lg border border-white/10 object-cover"
+                draggable={false}
+              />
+            ))}
+          </div>
+        )}
+        {message.content && (
+          <div className="selectable max-w-[78%] rounded-2xl rounded-br-md bg-white/[0.08] px-4 py-2.5 text-[14.5px] leading-relaxed text-white">
+            <div className="whitespace-pre-wrap">{message.content}</div>
+          </div>
+        )}
       </div>
     )
   }

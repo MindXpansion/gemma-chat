@@ -2,7 +2,7 @@ import { useEffect, useRef, useState } from 'react'
 import { transcribeAudioBlob } from '../lib/whisper'
 
 interface Props {
-  onSend: (text: string) => void
+  onSend: (text: string, images?: string[]) => void
   onStop: () => void
   streaming: boolean
   disabled: boolean
@@ -11,6 +11,18 @@ interface Props {
 }
 
 type RecState = 'idle' | 'recording' | 'loading-model' | 'transcribing'
+
+// Patch 13: read a File as a base64 data URL for direct attachment to the
+// chat request. The mlx_vlm.server (Gemma 4 vision) accepts data: URLs
+// in the OpenAI content-parts image_url shape — see Patch 5 wire format.
+function readImageAsDataUrl(file: File): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const r = new FileReader()
+    r.onload = () => resolve(String(r.result))
+    r.onerror = () => reject(r.error)
+    r.readAsDataURL(file)
+  })
+}
 
 export default function Composer({
   onSend,
@@ -25,11 +37,26 @@ export default function Composer({
   const [recordSeconds, setRecordSeconds] = useState(0)
   const [recordError, setRecordError] = useState<string | null>(null)
   const [modelProgress, setModelProgress] = useState<{ pct: number; label: string } | null>(null)
+  // Patch 13: pending images (data URLs) attached for the next send
+  const [images, setImages] = useState<string[]>([])
+  const [isDragging, setIsDragging] = useState(false)
   const taRef = useRef<HTMLTextAreaElement>(null)
+  const fileInputRef = useRef<HTMLInputElement>(null)
   const mediaRef = useRef<MediaRecorder | null>(null)
   const chunksRef = useRef<Blob[]>([])
   const streamRef = useRef<MediaStream | null>(null)
   const timerRef = useRef<number | null>(null)
+
+  async function addFiles(files: FileList | File[]): Promise<void> {
+    const arr = Array.from(files).filter((f) => f.type.startsWith('image/'))
+    if (arr.length === 0) return
+    const urls = await Promise.all(arr.map(readImageAsDataUrl))
+    setImages((prev) => [...prev, ...urls])
+  }
+
+  function removeImage(idx: number): void {
+    setImages((prev) => prev.filter((_, i) => i !== idx))
+  }
 
   useEffect(() => {
     const el = taRef.current
@@ -41,15 +68,33 @@ export default function Composer({
 
   function submit(): void {
     const t = text.trim()
-    if (!t || streaming || disabled) return
-    onSend(t)
+    // Patch 13: allow image-only sends — vision queries don't always need text
+    if ((!t && images.length === 0) || streaming || disabled) return
+    onSend(t, images.length > 0 ? images : undefined)
     setText('')
+    setImages([])
   }
 
   function onKeyDown(e: React.KeyboardEvent<HTMLTextAreaElement>): void {
     if (e.key === 'Enter' && !e.shiftKey && !e.nativeEvent.isComposing) {
       e.preventDefault()
       submit()
+    }
+  }
+
+  function onPaste(e: React.ClipboardEvent<HTMLTextAreaElement>): void {
+    const items = e.clipboardData?.items
+    if (!items) return
+    const files: File[] = []
+    for (const item of Array.from(items)) {
+      if (item.kind === 'file' && item.type.startsWith('image/')) {
+        const f = item.getAsFile()
+        if (f) files.push(f)
+      }
+    }
+    if (files.length > 0) {
+      e.preventDefault()
+      addFiles(files)
     }
   }
 
@@ -135,16 +180,76 @@ export default function Composer({
     }
   }
 
-  const canSend = text.trim().length > 0 && !disabled && recState === 'idle'
+  const canSend =
+    (text.trim().length > 0 || images.length > 0) && !disabled && recState === 'idle'
 
   return (
-    <div className="shrink-0 px-6 pb-6 pt-2">
+    <div
+      className="shrink-0 px-6 pb-6 pt-2"
+      onDragOver={(e) => {
+        if (Array.from(e.dataTransfer.types).includes('Files')) {
+          e.preventDefault()
+          setIsDragging(true)
+        }
+      }}
+      onDragLeave={(e) => {
+        // only clear if we're leaving the container, not a child
+        if (e.currentTarget === e.target) setIsDragging(false)
+      }}
+      onDrop={(e) => {
+        e.preventDefault()
+        setIsDragging(false)
+        if (e.dataTransfer.files.length > 0) addFiles(e.dataTransfer.files)
+      }}
+    >
+      <input
+        ref={fileInputRef}
+        type="file"
+        accept="image/*"
+        multiple
+        className="hidden"
+        onChange={(e) => {
+          if (e.target.files) addFiles(e.target.files)
+          // allow re-selecting the same file
+          e.target.value = ''
+        }}
+      />
       <div className="mx-auto max-w-3xl">
-        <div className="flex items-end gap-2 rounded-2xl border border-white/10 bg-white/[0.03] p-2 shadow-lg shadow-black/40 focus-within:border-white/20">
+        {/* Patch 13: thumbnail strip for pending images */}
+        {images.length > 0 && (
+          <div className="mb-2 flex flex-wrap gap-2">
+            {images.map((src, i) => (
+              <div
+                key={i}
+                className="group relative h-16 w-16 overflow-hidden rounded-lg border border-white/10 bg-white/5"
+              >
+                <img src={src} alt="" className="h-full w-full object-cover" draggable={false} />
+                <button
+                  onClick={() => removeImage(i)}
+                  aria-label="Remove image"
+                  className="absolute right-0.5 top-0.5 flex h-4 w-4 items-center justify-center rounded-full bg-black/70 text-[10px] leading-none text-white opacity-0 transition group-hover:opacity-100 hover:bg-black"
+                >
+                  ×
+                </button>
+              </div>
+            ))}
+          </div>
+        )}
+        <div
+          className={`flex items-end gap-2 rounded-2xl border bg-white/[0.03] p-2 shadow-lg shadow-black/40 transition ${
+            isDragging
+              ? 'border-white/40 bg-white/[0.06]'
+              : 'border-white/10 focus-within:border-white/20'
+          }`}
+        >
           <MicButton
             state={recState}
             seconds={recordSeconds}
             onClick={onMicClick}
+            disabled={streaming || disabled}
+          />
+          <AttachButton
+            onClick={() => fileInputRef.current?.click()}
             disabled={streaming || disabled}
           />
           <textarea
@@ -153,6 +258,7 @@ export default function Composer({
             value={text}
             onChange={(e) => setText(e.target.value)}
             onKeyDown={onKeyDown}
+            onPaste={onPaste}
             placeholder={
               recState === 'recording'
                 ? 'Listening…'
@@ -262,6 +368,25 @@ function MicButton({
           fill="none"
           strokeLinecap="round"
         />
+      </svg>
+    </button>
+  )
+}
+
+// Patch 13: image-attach button matching MicButton's idle style
+function AttachButton({ onClick, disabled }: { onClick: () => void; disabled: boolean }) {
+  return (
+    <button
+      onClick={onClick}
+      disabled={disabled}
+      title="Attach image"
+      aria-label="Attach image"
+      className="flex h-9 w-9 shrink-0 items-center justify-center rounded-xl text-ink-400 transition hover:bg-white/5 hover:text-white disabled:cursor-not-allowed disabled:opacity-40"
+    >
+      <svg viewBox="0 0 16 16" className="h-4 w-4" fill="none" stroke="currentColor" strokeWidth="1.5">
+        <rect x="2" y="3" width="12" height="10" rx="1.5" />
+        <circle cx="5.75" cy="6.25" r="0.9" fill="currentColor" stroke="none" />
+        <path d="M2.5 12L6 8.5l2.5 2.5L11 8l2.5 2.5" strokeLinecap="round" strokeLinejoin="round" />
       </svg>
     </button>
   )

@@ -108,8 +108,10 @@ export default function Chat({ model, onSwitchModel }: Props) {
     updateActive((c) => ({ ...c, canvasOpen: !c.canvasOpen }))
   }
 
-  async function handleSend(input: string): Promise<void> {
-    if (!input.trim() || streaming) return
+  async function handleSend(input: string, images?: string[]): Promise<void> {
+    // Patch 13: vision queries can be image-only — allow send when EITHER
+    // text or images are present.
+    if ((!input.trim() && (!images || images.length === 0)) || streaming) return
 
     const conv = conversations.find((c) => c.id === activeId)!
 
@@ -117,7 +119,8 @@ export default function Chat({ model, onSwitchModel }: Props) {
       id: newId('m'),
       role: 'user',
       content: input,
-      createdAt: Date.now()
+      createdAt: Date.now(),
+      ...(images && images.length > 0 ? { images } : {})
     }
     const assistantMsg: ChatMessage = {
       id: newId('m'),
@@ -140,7 +143,10 @@ export default function Chat({ model, onSwitchModel }: Props) {
     const history = [...conv.messages, userMsg].map((m) => ({
       role: m.role,
       content: m.content,
-      toolCalls: m.toolCalls
+      toolCalls: m.toolCalls,
+      // Patch 13: forward attached images through to the main process so
+      // chatStream can emit them as OpenAI content-parts (Patch 5 format).
+      ...(m.images && m.images.length > 0 ? { images: m.images } : {})
     }))
 
     setStreaming(true)
