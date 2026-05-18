@@ -199,10 +199,12 @@ export async function installMLX(
     '--index-url', 'https://pypi.org/simple/'
   ], onProgress)
 
-  // Step 3: Install mlx-vlm (force public PyPI to bypass corporate registries)
-  onProgress({ stage: 'install', message: 'Installing mlx-vlm (this may take a few minutes)…' })
+  // Step 3: Install mlx-vlm + hf_transfer (Rust-based HF download transport
+  // that avoids the Xet protocol stall — see audit §3.6 and Patch 6).
+  // Force public PyPI to bypass corporate registries.
+  onProgress({ stage: 'install', message: 'Installing mlx-vlm + hf_transfer (this may take a few minutes)…' })
   await runProcess(vPy, [
-    '-m', 'pip', 'install', '--upgrade', 'mlx-vlm>=0.5.0',
+    '-m', 'pip', 'install', '--upgrade', 'mlx-vlm>=0.5.0', 'hf_transfer',
     '--index-url', 'https://pypi.org/simple/'
   ], onProgress)
 
@@ -281,7 +283,10 @@ export async function startServer(
     // HuggingFace cache dir — keep models in our app data
     HF_HOME: modelsDir(),
     TRANSFORMERS_CACHE: modelsDir(),
-    HF_HUB_DISABLE_TELEMETRY: '1'
+    HF_HUB_DISABLE_TELEMETRY: '1',
+    // Rust-based downloader — avoids the Xet protocol stall (see audit §3.6 / Patch 6).
+    // Requires hf_transfer installed in the venv; installMLX adds it.
+    HF_HUB_ENABLE_HF_TRANSFER: '1'
   }
 
   // Track early exit so waitForHealth can bail out immediately

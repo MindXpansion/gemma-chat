@@ -1,3 +1,4 @@
+import { useEffect, useRef, useState } from 'react'
 import { AVAILABLE_MODELS, type SetupStatus } from '@shared/types'
 import gemmaLogoUrl from '../assets/gemma-logo.png'
 
@@ -26,6 +27,31 @@ export default function Setup({ status, model, onModelChange, onStart }: Props) 
     status.stage === 'installing-mlx' ||
     status.stage === 'starting-mlx' ||
     status.stage === 'downloading-model'
+
+  // Dead-man timer (Patch 6): detect when status updates stop arriving
+  // during a working stage. Surfaces a yellow warning at 30s of silence,
+  // an escalated critical banner at 90s. Resolves the "lying spinner"
+  // user-perception bug (audit §3.6 / §7.4).
+  const lastUpdateRef = useRef<number>(Date.now())
+  const [staleness, setStaleness] = useState<'fresh' | 'warning' | 'critical'>('fresh')
+  const statusKey = `${status.stage}|${status.message}|${status.progress ?? ''}|${status.bytesDone ?? ''}`
+  useEffect(() => {
+    lastUpdateRef.current = Date.now()
+    setStaleness('fresh')
+  }, [statusKey])
+  useEffect(() => {
+    if (!isWorking) {
+      setStaleness('fresh')
+      return
+    }
+    const id = window.setInterval(() => {
+      const elapsed = Date.now() - lastUpdateRef.current
+      if (elapsed > 90_000) setStaleness('critical')
+      else if (elapsed > 30_000) setStaleness('warning')
+      else setStaleness('fresh')
+    }, 2_000)
+    return () => window.clearInterval(id)
+  }, [isWorking])
 
   if (status.stage === 'checking' && status.message === 'Welcome') {
     return <WelcomeScreen model={model} onModelChange={onModelChange} onStart={onStart} />
@@ -61,6 +87,27 @@ export default function Setup({ status, model, onModelChange, onStart }: Props) 
                     {formatBytes(status.bytesDone)} / {formatBytes(status.bytesTotal)}
                   </span>
                 )}
+              </div>
+            </div>
+          )}
+
+          {isWorking && staleness === 'warning' && (
+            <div className="mt-6 rounded-lg border border-amber-400/30 bg-amber-400/10 p-3 text-[12.5px] text-amber-200">
+              <div className="font-medium">This is taking longer than expected</div>
+              <div className="mt-1 text-amber-200/80">
+                No progress signal for 30+ seconds. The download may be stalled. If it stays
+                like this for another minute, restart the app and try again.
+              </div>
+            </div>
+          )}
+
+          {isWorking && staleness === 'critical' && (
+            <div className="mt-6 rounded-lg border border-red-400/40 bg-red-500/10 p-3 text-[12.5px] text-red-300">
+              <div className="font-medium">Download appears stuck</div>
+              <div className="mt-1 text-red-300/80">
+                No progress signal in over 90 seconds. The HuggingFace download or MLX
+                runtime is most likely hung. Quit Gemma Chat (⌘Q) and reopen — your
+                progress so far is saved.
               </div>
             </div>
           )}
