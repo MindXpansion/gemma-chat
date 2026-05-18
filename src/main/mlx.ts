@@ -37,7 +37,7 @@ function modelsDir(): string {
 
 /**
  * Find a compatible system Python (3.10–3.13).
- * We explicitly skip 3.14+ because mlx-lm doesn't publish wheels for it yet.
+ * We explicitly skip 3.14+ because mlx-vlm doesn't publish wheels for it yet.
  * We try versioned binaries first (most reliable), then fall back to `python3`.
  */
 function findSystemPython(): string | null {
@@ -84,7 +84,7 @@ function findSystemPython(): string | null {
         } else if (minor < 10) {
           console.log(`[mlx] Skipping ${c} — ${ver} is too old (need 3.10+)`)
         } else {
-          console.log(`[mlx] Skipping ${c} — ${ver} is too new for mlx-lm`)
+          console.log(`[mlx] Skipping ${c} — ${ver} is too new for mlx-vlm`)
         }
       }
     } catch {
@@ -100,21 +100,21 @@ function findSystemPython(): string | null {
 // ---------------------------------------------------------------------------
 
 export interface MLXStatus {
-  /** Python to use for running mlx_lm (venv python if installed, system python otherwise) */
+  /** Python to use for running mlx_vlm (venv python if installed, system python otherwise) */
   python: string
-  /** Whether mlx-lm is installed and importable */
+  /** Whether mlx-vlm is installed and importable */
   installed: boolean
 }
 
 /**
- * Check if mlx-lm is ready to use.
- * Returns the python path to use and whether mlx_lm is installed.
+ * Check if mlx-vlm is ready to use.
+ * Returns the python path to use and whether mlx_vlm is installed.
  */
 export function locateMLX(): MLXStatus | null {
-  // 1. Check if we have a working venv with mlx_lm installed
+  // 1. Check if we have a working venv with mlx_vlm installed
   const vPy = venvPython()
   if (existsSync(vPy)) {
-    // Verify the venv Python is 3.10+ — older versions can't run modern mlx-lm
+    // Verify the venv Python is 3.10+ — older versions can't run modern mlx-vlm
     try {
       const verCheck = spawnSync(vPy, ['--version'], {
         timeout: 5000,

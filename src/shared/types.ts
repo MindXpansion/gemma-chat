@@ -78,7 +78,7 @@ export type StreamChunk =
   | { type: 'error'; error: string }
 
 export interface ModelInfo {
-  /** HuggingFace repo ID — used internally for mlx_lm */
+  /** HuggingFace repo ID — used internally for mlx_vlm */
   name: string
   /** Short, user-friendly display name */
   label: string
