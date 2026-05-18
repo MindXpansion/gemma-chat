@@ -1276,4 +1276,290 @@ Section 3 complete. Section 4 (`src/main/tools.ts` — 593 lines, never previous
 
 ---
 
-## (Sections 4–7 and 9–10 will be filled in as the file-by-file deep dive continues.)
+# Section 4 — Main Process: `src/main/tools.ts`
+
+**Path:** `src/main/tools.ts` (593 lines)
+
+**Role:** The complete tool/function-calling layer. Defines the `ToolSpec` contract, registers 10 concrete tools, writes the two system prompts (chat and code mode) that teach Gemma the XML-tag action format, and provides the streaming-safe parser that the chat orchestrator uses to extract action blocks from the model's token stream.
+
+**This is the foundation for your stated goal of "use Skills as well as access my filesystem on an approved basis."** Any future Skills integration — whether MCP-style, hardcoded, or hot-loaded — will register additional entries against the `TOOLS` registry defined here. Any "approved filesystem access" feature will extend the workspace-rooted tools or add new ones with explicit user-approval gates.
+
+The agent's entire visible capability surface lives in this file.
+
+## 4.1 Imports & contract types
+
+### Imports (lines 1–10)
+
+Only one source: `./workspace`. Pulls `wsWriteFile, wsReadFile, wsEditFile, wsDeleteFile, wsRunBash, ensureWorkspace, listTree, previewUrl`. The clean separation means "what can the agent *do* in the filesystem" is asked at workspace.ts boundaries (§5), while "what tools exist and how are they parsed" lives here.
+
+### `ToolContext` (lines 12–15)
+
+```ts
+interface ToolContext {
+  conversationId: string
+  onFileChange?: () => void
+}
+```
+
+Passed to every tool run. The `onFileChange` callback is what notifies the Canvas tab to re-list (wired in `index.ts:handleChat` as `() => send('workspace:changed', ...)`). Every tool that mutates the workspace calls `ctx.onFileChange?.()`.
+
+### `ToolSpec` (lines 17–24)
+
+```ts
+interface ToolSpec {
+  name: string
+  description: string
+  params: Array<{ name; description; required?; multiline? }>
+  example: string
+  mode: 'chat' | 'code' | 'both'
+  run: (args, ctx) => Promise<string>
+}
+```
+
+The contract every tool must satisfy. Three things to note:
+- **`mode` partitions the tool catalog.** Code-mode-only tools (file CRUD, bash, preview) are invisible in chat mode. The system prompt renders only matching-mode tools (see `renderToolHelp` below).
+- **`params` is self-describing.** The system prompt builds parameter docs from this list — so adding a new param to a tool automatically updates what Gemma is told.
+- **`run` returns a `string`.** The result is always a string that gets fed back to the model as a synthetic `tool`-role message. Errors are stringified ("Error: ..."), not thrown — the orchestrator never sees a rejection from a tool unless something deeper is broken. This is intentional: the model learns from textual error messages.
+
+## 4.2 The ten tools — what each one actually does
+
+### 4.2.1 `web_search` (lines 29–82) — DuckDuckGo HTML scrape
+
+`mode: 'both'`. Single param: `query`.
+
+1. Trim query, error if empty.
+2. GET `https://duckduckgo.com/html/?q=${encoded}` with a hardcoded **Chrome 122 macOS User-Agent** (line 27).
+3. Regex-parse the HTML for `.result` blocks: title, URL, snippet.
+4. URL cleanup: DDG wraps real URLs in `//duckduckgo.com/l/?uddg=<encoded>` redirects. We `decodeURIComponent`, strip `&rut=`, `&amp;`, and any `&` query parameters.
+5. Return top **6** results (line 36; line 66 has a soft cap of 10 but is unreachable given the 6-slice).
+6. Format: `[N] title\nURL\nsnippet` separated by blank lines.
+
+**Fragility:** Entire approach is **HTML regex against DuckDuckGo's markup**. Any change to DDG's class names or block structure silently breaks search. `parseDuckDuckGoResults` returns `[]` gracefully → tool returns `"No results found."` → model thinks the query had no hits. Captured for §Hardening — either swap to DDG's instant-answer API, a different scraper-friendly engine, or a real search API (Brave, Tavily, Serper).
+
+**Privacy posture:** No telemetry, no API key, no logging of queries beyond the console.log in `runProcess`. Search-and-forget. Good default.
+
+### 4.2.2 `fetch_url` (lines 84–116) — Generic HTTP GET
+
+`mode: 'both'`. Single param: `url`.
+
+1. Validate: must be `http://` or `https://`. Anything else returns `"Error: url must be http(s)"`.
+2. GET with the same Chrome UA.
+3. If `content-type` includes `html`: pass through `htmlToText` (strips `<script>`, `<style>`, `<noscript>`, all tags, decodes entities). Otherwise return raw text.
+4. **Truncate to 8000 chars** (line 94 + 96). Beyond that, silently dropped.
+
+**Security holes worth flagging:**
+- **No URL allowlist / denylist.** The model can fetch any URL — including `http://localhost:11437`, internal `192.168.x.x` IPs, AWS metadata endpoints, etc. **Classic SSRF (Server-Side Request Forgery) surface.** A malicious-looking user message could induce the model to fetch internal resources and leak them back into chat. Captured as high-priority §Hardening.
+- **No size cap before the 8KB truncation.** A multi-gigabyte response would be fully buffered into memory before the slice. `fetch` has no built-in stream-cap. A bad actor (or accidentally-pointed-at-a-firehose model) could OOM the main process.
+- **No timeout.** A slow-loris response hangs the tool call forever. The chat orchestrator has no per-tool timeout either. Worst case: a chat turn hangs until the user manually aborts.
+
+### 4.2.3 `calc` (lines 118–131) — Numeric expression evaluator
+
+`mode: 'both'`. Single param: `expression`.
+
+1. Whitelist regex: `/^[0-9+\-*/().\s^%,eE]*$/`. Anything outside that set returns `"Error: only numeric expressions allowed"`. The whitelist allows scientific notation (e/E) and ^/% for exponent/modulo expressions.
+2. Substitute `^` → `**` (JS exponent).
+3. **Evaluate via `Function("use strict; return (expr)")()`** — i.e., the `Function` constructor.
+
+**Verdict:** The whitelist is genuinely tight (no letters except `eE`, no `;`, no `[`, no string literals), so `Function` cannot reach arbitrary JS via this code path. But the *pattern* of using `Function` is risky on principle. Captured for §Hardening — replace with a real expression parser (`mathjs` or a tiny custom shunting-yard) so the pattern doesn't survive into future modifications that might widen the whitelist.
+
+### 4.2.4 `write_file` (lines 133–142) — Create or overwrite
+
+`mode: 'code'`. Params: `path`, `content` (multiline).
+
+1. Run `cleanFileContent(raw, path)` before writing. (See §4.3 for what this does.)
+2. `wsWriteFile(ctx.conversationId, path, content)`.
+3. `ctx.onFileChange?.()`.
+4. Return `"Wrote <path> (<bytes> bytes, <lines> lines)."`.
+
+Note: the live-write streaming in `handleChat` (§2.5) calls `wsWriteFile` *and* `cleanFileContent` directly from the orchestrator while the model is still emitting `<content>`. By the time the tool's `run` fires (with the closed `</content>`), the file has typically already been written multiple times in flight. The `run` call effectively writes the final version + emits the textual confirmation.
+
+### 4.2.5 `read_file` (lines 180–192) — Read with truncation
+
+`mode: 'code'`. Single param: `path`. Reads via `wsReadFile`. **Truncates to 20,000 chars** (line 185–187), appending `\n[…truncated]`. Wraps in try/catch; errors stringified.
+
+### 4.2.6 `edit_file` (lines 194–208) — In-place string replace
+
+`mode: 'code'`. Params: `path`, `old_string` (multiline), `new_string` (multiline), `replace_all` (boolean, optional).
+
+Delegates to `wsEditFile`. Coerces `replace_all` from either boolean `true` or the literal string `'true'` (depending on whether the action parser stringified it). Returns `"Edited <path> (<N> replacements)."` on success.
+
+The contract enforced by `wsEditFile` (verified in §5) is: `old_string` must match exactly once, unless `replace_all=true`. Multiple matches without `replace_all` throws — this is the discipline that prevents the model from accidentally editing the wrong occurrence.
+
+### 4.2.7 `list_files` (lines 210–222) — Workspace tree dump
+
+`mode: 'code'`. No params. Calls `listTree(workspaceBase, 200)`. **Cap of 200 entries** (lower than `workspace:list` IPC's 300, see §5).
+
+Format: directories with trailing `/`, files with `(NB)` size annotation. One entry per line.
+
+### 4.2.8 `delete_file` (lines 224–234) — Remove file or directory
+
+`mode: 'code'`. Single param: `path`. Calls `wsDeleteFile`, fires `onFileChange`, returns `"Deleted <path>."`.
+
+**No confirmation prompt.** The model can wipe the workspace by calling this repeatedly. The blast radius is bounded to the per-conversation workspace dir (§5 will verify), so even worst-case the user loses one conversation's generated files. Still: captured for §Hardening — a soft confirmation step (require the model to repeat the path or pass a `confirm=true` arg) would prevent accidental destruction.
+
+### 4.2.9 `run_bash` (lines 236–252) — **Arbitrary shell execution**
+
+`mode: 'code'`. Params: `command` (multiline), `timeout_ms` (number, default 60_000).
+
+Delegates to `wsRunBash`. Returns `exit=<code> (<duration>ms)\nstdout:\n...\nstderr:\n...\n[output was truncated]`.
+
+**This is the most powerful and most dangerous tool in the registry.** The model can run any shell command. Specific risks:
+
+- The command runs inside the workspace dir (verify in §5), but `cd /tmp` or absolute-path commands escape that easily.
+- Network egress: `curl`, `wget`, `npm install`, `pip install`, `git clone` — all available. The model can pull arbitrary code from the internet and execute it.
+- Filesystem reach: `rm -rf ~` would not be sandboxed by the cwd-in-workspace setup unless `wsRunBash` constrains it (verify §5).
+- Persistence: write to `~/.bashrc`, install launchd plist, etc.
+
+**As we add Skills + filesystem access, the threat model widens substantially.** The current implicit trust ("the model is Gemma, running locally, and the user explicitly clicked Build") is reasonable for a single-user dev tool but becomes unsafe if/when:
+- The conversation becomes user-shared (someone pastes a malicious prompt)
+- Skills introduce model-controlled extension loading
+- Filesystem access widens to user's real working dirs
+
+Captured at the top of §Hardening Roadmap alongside the multimodal-images bug. The right pattern is probably: per-tool approval (user clicks "Approve" before `run_bash` fires), with optional "Always approve in this conversation" toggles.
+
+### 4.2.10 `open_preview` (lines 254–257) — Reveal Canvas
+
+`mode: 'code'`. No params. Returns a string telling the model the preview URL. Pure informational — does not actually focus the Canvas pane (the rendering is handled by `Canvas.tsx` reacting to `workspace:changed` events). The tool exists primarily so the model can deliberately mark "I'm done, look here" — used as the terminal action in code mode per the system prompt.
+
+## 4.3 `cleanFileContent(raw, path)` (lines 144–178) — Markdown-fence stripper
+
+This is the workhorse that protects against Gemma's strong habit of wrapping file contents in code fences even when explicitly told not to. Three cases:
+
+### Case 1 — Fully wrapped (lines 148–150)
+
+Regex: `/^```[a-zA-Z0-9_-]*\n([\s\S]*?)\n```[\s\S]*$/`
+
+Matches `\`\`\`html\n<file content>\n\`\`\`<anything after>`. Captures group 1 = the inner content. **The `[\s\S]*$` tail is intentional** — strips trailing commentary the model may have added after the closing fence ("Key features: ...").
+
+Edge case: requires a leading `\n` after `\`\`\`lang` — would miss `\`\`\`html\r\n<content>` (Windows-style line endings emitted by the model). Low likelihood in practice but captured for §Hardening.
+
+### Case 2 — Leading fence only (lines 153–159)
+
+If the full-wrap regex didn't match but the content starts with `\`\`\`lang\n`, strip the leading fence. Then look forward for any `\n\`\`\`(?:\s|$)` and truncate everything from there.
+
+### Case 3 — File-type-aware trailing truncation (lines 163–175)
+
+- `.html`/`.htm` files: find the last `</html>`, truncate after it (+ `\n`).
+- `.svg` files: same with `</svg>`.
+- `.json` files: trim, find the last `}` or `]`, truncate there.
+
+This catches the failure mode where the model writes valid HTML/SVG/JSON followed by explanatory prose. Robust for those three file types; silently ignored for others (`.css`, `.js`, `.md`, `.py` — model would have to behave for these).
+
+**Worth knowing:** `cleanFileContent` is `export`ed and used by *two* call sites — the `write_file` tool itself, and the live-write streaming path in `handleChat` (§2.5). The two paths must use identical cleaning logic so the in-flight partial-disk-writes and the final post-action write are byte-identical. This is correctly enforced by sharing the function.
+
+## 4.4 The system prompts
+
+Two functions, both called from `handleChat` (§2.5).
+
+### `chatSystemPrompt(enableTools: boolean)` (lines 391–424)
+
+Two variants. **Both inject `new Date().toISOString()`, day-of-week, and the IANA timezone** (lines 392–393, `tz()` defined at line 359). This is the model's temporal grounding — without it, Gemma would have no idea what date it is.
+
+- **No tools variant:** ~3 lines. "You are Gemma, AI assistant, local Mac. Be clear, concise, helpful."
+- **With tools variant:** ~25 lines. Adds the `<action name="...">` format, the rule "one action per response, then STOP and wait," and the rendered tool catalog from `renderToolHelp('chat')`.
+
+### `codeSystemPrompt(workspacePath, previewHref)` (lines 426–498)
+
+~70 lines of carefully-tuned prompt engineering. Much more opinionated than chat mode:
+
+1. **Identity & context:** "You are Gemma, a local coding agent." Date/day/workspace/preview-href injected.
+2. **What to build:** "small apps, pages, demos, and scripts. Quality matters — the user is watching." With detailed style direction: modern polished design, real-feeling copy not lorem ipsum, working interactivity, CSS/SVG over fetched images.
+3. **File structure heuristic:** single `index.html` with inline `<style>` + `<script>` for one-off widgets; split into `index.html` + `style.css` + `app.js` for anything substantive.
+4. **The action loop:** plan in ONE sentence, IMMEDIATELY emit the first `write_file` in the SAME response (this is the rule the round-0 nudge in `handleChat` enforces), then narrate-then-action one at a time, call `open_preview` at the end.
+5. **`<content>` rules — "read twice":** literal disk write, NO fences inside `<content>`, NO commentary inside `<content>`, close tags on their own line. This is the bulk of the prompt — fighting Gemma's natural tendency to over-format.
+6. **Example multi-file build** (lines 467–485). A worked example showing exactly the expected output format with `<!doctype html>` content.
+7. **Hard rules** restated.
+8. **Available tools:** rendered from `renderToolHelp('code')`.
+
+**Engineering quality observation:** the code prompt is the result of many iterations of fighting model failure modes. Each "NEVER" line corresponds to a specific historical bug. Worth treating as accumulated wisdom — don't rewrite from scratch without preserving the lessons. Captured for §Hardening: when we extend with Skills, the prompt needs additive composition, not replacement.
+
+### `renderToolHelp(mode)` (lines 367–389)
+
+Iterates `TOOLS`, filters by `mode === 'both' || mode === currentMode`, renders each as a markdown-ish block:
+
+```
+### tool_name
+description
+Parameters:
+  <param>: description (required) — multi-line OK
+Example:
+<action name="tool_name">...
+```
+
+The result is interpolated into the system prompt. **This means adding a new tool automatically appears in the prompt** — no manual prompt-string edit required. Good extensibility property.
+
+## 4.5 The streaming action parser
+
+Three functions, used by the orchestrator's tool-parsing loop in `handleChat`.
+
+### `findNextAction(text, from=0)` (lines 508–528)
+
+Returns one of:
+- `ParsedAction` (full action found, parsed),
+- `'incomplete'` (open tag found but no matching close — model is mid-emit),
+- `null` (no open tag at or after `from`).
+
+Open-tag regex tolerates variations: `<action name="x">`, `<action name='x'>`, `<action name=x>`, with optional whitespace, case-insensitive. The captured group is the tool name (`[a-zA-Z_][\w]*`).
+
+Once an open tag is found, looks for `</action>` after. Closing is also case-insensitive with optional whitespace. If found, slice the body and pass to `parseActionBody`.
+
+### `parseActionBody(body)` (lines 530–560)
+
+Two-phase parse:
+
+1. **`<content>...</content>` special-case** (lines 534–545). Uses `lastIndexOf('</content>')` so nested `</content>` (which can appear inside HTML the model is writing, e.g., a `<style>` block with text saying `</content>`) doesn't prematurely close the body. Trims leading `\n` and trailing whitespace from the content. Removes the `<content>...</content>` span from the body before phase 2.
+2. **All other `<key>value</key>` tags** (lines 547–558). Simple regex sweep. For each match:
+   - Skip if `key === 'content'` (already handled, shouldn't reach here but defensive).
+   - Type coercion: `'true'` → boolean true, `'false'` → boolean false, digit-only-with-optional-sign → number, anything else → trimmed string.
+
+**Result:** a flat `Record<string, unknown>` matching the tool's `params` declaration. Type-coercion is a small but meaningful UX detail — `<replace_all>true</replace_all>` becomes boolean `true`, not string `"true"`, so the tool's `args.replace_all === true` check works as expected.
+
+**Edge case worth flagging:** attribute-style params (`<action name="x" path="foo">`) are not supported. All params must be nested tags. Reasonable design choice (one syntax, less for the model to confuse) — and the system prompt is unambiguous about it.
+
+### `emitSafeBoundary(buffer, from)` (lines 562–579)
+
+The cleverest function in the file. Solves: during streaming, we want to flush emitted-but-not-yet-shown buffer content to the renderer as plain text — but we must NOT emit characters that are forming the start of an `<action` tag we haven't fully received yet.
+
+Algorithm:
+1. Scan backward from `buffer.length - 1` to `from` looking for `<`.
+2. For each `<` found, look at the substring from there to end.
+3. If that substring could be the start of `<action` (case-insensitive), hold the boundary there — don't emit past this `<`.
+4. Otherwise this `<` is some other tag (`<p>`, `<div>`, etc.) — keep scanning further back.
+5. If no ambiguous `<` is found, the whole buffer is safe.
+
+**Tradeoff:** Slightly conservative. A pending `<table>` would NOT be held back because `<table` doesn't start with `<action`. Only `<a` followed by characters that match the prefix of "action" hold the boundary. This is exactly the right granularity.
+
+**Without this function**, the streaming would either (a) emit the literal characters `<action name="write_file">` as plain text to the user (ugly) or (b) buffer everything until end-of-stream (no streaming benefit). The boundary emitter gives us live token streaming AND clean action-tag elision.
+
+## 4.6 `runTool(name, args, ctx)` (lines 581–593)
+
+The dispatcher. Looks up `TOOLS[name]`:
+- Unknown → `"Error: unknown tool \"X\". Available: ..."` (includes the catalog so the model can self-correct).
+- Known → `await tool.run(args, ctx)`, catch any rejection → `"Error running <name>: <message>"`.
+
+**Every tool error is a string return, never a thrown rejection.** This is the single discipline that lets the chat orchestrator treat tool execution as infallible from a control-flow perspective. Errors propagate to the model as `[error] tool_name: message` synthetic tool messages, and the model is expected to read and adapt.
+
+## §4 Synthesis — what tools.ts tells us about extensibility
+
+1. **The architecture is genuinely good for adding Skills.** `TOOLS` is a flat string-keyed registry. Each `ToolSpec` is fully self-describing (name, params, mode, example, run). Adding a new tool means appending one entry; the system prompt updates automatically via `renderToolHelp`. This is the right starting point for a Skills integration — Skills become dynamically-discovered `ToolSpec` entries that get merged into the registry at startup or on-demand.
+
+2. **The XML-tag action format is the wire protocol.** Skills would need to either (a) emit the same `<action name="...">` shape, which means every Skill is conceptually a tool with structured params, or (b) introduce a parallel routing mechanism. Path (a) is the simpler integration and keeps one parsing path. Worth discussing the tradeoff explicitly when we get to designing the Skills extension.
+
+3. **`run_bash` is the high-water-mark of capability and the high-water-mark of risk.** Any approved-filesystem-access feature should *not* widen `run_bash`'s scope — it should add new narrower tools (`fs_read_user_dir`, `fs_write_with_approval`, etc.) with explicit user approval gates. The architecture supports this cleanly (just add new `ToolSpec` entries with new `run` implementations that prompt the user before proceeding).
+
+4. **Per-tool approval doesn't exist yet.** This is the single biggest functional gap for the "approved basis" goal. A new layer in `runTool` could intercept high-risk tools, surface an approval dialog via a new IPC channel, await the user's decision, then proceed or reject. Captured as the central §Hardening item for that goal.
+
+5. **The system prompts are valuable IP.** Especially `codeSystemPrompt`. Many `NEVER` and `ALWAYS` lines map to specific historical failure modes the upstream and we have battled. Treat them as load-bearing; extend, don't rewrite.
+
+6. **Five hardening items specific to tools.ts:**
+   - `web_search` HTML-regex fragility (switch to real search API).
+   - `fetch_url` SSRF surface (allowlist/denylist + private-IP block + size cap + timeout).
+   - `calc` `Function()` pattern (replace with a real parser).
+   - `delete_file` confirmation (require explicit `confirm=true` arg).
+   - `run_bash` user approval (the central gap for the "approved basis" feature).
+
+Section 4 complete. Section 5 (`src/main/workspace.ts`) is next.
+
+---
+
+## (Sections 5–7 and 9–10 will be filled in as the file-by-file deep dive continues.)
