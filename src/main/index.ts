@@ -1,4 +1,16 @@
 import { app, shell, BrowserWindow, ipcMain, nativeTheme, session, nativeImage } from 'electron'
+// EPIPE guard — Electron main can lose stdout to a closed pipe at startup,
+// which turns the first console.log into an uncaught exception that crashes the app.
+// See locateMLX() in ./mlx for the first call that surfaces this.
+process.stdout.on('error', (err: NodeJS.ErrnoException) => {
+  if (err.code === 'EPIPE') return
+  throw err
+})
+process.stderr.on('error', (err: NodeJS.ErrnoException) => {
+  if (err.code === 'EPIPE') return
+  throw err
+})
+
 import { join } from 'path'
 import { electronApp, optimizer, is } from '@electron-toolkit/utils'
 import { AVAILABLE_MODELS } from '@shared/types'
