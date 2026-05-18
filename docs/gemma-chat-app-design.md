@@ -2680,6 +2680,375 @@ Gemma Chat is a well-architected single-user local-AI Electron app: clean three-
 
 ---
 
-**Document complete.** Every source file in `src/` covered, every IPC channel mapped, every known issue catalogued, every hardening recommendation prioritized.
+**Document complete (Phase 0 forensic audit).** Every source file in `src/` covered, every IPC channel mapped, every known issue catalogued, every hardening recommendation prioritized.
 
-Next session, the highest-value moves are: (1) Patch 5 — fix multimodal images in `mlx.ts:chatStream` (item #1, ~30 min); (2) Patch 6 — dead-man timer in `Setup.tsx` + HF transfer env var (items #2, #3, ~1–2 hours); (3) start Skills design discussion grounded in §9.8.
+> **Section 10 below supersedes the first-principles recommendations in §9.7 and §9.8** with research-grounded specifics from the four Phase 0 research investigations completed 2026-05-17 (docs at `docs/research/01–04`). When the two conflict, §10 wins.
+
+---
+
+# Section 10 — Phase 0 Research Close-out & Revised Roadmap
+
+**Status:** Synthesizes four research investigations into one actionable plan.
+**Source docs:** `docs/research/01-mlx-vlm-and-gemma-4.md`, `02-image-generation-strategy.md`, `03-sota-electron-and-skills-architecture.md`, `04-aios-integration-and-self-improvement.md`.
+**Date:** 2026-05-17.
+
+## 10.1 What changed from §9 to here
+
+§9 was first-principles synthesis from reading the code. §10 is grounded in:
+- The actual `mlx-vlm` wire format (read from the server source, not guessed)
+- A surveyed image-gen provider landscape with cited pricing/latency/return-format
+- Surveyed SOTA Electron security (fuses, ASAR integrity, IPC validation pattern, sandbox-exec) and the Anthropic Skills + MCP architecture
+- A read of Bear's RISE framework, persistence-discipline, and filesystem-truth rules — explicit integration seams identified
+
+**Net effect on §9's recommendations:**
+
+| §9 item | §10 status | Why |
+|---|---|---|
+| §9.6 Critical #1 (multimodal images) | **Promoted with exact wire format** | Research #1 gave us the OpenAI-canonical content-parts shape, the base64 data-URL convention, the images-before-text ordering rule, and a verbatim code patch. |
+| §9.6 Critical #2 (lying spinner) | **Unchanged** | No research needed; fix is local. |
+| §9.6 Critical #3 (chat stream timeout) | **Unchanged** | No research needed; fix is local. |
+| §9.6 High #4 (`run_bash`) | **Replaced with curated typed tools + gated sandbox-exec** | Research #3 closed this with the canonical pattern. |
+| §9.7 Phase 1 items 1–5 | **Locked in with research-grounded specifics** (see §10.4) | |
+| §9.7 Phase 2 items 6–11 | **Reshaped around Anthropic SKILL.md + MCP** (see §10.5) | |
+| §9.8 "subprocess + JSON-RPC for first Skill" | **Replaced — adopt Anthropic SKILL.md format directly** | Research #3 found MCP is the de facto standard; SKILL.md is the instruction-shaped extension, MCP servers are the action-shaped extension. They're complementary. |
+| §9.8 approved-FS feature | **Specified concretely** with the per-tool approval matrix (see §10.5.4) | |
+| Implicit: self-improvement workspace | **Specified as three-tier promotion** (per-conv → app-level → Bear-reviewed master library) per Research #4 | |
+| Implicit: AIOS integration | **Specified via session handoffs** as the canonical bridge artifact | |
+
+## 10.2 Cross-cutting decisions — locked
+
+These are the load-bearing architectural choices that ripple across multiple Phase 1+ items. Locking them now prevents thrash later.
+
+### 10.2.1 Tool definition shape
+
+**Decision:** Adopt the **Vercel AI SDK v5 tool shape** (`name`, `description`, `inputSchema`, optional `outputSchema`, `execute`) as the type of every `ToolSpec` entry in `src/main/tools.ts`. Schemas are Zod. No dependency on the `ai` package — a 40-line `tool()` helper of our own gives the inference benefits.
+
+**Why this shape specifically:** AI SDK v5 deliberately renamed `parameters` → `inputSchema` to align with MCP's vocabulary. Adopting the same names means tools we define are 1:1 translatable to MCP-exposed tools, and MCP tools we consume have the same shape as our native ones. One mental model, one parser, one approval surface.
+
+**Migration:** the current `ToolSpec` becomes a subset of the new shape; existing tool definitions get an `inputSchema` derived from their `params` array (mechanical translation). The XML `<action>` parser already produces a Record<string, unknown>; with Zod we now validate that record before dispatching.
+
+### 10.2.2 IPC validation
+
+**Decision:** Hand-rolled `defineHandler` wrapper with Zod schemas. **Not** `electron-trpc`.
+
+**Why not electron-trpc:** every call goes through SuperJSON twice. For the streaming-chunk channel (one IPC event per token, thousands per turn) the overhead is real. Research #3 cites a December 2025 analysis flagging this as a measurable performance tax.
+
+**Wrapper shape:** ~40 LOC. Centralizes sender allowlist (Electron security rec #17), schema validation, and audit logging in one place. Migrate channel-by-channel starting with the highest-blast-radius (`chat:send`, `workspace:*`, future `tool:*`).
+
+### 10.2.3 Skills format
+
+**Decision:** Adopt **Anthropic's SKILL.md format verbatim** (`name`, `description`, three-level progressive disclosure via SKILL.md → referenced files → bundled scripts).
+
+**Why:** It's the most thoughtful filesystem-based skill design in production. It's already what Claude Code uses. Skills authored for Claude Code can drop into Gemma Chat without modification. The progressive disclosure model is *necessary* for an 8B-parameter model whose effective context is tighter than Claude's — loading 30 skills' full bodies would be catastrophic; loading 30 one-line descriptions costs ~3,000 tokens.
+
+**Reconciliation with Bear's Skill v3.1 standard:** Research #4's working model of v3.1 (inferred from the registry — the two `_readme_first_/` standards docs couldn't be read; flagged `[VERIFY]`) appears largely compatible with Anthropic's frontmatter shape. The right move is:
+1. Implement the loader against Anthropic's exact spec.
+2. Read Bear's v3.1 standard once we can (paste, sudo, or permissions fix).
+3. If v3.1 adds fields beyond Anthropic's (e.g., `runtime:`, `model_min:` as Research #4 proposes), the loader treats them as optional metadata — present skills with those fields, ignore them on skills without.
+
+This way we ship without being blocked on v3.1, and we extend to v3.1 conventions as they're confirmed.
+
+### 10.2.4 The action wire format stays as-is
+
+**Decision:** Keep the existing `<action name="...">` XML format that the streaming parser already handles. Don't switch to JSON-mode tool calling.
+
+**Why:** The streaming-safe boundary emitter in `tools.ts` (§4.5) is genuinely clever and works. Gemma 4 has been prompted into reliably emitting this shape. Changing the wire format to JSON would require re-prompting the model, rewriting the parser, and lose the partial-disk-write feature for `write_file`. The schema validation from §10.2.1 happens *after* parsing, on the extracted args.
+
+### 10.2.5 MCP integration goes second, not first
+
+**Decision:** Phase 1 ships SKILL.md skill loader. Phase 2 adds MCP client (stdio transport, Claude-Desktop-compatible `mcpServers` JSON config).
+
+**Why this order:** Skills are the instruction-shaped extension; MCP servers are the action-shaped extension. Skills typically *call* tools — sometimes MCP tools. Shipping skills first means we have demand for tools, which forces the registry to be clean before we plug MCP into it. Also: MCP requires us to make every tool call go through approval (a Phase 1 deliverable) before exposing 5,800+ servers' worth of capability.
+
+### 10.2.6 Self-improvement workspace: three-tier, append-only
+
+**Decision:** Three surfaces, with a one-way promotion path:
+
+| Tier | Location | Owner | Lifecycle |
+|---|---|---|---|
+| Per-conversation | `<workspace>/.aios/observations.md` | Gemma writes during chat | Lives with the conversation |
+| App-level | `<userData>/aios/skills/gemma-chat-runtime/patterns/{successful,anti}-patterns.md` | Gemma writes at conversation close, only when 3-data-point threshold met | Append-only, persists across conversations |
+| Master library | `/Users/bear/Skills/gemma-chat-runtime/` | **Bear-mediated promotion only** | Not autonomously writable |
+
+Per RISE's pattern-file rules: **append-only**, **3-data-point threshold before naming a pattern**, **stable header makes the append-only contract explicit**. Anti-patterns require a "what to do instead" counter-pattern entry — anti-patterns without remediations are noise.
+
+### 10.2.7 Session handoffs as the AIOS bridge
+
+**Decision:** Every Gemma Chat conversation produces a `SESSION_HANDOFF_gemma_<topic>_<YYYYMMDD>.md` at close (and on a 30-min heartbeat for long conversations). Written to `/Users/bear/claude-tracks/Knowledge_Base/` (local working copy, never T9-1 due to the documented SMB sandbox limitation).
+
+**Why:** Per Bear's `persistence-discipline.md`, session handoffs are the canonical bridge between sessions. Gemma Chat sessions are sessions. Without handoffs, work in Gemma Chat is invisible to the rest of the AIOS. The `gemma_` filename prefix makes the source auditable at a glance.
+
+### 10.2.8 Temporal grounding on every conversation
+
+**Decision:** On every conversation create (and on every model swap / workspace reset), inject a system message with: current date, current time + timezone, day-of-week, workspace path, operator, runtime identity.
+
+**Why:** RISE explicitly identifies temporal grounding as the single highest-impact change ever made in Bear's ecosystem — "effectively dropped temporal hallucination to zero." Gemma Chat partially does this today (chatSystemPrompt / codeSystemPrompt include `new Date().toISOString()`). Standardize and enforce on every conversation start, not just first prompt.
+
+## 10.3 Conflicts surfaced — needs your final call
+
+### 10.3.1 Write boundaries to Hindsight + KG
+
+You chose **"Gemma writes freely — full memory access."** Research #4 recommends the opposite for v1: Gemma owns its workspace + `userData/aios/`; touches handoff files; **reads but does not write** to Hindsight / Neo4j KG / IPP / agent-memory / Bear's master Skills library.
+
+The agent's recommendation is defensible for v1 specifically because:
+- The model is an 8B-parameter Gemma, not Claude. Hallucination rates and pattern-detection quality are lower; what gets written to the durable KG matters epistemically.
+- The promotion path (per-conv → app-level → Bear-reviewed master library) is itself a soft guardrail — patterns prove themselves before joining the canonical library.
+- The boundary can be relaxed later from data; tightening retroactively is harder (need to identify and remove model-polluted nodes).
+
+Your "write freely" choice is also defensible:
+- You know your tolerance, you have evaluation pipelines I don't, and you intentionally favor a permissive default that you tighten from observation.
+- Faster compounding — Gemma's learnings feed your KG immediately rather than waiting on a review queue.
+
+**Recommendation for your re-confirmation:** start with Research #4's restricted-write boundaries for v0.2 (handoffs + workspace + userData/aios only). Add a single "promote to KG/Hindsight" UI affordance the model can request and the human approves — same approval surface as risky tool calls. Loosen progressively to autonomous writes once we've watched Gemma's pattern-detection quality for a few weeks. **But this is reversible; the call is yours.**
+
+### 10.3.2 The two unread governance docs
+
+Research #4 was denied read access to:
+- `/Users/bear/Skills/_readme_first_/MindXpansion-CLAUDE-Standards.md`
+- `/Users/bear/Skills/_readme_first_/MindXpansion_Skill_Development_Standard_v3.1.md`
+
+The Skill v3.1 manifest structure in Research #4 §1.4 is inferred from the runtime skill registry, not from the standard itself. **Sections marked `[VERIFY]` should be cross-checked before implementing the Skills loader.** Three resolution options:
+
+1. **Grant read access** to `/Users/bear/Skills/_readme_first_/` from this session and have me re-read.
+2. **Paste the contents** of both files inline so I can incorporate them into a v3.1-aware loader spec.
+3. **Ship the Anthropic-format loader first**, treat v3.1 fields as optional extensions, reconcile when the standard is available.
+
+(3) is the lowest-friction path that unblocks Phase 1; (1) or (2) gives the cleanest final design.
+
+### 10.3.3 Skills directory: read Bear's master library directly?
+
+Research #4 recommends Gemma Chat **read** `/Users/bear/Skills/` at startup (read-only, filtered by an allowlist or proposed `runtime:` frontmatter field). This makes a single skill work for both Claude Code and Gemma Chat.
+
+Implementation choice for v0.2:
+- **Simple:** maintain a local allowlist file `<userData>/aios/skill-allowlist.json` listing skills to expose. Initially: `orient`, `verify-env`, `session-start`, `session:resume`.
+- **More ambitious:** propose a v3.1 standard amendment adding `runtime:` and `model_min:` frontmatter fields. Defer until 30+ pattern entries have accumulated in `gemma-chat-runtime`.
+
+Recommend the simple allowlist for v0.2; revisit standard amendment after the integration has proven its value.
+
+## 10.4 Revised Phase 1 — research-grounded, ordered
+
+Six items. Each is small (S), medium (M), or large (L) in scope; each has a "definition of done."
+
+### Phase 1.1 — Patch 5: fix multimodal images in `chatStream` (S, ~30 min)
+
+**Files:** `src/main/mlx.ts` (lines 431, 439).
+**Source:** Research #1 §4 has the verbatim code.
+
+Change `MLXChatMessage.images?: string[]` consumer in `chatStream` from:
+
+```ts
+messages: opts.messages.map((m) => ({ role: m.role, content: m.content }))
+```
+
+to:
+
+```ts
+messages: opts.messages.map((m) => {
+  if (!m.images || m.images.length === 0) {
+    return { role: m.role, content: m.content }
+  }
+  // Gemma 4: images first, text last.
+  const parts: Array<
+    | { type: 'image_url'; image_url: { url: string } }
+    | { type: 'text'; text: string }
+  > = m.images.map((url) => ({ type: 'image_url', image_url: { url } }))
+  if (m.content) parts.push({ type: 'text', text: m.content })
+  return { role: m.role, content: parts }
+})
+```
+
+Renderer must pass `data:image/...;base64,...` URLs in `m.images`.
+
+**Plus:** pin `mlx-vlm>=0.4.3` in `installMLX` (currently no pin; ships latest which is fine today, but no floor).
+
+**Plus:** add a one-line dev-mode log of `usage.prompt_tokens` after each completion. <50 tokens for a single-image request = silent drop (catches the bug class that already bit us once).
+
+**Definition of done:** can send an image to Gemma E4B via dev tools and get an actual description back; log shows hundreds of prompt tokens for a 512×512 PNG; existing text-only tests still pass.
+
+### Phase 1.2 — Patch 6: kill the lying spinner (M, ~1–2 hours)
+
+**Files:** `src/main/mlx.ts` (env vars), `src/renderer/src/components/Setup.tsx` (timer).
+**Source:** Audit §3.6 + §7.4.
+
+1. In `startServer`'s env block: add `HF_HUB_ENABLE_HF_TRANSFER: '1'`. Add `hf_transfer` to the pip install line in `installMLX`. Switches HF's download transport from the Xet-stall-prone default to a Rust-based one that doesn't have the failure mode.
+2. In `Setup.tsx`, track the last meaningful status update timestamp. If 30s elapse without progress while `isWorking && progress < 1`: yellow warning banner ("This is taking longer than expected"). If 90s: prominent banner with Cancel + Try Again buttons.
+
+**Definition of done:** simulating a 60-second download stall surfaces the warning banner; canceling at the 90s mark cleanly returns to Welcome.
+
+### Phase 1.3 — Patch 7: client-side chat stream timeout (S, ~30 min)
+
+**Files:** `src/preload/index.ts` (where `sendChat` lives).
+**Source:** Audit §6.
+
+Wrap the streaming-await in `Promise.race` with a no-chunk-for-90s timeout. On timeout: invoke `api.abortChat(conversationId)`, throw a recoverable error the renderer can surface.
+
+**Definition of done:** simulating a hung MLX response surfaces the timeout error after 90s; `chat:abort` is correctly issued.
+
+### Phase 1.4 — Patch 8: finish the mlx-lm → mlx-vlm comment cleanup (S, ~5 min)
+
+**Files:** `src/main/mlx.ts` lines 40, 105, 110. Plus the stale `ModelInfo.name` JSDoc in `src/shared/types.ts`.
+
+Find-replace `mlx-lm` → `mlx-vlm` and `mlx_lm` → `mlx_vlm` in comments only. Trivial.
+
+### Phase 1.5 — Audio variant gating + voice input through MLX (M, ~2–3 hours)
+
+**Files:** `src/renderer/src/components/Composer.tsx` (mic gating), `src/main/mlx.ts` + `tools.ts` (optional: switch from in-renderer Whisper to Gemma 4 native audio for E2B/E4B).
+**Source:** Research #1 §2.6.
+
+Two sub-steps:
+
+1. **Mic gating** (always do this): when current model is 26B-MoE or 31B-Dense, hide the mic button. Those variants have no audio path. The user shouldn't see a button that silently produces empty text.
+
+2. **(Optional this phase, but high-value):** for E2B/E4B variants, route voice transcription through Gemma 4's native audio path (Conformer encoder, 30s cap, WAV/MP3/FLAC) instead of the in-renderer Whisper-base.en. Gives multilingual support and integrates voice as a first-class modality alongside vision. The existing `lib/whisper.ts` becomes the fallback for the non-audio variants.
+
+**Definition of done:** mic appears for E2B/E4B, hidden for 26B/31B; voice input on E4B produces a transcript via the MLX path; comparison test confirms quality is ≥ Whisper-base.en.
+
+### Phase 1.6 — Initial AIOS integration (M, ~3–4 hours)
+
+**Files:** new `src/main/aios/` directory, `src/main/tools.ts` additions.
+**Source:** Research #4 §3.4 Increment 1.
+
+Minimal viable integration:
+
+1. **Temporal grounding** standardized: on conversation create, inject the full grounding system message (date, time, tz, workspace, operator, runtime identity). Not just date.
+2. **`<workspace>/.aios/observations.md`** created with append-only header on conversation create.
+3. **Two new tools** added to `tools.ts`:
+   - `aios.observe(text)` — appends timestamped entry to observations.md.
+   - `aios.now()` — returns current temporal grounding (date, time, tz, workspace id, operator).
+4. **System prompt addition** instructing Gemma to use `aios.observe` whenever it notices something worth capturing.
+
+**Definition of done:** a substantive conversation produces `<workspace>/.aios/observations.md` with at least one timestamped Gemma-written entry. No other AIOS surface touched. (Session handoffs come in Phase 2.)
+
+**Phase 1 commit cadence:** each numbered item is one commit, optionally split. Phase 1 ends with 6 commits + an updated Section 10.4 marking each item complete.
+
+## 10.5 Revised Phase 2 — capability + security (1–2 weeks)
+
+Six items. Implementation order matters less than dependencies.
+
+### Phase 2.1 — Image generation tool (`generate_image`) (M, ~2 days)
+
+**Source:** Research #2 §6.
+
+1. Add `wsWriteBinary(conv, path, Buffer)` to `workspace.ts` (binary sibling of `wsWriteFile`, skips `cleanFileContent`).
+2. New file `src/main/image-gen.ts` with provider abstraction interface + fal.ai implementation (Replicate as second impl).
+3. `safeStorage`-backed key storage. Guard against Linux `basic_text` fallback per Research #3 §1.4.
+4. Wire `generate_image` ToolSpec into `TOOLS` registry. `mode: 'both'`. Writes to `<workspace>/images/<YYYY-MM-DD>-<slug>-<rand>.png`.
+5. Settings → Image Generation panel (provider picker, key field, validate button).
+6. Inline image rendering in chat message component (regex-match `images/[a-z0-9-]+\.(png|jpg|webp)`, render as `<img>` pointing at the preview server).
+
+**Definition of done:** "draw me a sunset" produces an inline thumbnail in chat + a file in the Canvas file tree; cost telemetry shown in Settings.
+
+### Phase 2.2 — IPC validation retrofit (`defineHandler` wrapper) (M, ~1–2 days)
+
+**Source:** Research #3 §1.3, §3.1.
+
+1. New file `src/main/ipc/define.ts` (the ~40 LOC Zod wrapper).
+2. New file `src/main/ipc/schemas.ts` (one Zod schema per channel).
+3. Migrate `chat:send`, `workspace:*`, and any future `tool:*` channels to `defineHandler`. Lower-blast channels can migrate over time.
+4. Sender allowlist enforced.
+
+**Definition of done:** all migrated channels reject malformed input; sender check blocks any non-renderer caller; no behavioral regressions.
+
+### Phase 2.3 — Skills loader (Anthropic SKILL.md format) (M, ~2 days)
+
+**Source:** Research #3 §2.2, §3.2.
+
+1. Skill directories: `<userData>/skills/` (user) + `<repo>/.gemma-chat/skills/` (project).
+2. At startup: scan both, parse only YAML frontmatter, build skill catalog. Inject into agent system prompt as "available skills."
+3. New tool: `use_skill(name)` — `cat`s the SKILL.md body into the next agent turn. Triggers the progressive disclosure (model can then read referenced files via existing `read_file` tool).
+4. Read Bear's `/Users/bear/Skills/` per allowlist (see §10.3.3).
+
+**Definition of done:** dropping a skill into `~/Library/Application Support/Gemma Chat/skills/` and restarting makes it available; invoking it loads its body; the model can use referenced files.
+
+### Phase 2.4 — `run_bash` hardening: typed per-CLI tools + gated sandbox-exec (L, ~3–5 days)
+
+**Source:** Research #3 §1.8, §3.3.
+
+1. Add typed tools, each with Zod-validated args:
+   - `run_grep({ pattern, path, flags })` — path workspace-bounded.
+   - `run_jq({ filter, input })`.
+   - `run_git({ subcommand: enum, args })` — explicit subcommand allowlist.
+   - `run_gh({ subcommand, args })` — token from `safeStorage`.
+2. Deprecate `run_bash` as default-on; make it workspace-opt-in (`.gemma-chat/config.json` with `allowBash: true`) plus a one-time approval modal.
+3. When `run_bash` is allowed: wrap every invocation in `sandbox-exec` per the profile in Research #3 §1.8. Scrub env vars. Approval modal shows command + cwd + sandbox profile name.
+
+**Definition of done:** `run_bash` is gone from default workspaces; the four typed tools cover 90% of agent shell needs; opt-in `run_bash` requires explicit approval per invocation; sandbox-exec profile prevents network egress and out-of-workspace writes.
+
+### Phase 2.5 — Filesystem-access approval UX (M, ~2 days)
+
+**Source:** Research #3 §3.4.
+
+1. In-renderer modal (NOT Electron native dialog) for approval prompts.
+2. Persistent allowlist at `<userData>/allowlist.json`: `{ path, scope: 'read'|'write', expires, addedAt, grantedFor }`.
+3. Sensitive paths (`~/.ssh`, `~/Library/Keychains`, `~/.aws`, anything matching credential-path patterns) are always blocked, never approvable.
+4. Per-tool default policy enforced (the matrix from Research #3 §3.4): read-within-workspace = always allow; read-outside = prompt with persistence; write-outside = always prompt, no "always" option; delete = always prompt; `run_bash` = workspace-opt-in + per-call.
+
+**Definition of done:** asking Gemma to read a file outside the workspace surfaces an approval modal; granting "always allow this path" persists across restarts; blocked paths surface a clear "this path is restricted" message.
+
+### Phase 2.6 — Session handoffs + 3-tier pattern accumulation (M, ~2–3 days)
+
+**Source:** Research #4 §3.4 Increments 2–3.
+
+1. On conversation close (or 30-min heartbeat for long conversations): distillation pass writes `SESSION_HANDOFF_gemma_<topic>_<YYYYMMDD>.md` to `~/claude-tracks/Knowledge_Base/`. Template per Research #4 §2.4.
+2. Distillation also evaluates whether any observation has crossed the 3-data-point threshold across recent conversations. If so: append to `<userData>/aios/skills/gemma-chat-runtime/patterns/successful-patterns.md` (or `anti-patterns.md`).
+3. UI "Patterns" surface in Settings where Bear can review recent additions.
+4. **Decision required from §10.3.1:** if write-restricted boundaries, stop here. If write-freely, add Hindsight + Neo4j writers behind the same approval surface as risky tools.
+
+**Definition of done:** every closed conversation produces a handoff file; after 3+ conversations exhibiting a pattern, an entry appears in the app-level patterns file; append-only is enforced (app cannot edit existing entries).
+
+## 10.6 Phase 3 — distribution + advanced agent (later, when v0.2 + v0.3 are stable)
+
+Brief — full specs are in Research #3 §4 and §1.7, §1.9, §1.1, §1.2.
+
+- **Electron Fuses + ASAR integrity** via electron-builder config. CI assertion via `npx @electron/fuses read`.
+- **`sandbox: true`** after preload audit.
+- **macOS notarization + hardened runtime + entitlements** per Research #3 §1.7.
+- **Auto-update with Ed25519 manifest signing** (the Doyensec SafeUpdater pattern, not default electron-updater).
+- **MCP client** (Phase 2 from Research #3 §3.2): stdio transport, Claude-Desktop-compatible `mcpServers` JSON config. Tools registered into `TOOLS` under namespace `mcp:<server>:<tool>`.
+- **Skills v3.1 standard amendment** if needed (`runtime:` and `model_min:` fields), after we've seen the integration pay off.
+
+## 10.7 What we explicitly do NOT do in Phase 1
+
+To keep Phase 1 disciplined:
+
+- **No MCP client** (Phase 2.3 not 1; Skills format first; MCP after we have a clean approval surface).
+- **No Hindsight or Neo4j writes** from Gemma Chat in v0.2 (see §10.3.1 decision).
+- **No `/Users/bear/Skills/` autonomous writes ever** — promotion to master library is Bear-mediated only.
+- **No Electron Fuses / sandbox: true / notarization in v0.2** — these are v0.3 (Phase 3) and need an audit cycle each.
+- **No T9-1 writes** from any background process (documented sandbox limitation in filesystem-truth).
+- **No `bear-voice` / `bear-writer` invocation** from Gemma — communication-style skills require model capability Gemma may not have; risk of off-voice content under Bear's name.
+- **No replacement of the `<action>` XML wire format** — preserve the streaming-safe parser, the partial-disk-write feature, and the prompt engineering invested in it.
+
+## 10.8 What this revised plan unlocks
+
+End of Phase 1 (~1–2 days of work):
+- Gemma 4 vision and audio capabilities **actually work** (Patch 5 + audio gating + voice through MLX).
+- The lying spinner is resolved.
+- Chat hang failures are bounded.
+- Initial AIOS integration: every conversation grounded in time, observations capturable to disk.
+
+End of Phase 2 (~1–2 weeks of work):
+- Image generation via fal.ai integrated as a first-class tool.
+- IPC layer fully validated with Zod schemas.
+- Skills (Anthropic format) loadable from disk; first useful skills installed.
+- `run_bash` replaced with safer typed tools + gated escape hatch.
+- Filesystem access governed by user-approval flow with persistent allowlist.
+- Session handoffs bridge Gemma Chat into the rest of the AIOS; patterns accumulate.
+
+End of Phase 3 (~2–4 weeks of work, deferred):
+- App is shippable to other Macs (notarized, hardened, fuses set, updater secured).
+- MCP unlocks 5,800+ servers as installable Skills.
+- Sandbox: true closes the renderer-RCE class.
+
+## 10.9 What needs your decision before I start coding
+
+1. **Restated write-boundary call** (§10.3.1). Confirm "write freely" stands, or downshift to Research #4's recommendation for v0.2 with a clear escalation path.
+2. **Read access to the two governance docs** (§10.3.2). Grant access / paste contents / accept Anthropic-format-first.
+3. **Skills directory allowlist** (§10.3.3). Confirm the initial allowlist (`orient`, `verify-env`, `session-start`, `session:resume`) or revise.
+4. **OK to start Phase 1.1 (Patch 5) on confirmation, or do you want to review each research doc directly first?**
+
+Everything else is internal architectural choice that doesn't need your call.
+
+---
+
+**End of Section 10.** Phase 1 is ready to execute on your confirmation of the four items above.
