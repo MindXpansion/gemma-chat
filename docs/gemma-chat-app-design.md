@@ -2169,4 +2169,171 @@ Section 7 complete. Section 8 (Composer, Message, Canvas, Sidebar, whisper — s
 
 ---
 
-## (Section 8 and 9 will be filled in as the deep dive continues.)
+# Section 8 — Renderer (structural depth): Composer, Message, Canvas, Sidebar, whisper
+
+**Files:** Composer (283), Message (393), Canvas (349), Sidebar (81), whisper (101) — 1,207 lines.
+
+Structural depth (per the upfront agreement): purpose, key functions, IPC consumed, state held, notable behaviors. Less line-by-line than §§2–7; deep enough to extend safely.
+
+## 8.1 Composer.tsx — input + voice + send/stop
+
+**Purpose:** Textarea with auto-resize, mic-button voice input, send/stop button. The bottom bar of the chat surface.
+
+### State
+
+- `text: string` — current input.
+- `recState: 'idle' | 'recording' | 'loading-model' | 'transcribing'`.
+- `recordSeconds: number` — elapsed recording time (mm:ss display).
+- `recordError: string | null`.
+- `modelProgress: { pct, label } | null` — for Whisper model download progress.
+- Refs: `taRef` (textarea), `mediaRef` (MediaRecorder), `chunksRef` (Blob[]), `streamRef` (MediaStream), `timerRef` (recording-seconds interval).
+
+### Behavior highlights
+
+- **Auto-resize textarea** (lines 34–40): on every text change, reset height then set to `min(scrollHeight, 220px)`.
+- **Enter to send, Shift+Enter for newline, IME composition respected** (`!e.nativeEvent.isComposing`).
+- **Mic flow** (lines 56–119):
+  1. `navigator.mediaDevices.getUserMedia({ audio: true })` — gated by main's permission handler (§2.6 only grants media/mediaKeySystem).
+  2. `pickMime()` tries `audio/webm;codecs=opus` first, then `webm`, `mp4`, `ogg`.
+  3. `MediaRecorder.start()`, collect chunks via `ondataavailable`.
+  4. On stop: assemble Blob, reject if <500 bytes ("Recording too short"), call `transcribeAudioBlob(blob, onProgress)` from `lib/whisper.ts`.
+  5. Result text appended to existing `text` (preserves typed-then-spoken composition).
+  6. Cleanup: stop all MediaStream tracks, clear timer, reset state.
+- **State-aware UI** — placeholder switches between "Listening…" / "Transcribing…" / default; mic button shows seconds + pulsing red while recording, spinner while loading/transcribing; below the input shows hints, errors, or progress.
+- **Composer textarea has `data-composer` attribute** (line 152) — this is the hook the suggestion-click pattern in `Chat.tsx:EmptyState` (§7.5.9) reaches into. Documented coupling.
+
+### Correction to §2.7
+
+§2.7 marked `audio:transcribe` as a "known dead feature" that returns empty text. The IPC handler IS a stub — but **voice transcription itself is fully implemented and working**, just *entirely in the renderer*. Composer calls `transcribeAudioBlob` directly from `lib/whisper.ts` (§8.5), which runs Whisper via `@huggingface/transformers` with WebGPU (WASM fallback). The IPC bridge is unused dead code; the feature is live.
+
+This is a meaningful architectural observation: **the renderer can run ML models in-browser via transformers.js, completely independent of the MLX subprocess.** That capability could be useful for future features (e.g., in-renderer reranking, embedding, classification — anything where the model fits in a few hundred MB and doesn't need full MLX). Captured for §Hardening notes — and the dead IPC handler + bridge method should be removed.
+
+---
+
+## 8.2 Message.tsx — assistant + user message rendering
+
+**Purpose:** Render a single `ChatMessage`. Different layouts for user (right-aligned bubble) vs assistant (logo + markdown + tool calls + activity). Owns the markdown pipeline, the `<thinking>` block extraction, the tool-call card UI, and the rotating-verb activity bar.
+
+### Key subcomponents
+
+- **`parseThinking(content)`** (lines 19–33): extracts `<think>...</think>` or `<thinking>...</thinking>` blocks. Returns `{ thinking, thinkingInProgress, visible }`. Critical for Gemma 4 reasoning output — the model's internal monologue gets surfaced in a collapsible block instead of mixed into the visible response.
+- **`Message`** (lines 35–120):
+  - User: right-aligned bubble, `whitespace-pre-wrap`, no markdown rendering.
+  - Assistant: logo + `<ThinkingBlock>` (if any) + `<ToolCallView>`s + main markdown body + `<ActivityBar>` + hover-revealed Regenerate/Copy buttons.
+  - Markdown rendering: `marked.parse(parsed.visible, { breaks: true })` → injected via React's raw-HTML escape hatch. **HTML-injection surface** (see below).
+  - Streaming cursor (`▍`) appended via the same raw-HTML path.
+- **`ThinkingBlock`** (lines 229–260): collapsible, defaults open while in-progress, closed when done. Shimmer text on the label while thinking.
+- **`ToolCallView`** (lines 317–385): per-call card with icon, verb, target, expandable args/result/error. `write_file` calls show the first 4KB of content in a `<pre>`; other calls show JSON.stringify'd args truncated to 400 chars.
+- **`ActivityBar`** (lines 132–193): rotates labels every 3.5s through `THINKING_VERBS` / `GENERATING_VERBS`. Shows char count + elapsed time. **Suppresses itself if there's a running tool card showing the same state** (line 181) — avoids double-status.
+- **`toolVerb`, `toolLabel`, `toolIcon`** (lines 195–315): three switch statements mapping the 10 tools to display labels. Adding a new tool means adding entries to all three.
+
+### Markdown HTML-injection surface
+
+`marked v15` is generally safe by default (escapes attribute injection and doesn't allow `<script>` tags). Combined with the CSP's `script-src 'self' 'wasm-unsafe-eval' blob:` (which forbids inline scripts), the surface is small.
+
+But: the model controls the markdown content. If marked's defaults ever change, or a markdown parser CVE lands, the chat surface becomes the attack vector. Captured for §Hardening — consider passing the parsed HTML through DOMPurify before injection. Adds ~5 KB to the bundle; eliminates the class of risk.
+
+### Coupling to tools.ts
+
+Three switch statements in this file (`toolVerb`, `toolLabel`, `toolIcon`) plus the per-tool special-cases (e.g., `write_file` content preview) all encode tool names. Adding a new tool means edits to (a) `tools.ts:TOOLS`, (b) at least these three switches, and (c) `Chat.tsx` if any chunk handling is specific.
+
+For the Skills extension: every Skill that registers a new tool needs corresponding display metadata (label, icon, verb). The clean refactor would be to attach `displayVerb`, `displayIcon`, etc. to `ToolSpec` itself, so the renderer can render unknown tools generically and known tools with their custom presentation. Captured for §Hardening as the natural prep work for Skills.
+
+---
+
+## 8.3 Canvas.tsx — Preview / Code / Files
+
+**Purpose:** The right-pane Build tab. Three sub-tabs:
+- **Preview**: iframe to the workspace HTTP server (§5.3). Cache-busted via `?v=${nonce}` query param.
+- **Code**: live-streaming view of whatever file is currently being written (via `file:streaming` IPC). Line-numbered, monospace, auto-scroll-to-bottom unless user scrolled up.
+- **Files**: indented file tree from `api.listWorkspace`. Click to set as preview source.
+
+### State
+
+- `tab: 'preview' | 'files' | 'code'`.
+- `port: number` — workspace server port (fetched once on mount via `api.workspaceServerPort()`).
+- `files: WorkspaceFile[]`.
+- `selectedFile: string | null` — when set, preview shows that file specifically; otherwise the workspace root (renders `index.html` if present).
+- `nonce: number` — cache-busting counter, bumped on workspace changes and refresh clicks.
+- `liveFile: { path, content, done } | null` — current write_file streaming state.
+- `autoSwitched: boolean` — has the auto-tab-switch fired this round.
+
+### Behavior highlights
+
+- **Tab auto-switching during streaming**: when `file:streaming` arrives and `!autoSwitched`, switch to Code tab. When `done:true` arrives, wait 1400ms, then switch back to Preview. **This is the live-typing demo experience** — the user sees the code appearing, then the rendered result.
+- **Iframe reload debounce**: `workspace:changed` events trigger a 350ms-debounced `nonce++`, causing the iframe to reload with a new cache-busting URL. Without the debounce, rapid-fire workspace changes (e.g., during code-mode tool-heavy rounds) would cause iframe thrashing.
+- **`refreshFiles()`** (lines 76–83): calls `api.listWorkspace(conversationId)`, swallows errors to `[]`. Called on conversation change, on workspace:changed, and never explicitly otherwise — file list can go stale if the user opens the workspace in Finder and adds/removes files (no file watcher, see §5 finding).
+- **Open Workspace Folder** button calls `api.openWorkspace(conversationId)` → `shell.openPath(workspaceDir(conversationId))`. Useful escape hatch.
+- **Code view's `userScrolledRef`** (lines 197–207): tracks whether the user has scrolled up from the bottom. If they have, don't auto-scroll. Same discipline as Chat's MessageList.
+
+### IPC consumed
+
+- `workspaceServerPort` (one-shot on mount)
+- `listWorkspace` (on mount, on conversation change, on workspace changed)
+- `openWorkspace` (button click)
+- `onWorkspaceChanged` subscription (lifetime of the component)
+- `onFileStreaming` subscription (lifetime of the component)
+
+### Notable
+
+- **`previewSrc` URL** (lines 85–90): `http://127.0.0.1:${port}/${encodeURIComponent(conversationId)}/${path}?v=${nonce}`. The `encodeURIComponent` on conversationId is correct defense (the workspace server's `sanitizeId` does the actual safety enforcement on the server side; encoding here is for URL well-formedness).
+- **Iframe sandbox attribute is not set.** The CSP's `frame-src http://127.0.0.1:*` restricts the *source* of frames, but the loaded content runs without `sandbox` attribute restrictions. The previewed code runs in a separate origin (different port, with the workspace server's permissive CORS), but it has access to localhost network and any `data:` URIs. Low-risk because the content is the user's own generated files, but captured for §Hardening — add `sandbox="allow-scripts allow-same-origin"` if we ever serve any third-party content here.
+
+---
+
+## 8.4 Sidebar.tsx — conversation list
+
+**Purpose:** Left rail. New Chat button, conversation list, "Running locally" + author footer.
+
+**81 lines, mostly markup.** Three observations:
+
+1. **Drag region at top** (`drag` class on the outer div) — the macOS title bar drag area.
+2. **Delete confirmation uses `confirm()`** (line 52). Per the global instructions, modal dialogs in Electron renderers block the renderer event loop, which is generally fine for confirm but worth noting — if you ever ship a Skill that needs to react to delete events, that dialog being open blocks IPC handling.
+3. **Hard-coded `@ammaar` footer link** (lines 69–76) — upstream attribution, target=_blank, opens via `shell.openExternal` (correct per §2.2's `setWindowOpenHandler`). Captured as one of the upstream-drift markers from §1.
+
+---
+
+## 8.5 lib/whisper.ts — in-browser speech recognition
+
+**Purpose:** The actual implementation of the voice feature. Loads a Whisper model via `@huggingface/transformers` (transformers.js), runs inference entirely in the renderer using WebGPU (with WASM fallback).
+
+### Configuration
+
+- **`env.allowLocalModels = false`** — model must be downloaded from HF, not loaded from a local file path.
+- **`env.useBrowserCache = true`** — caches the downloaded model in the browser's IndexedDB. First voice use takes 30+ seconds; subsequent uses are instant.
+- **Model: `onnx-community/whisper-base.en`** — English-only Whisper Base. Comment (lines 10–11) explains the choice: avoids a known broken int4 quantization in Xenova's older `whisper-tiny.en`. **English-only** is a real limitation — non-English voice input would transcribe to garbage. Captured for §Hardening as a (small) capability ceiling.
+- **`dtype: { encoder_model: 'fp32', decoder_model_merged: 'q8' }`** — full precision encoder, 8-bit quantized decoder. Reasonable balance.
+
+### `getTranscriber(onProgress)` (lines 14–40)
+
+- Singleton pipeline cached in `pipelinePromise`. First call creates it; subsequent calls return the cached promise.
+- Tries WebGPU first; on failure, falls back to WASM. Logs the WebGPU error. **WASM fallback works on every modern browser** but is meaningfully slower (10-30x slower depending on hardware).
+- Progress callback forwarded to consumer for the model download phase.
+
+### `transcribeAudioBlob(blob, onProgress)` (lines 48–75)
+
+1. **Decode the audio blob** via `AudioContext({ sampleRate: 16000 })`.
+2. **Mix to mono** if needed (`mixToMono` — sums channels, divides by N).
+3. **Resample to 16 kHz** if the AudioContext didn't honor the target rate (some browsers, notably Safari, ignore the `sampleRate` constructor option). `resampleLinear` does linear interpolation. Good-enough for speech.
+4. **Run the transcriber** with `chunk_length_s: 30, stride_length_s: 5` — standard Whisper chunking parameters for long-form audio.
+5. **Concatenate results** (Whisper may return an array for multi-chunk audio) and trim.
+
+### Integration
+
+Only called from `Composer.tsx:startRecording → rec.onstop`. No other call sites. The `setTranscriberModel` exported function (lines 42–46) for swapping models is unused in the codebase — dead export. Captured for §Hardening cleanup or for retention if we plan to support model swapping in UI.
+
+## §8 Synthesis
+
+1. **Voice transcription works and is good.** The IPC stub was misleading; the actual implementation is solid (transformers.js + WebGPU). The dead IPC channel should be removed; the feature should stay.
+2. **transformers.js capability is broader than just whisper.** The renderer can run any HF model that has an ONNX export and fits in memory. Useful primitive for future features (in-renderer embeddings, classification, reranking) that don't need the MLX subprocess.
+3. **Message rendering has a small HTML-injection surface via the marked output path.** Mitigated by CSP and marked's defaults. Adding DOMPurify is cheap insurance — captured for §Hardening.
+4. **Adding a new tool means editing three switches in Message.tsx plus tools.ts.** For Skills extensibility, lift display metadata (verb, icon, label-generator) onto `ToolSpec` itself so unknown tools render generically and known tools render with their own metadata. The natural prep work for Skills.
+5. **Canvas's live-tab-switching behavior is a real UX win.** Auto-Code-while-streaming, auto-Preview-when-done — preserve this as we evolve.
+6. **No file watcher means the Files tab can go stale.** Same finding from §5; surfaces here because Files is where the user notices.
+7. **All upstream attribution drift markers from §1 are visible in actual UI:** the `@ammaar` Sidebar link, the (no longer accurate) Welcome screen copy, the package metadata. Cosmetic but visible.
+
+Section 8 complete. Section 9 (cross-cutting synthesis) is the close-out.
+
+---
+
+## (Section 9 will be the final cross-cutting synthesis.)
