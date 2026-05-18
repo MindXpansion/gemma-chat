@@ -2336,4 +2336,350 @@ Section 8 complete. Section 9 (cross-cutting synthesis) is the close-out.
 
 ---
 
-## (Section 9 will be the final cross-cutting synthesis.)
+# Section 9 — Cross-Cutting Synthesis: IPC Map, Lifecycle, Footprints, Risk Register, Hardening Roadmap
+
+The whole-system view. Reads against §§1–8 but is self-contained: if you only have time for one section, read this one.
+
+## 9.1 Complete IPC channel map
+
+Direction: `→` = renderer-to-main (invoke/return), `←` = main-to-renderer (event/stream).
+
+| Channel | Direction | Args / Payload | Returns / Subscribers | Source | Notes |
+|---|---|---|---|---|---|
+| `setup:start` | → | `model: string` | void | `index.ts:487` | Triggers `handleSetup(model)`; emits many `setup:status` |
+| `model:switch` | → | `model: string` | void | `index.ts:491` | Stops MLX, starts new; emits `setup:status` |
+| `setup:status` (probe) | → | — | `{ hasMLX: boolean }` | `index.ts:519` | Synchronous existence check for venv + mlx_vlm |
+| `models:list-local` | → | — | `string[]` | `index.ts:524` | Hits MLX server `/v1/models` — only shows loaded, not on-disk |
+| `chat:send` | → | `ChatRequest` | `{ channel: string }` | `index.ts:528` | Spawns async `handleChat`, returns dynamic channel |
+| `chat:abort` | → | `conversationId` | void | `index.ts:534` | Triggers AbortController in main |
+| `tools:list` | → | — | `Array<{name,description,mode}>` | `index.ts:539` | Tool metadata for UI |
+| `workspace:info` | → | `conversationId` | `WorkspaceInfo` | `index.ts:547` | Ensures + returns path/previewUrl |
+| `workspace:list` | → | `conversationId` | `WorkspaceFile[]` | `index.ts:556` | listTree max 300 |
+| `workspace:open-external` | → | `conversationId` | void | `index.ts:561` | `shell.openPath` |
+| `workspace:server-port` | → | — | `number` | `index.ts:566` | Workspace HTTP server port |
+| `audio:transcribe` | → | `{base64, model}` | `{text: ''}` | `index.ts:568` | **Dead stub** — returns empty; renderer transcribes via lib/whisper.ts |
+| `setup:status` (event) | ← | `SetupStatus` | Setup.tsx, SwitchingOverlay | `index.ts` everywhere | The lying-spinner channel |
+| `chat:stream:${conversationId}` | ← | `StreamChunk` | Chat.tsx (per-conversation) | `index.ts:170 emit` | Per-chat dynamic channel |
+| `chat:raw` | ← | `{conversationId, chunk}` | App.tsx (console.log only) | `index.ts:281` | Devtools-only debug forwarding |
+| `workspace:changed` | ← | `{conversationId}` | Canvas.tsx | `index.ts:199`, tools via ctx | Triggers refreshFiles + iframe reload |
+| `file:streaming` | ← | `{conversationId, path, content, done}` | Canvas.tsx | `index.ts:230` | Live write_file streaming for Code tab |
+
+**Total: 12 request-response handlers + 5 outbound channels = 17 channels.** Preload exposes 15 wrapper methods on `window.api`. Mapping is complete: every preload method corresponds to a registered handler or event subscription, and every registered handler/event has a preload entry.
+
+## 9.2 Lifecycle / state machine
+
+```
+   ┌─────────────────────────────────────────────────────────────────┐
+   │                       APP PROCESS LIFECYCLE                      │
+   └─────────────────────────────────────────────────────────────────┘
+
+   npm run dev / start                 user double-clicks .app
+            │                                   │
+            ▼                                   ▼
+   ┌──────────────────────────────────────────────────┐
+   │ Electron main bootstraps (out/main/index.js)     │
+   │  1. EPIPE guard installs                          │
+   │  2. app.whenReady fires                           │
+   │  3. setAppUserModelId, dark theme, dock icon      │
+   │  4. await startWorkspaceServer()  ← HTTP on 0     │
+   │  5. session permission handlers                   │
+   │  6. Register 12 ipcMain.handle channels           │
+   │  7. createWindow()  ← preload + renderer load     │
+   └──────────────────────────────────────────────────┘
+            │
+            ▼
+   ┌──────────────────────────────────────────────────┐
+   │ Renderer App.tsx mounts                           │
+   │  state: 'boot' → BootSplash shimmer               │
+   │  subscribes: onRawChunk, onSetupStatus            │
+   │  awaits: listLocalModels(), checkMLX()            │
+   └──────────────────────────────────────────────────┘
+            │
+            ├──────────── model exists + MLX installed ─────────────┐
+            │                                                        │
+            ▼                                                        ▼
+   ┌─────────────────────┐                          ┌─────────────────────┐
+   │ state: 'setup'      │                          │ state: 'setup'      │
+   │   stage: 'checking' │                          │   stage:'starting'  │
+   │   Welcome screen    │                          │   auto-startSetup   │
+   │   Model picker      │                          │                     │
+   └─────────────────────┘                          └─────────────────────┘
+            │ user clicks Download                              │
+            └────────────┬─────────────────────────────────────┘
+                         ▼
+            ┌────────────────────────────────────────────────┐
+            │ MAIN PROCESS: handleSetup(model)               │
+            │  → ensureMLXRunning(model)                     │
+            │     1. locateMLX (cached venv? sys python?)    │
+            │     2. installMLX if needed (pip install)      │
+            │     3. send 'starting-mlx' status              │
+            │     4. send 'downloading-model' status         │
+            │     5. await startServer:                      │
+            │        spawn python -m mlx_vlm.server          │
+            │        waitForHealth (10 min timeout):         │
+            │          poll /v1/models every 1.5s            │
+            │          OR break on subprocess exit           │
+            │     6. send 'ready' status  ─OR─ throw         │
+            │  catch → send 'error' status                   │
+            └────────────────────────────────────────────────┘
+                         │
+            ┌────────────┴────────────┐
+            │                          │
+            ▼                          ▼
+   ┌──────────────────┐      ┌──────────────────┐
+   │ state: 'ready'   │      │ state: 'setup'   │
+   │ → Chat.tsx       │      │   stage: 'error' │
+   │   loads convo    │      │   Try again btn  │
+   │   localStorage   │      └──────────────────┘
+   └──────────────────┘
+            │
+            │  ┌──────────────────────────────────────┐
+            ├─►│ user sends message                   │
+            │  │  Chat.handleSend                     │
+            │  │  → api.sendChat                      │
+            │  │  → ipcRenderer.invoke('chat:send')   │
+            │  │  → main handleChat(req, channel)     │
+            │  │     for round 0..maxRounds:          │
+            │  │       chatStream → MLX (SSE)         │
+            │  │       parse <action> tags            │
+            │  │       run tool, emit results         │
+            │  │     emit done | error                │
+            │  │  ← per-chunk: token / tool_call /    │
+            │  │     tool_result / activity / done    │
+            │  └──────────────────────────────────────┘
+            │
+            │  ┌──────────────────────────────────────┐
+            ├─►│ user picks different model           │
+            │  │  state: 'switching'                  │
+            │  │  → api.switchModel                   │
+            │  │  → handleSetup (stop + start)        │
+            │  │  on ready: state: 'ready' w/ new    │
+            │  │  on error: state: 'ready' w/ prev   │
+            │  └──────────────────────────────────────┘
+            ▼
+   ┌────────────────────────────────────────────────┐
+   │ app quit (Cmd-Q)                               │
+   │  before-quit:                                  │
+   │    stopServer() — SIGTERM mlx_vlm, sync        │
+   │    stopWorkspaceServer() — server.close, sync  │
+   │  (neither awaited; child may not finish exit)  │
+   └────────────────────────────────────────────────┘
+```
+
+**Critical liveness gap:** the `downloading-model → ready | error` transition is the only place where a hung promise (no return, no throw) can park the UI indefinitely. See §3.6 Case B and §7.4.
+
+## 9.3 Filesystem footprint — every path the app touches
+
+| Path | Read | Write | Owner | Notes |
+|---|---|---|---|---|
+| `<userData>/mlx/venv/` | ✓ | ✓ (created, sometimes wiped) | `mlx.ts` | Python venv with mlx-vlm |
+| `<userData>/mlx/venv/bin/python3` | ✓ (spawn) | — | `mlx.ts` | The venv Python binary |
+| `<userData>/mlx/models/` | ✓ | ✓ | `mlx.ts` via HF | HF cache — model weights here, isolated from `~/.cache/huggingface` |
+| `<userData>/workspaces/` | ✓ | ✓ | `workspace.ts` | Per-conversation dirs root |
+| `<userData>/workspaces/c_*/` | ✓ | ✓ | `workspace.ts`, tools | Agent's writable area |
+| `<appBundle>/build/icon.png` | ✓ | — | `index.ts` | Dock icon |
+| `<appBundle>/out/main/index.js` | ✓ (Electron) | — | electron-vite | Compiled main entry |
+| `<appBundle>/out/preload/index.mjs` | ✓ | — | electron-vite | Compiled preload |
+| `<appBundle>/out/renderer/` | ✓ | — | electron-vite | Compiled renderer + assets |
+| `/opt/homebrew/bin/python3.{10..13}` | ✓ (spawn probe) | — | `mlx.ts:findSystemPython` | Up to 12 versioned + 3 fallback candidates |
+| `/usr/local/bin/python3.{10..13}` | ✓ | — | same | |
+| `/bin/bash` | ✓ (spawn) | — | `workspace.ts:wsRunBash` | The shell for `run_bash` tool |
+| Browser IndexedDB (renderer) | ✓ | ✓ | `lib/whisper.ts` | Whisper model cache (~100 MB) |
+| Browser localStorage (renderer) | ✓ | ✓ | `Chat.tsx` | Conversation history (`gemma-chat:conversations:v2`) |
+
+**On macOS, `<userData>` = `~/Library/Application Support/Gemma Chat/`.** Everything app-state-related lives there. Uninstall = delete that one directory.
+
+## 9.4 Network footprint — every URL the app contacts
+
+### Outbound (the app initiates)
+
+| URL pattern | Direction | Triggered by | Frequency |
+|---|---|---|---|
+| `https://pypi.org/simple/` + wheel URLs | HTTPS | `installMLX` pip install | First-run setup only |
+| `https://huggingface.co/api/...` | HTTPS | HF Hub model resolution | First model download per model |
+| `https://huggingface.co/<repo>/...` | HTTPS | HF model file fetch | First model download |
+| `https://*.huggingface.co`, `https://*.hf.co`, `https://cdn-lfs.huggingface.co` | HTTPS | HF Hub LFS / CDN | Same as above |
+| `https://cdn.jsdelivr.net/...` | HTTPS | `@huggingface/transformers` for whisper | First voice use, cached after |
+| `https://duckduckgo.com/html/?q=...` | HTTPS | `web_search` tool | Per agent web_search call |
+| User-specified `http(s)://...` | HTTPS/HTTP | `fetch_url` tool | Per agent fetch_url call — **SSRF surface, no allowlist** |
+| `http://127.0.0.1:11437/v1/{models,chat/completions}` | HTTP | All MLX inference | Continuous during chat |
+| `http://127.0.0.1:<random>/<conv>/...` | HTTP | Canvas iframe | Continuous during Build |
+
+### Inbound (the app listens)
+
+| Port | Bound to | Source | Notes |
+|---|---|---|---|
+| 11437 | 127.0.0.1 | `mlx_vlm.server` (Python child) | Moved from 11434 in Patch 2 |
+| random (OS-assigned) | 127.0.0.1 | workspace HTTP server | Wide-open CORS but localhost-only |
+
+**No outbound telemetry.** `HF_HUB_DISABLE_TELEMETRY=1` is set on the MLX child env (§3.6). The app itself emits no analytics, no error reporting, no usage pings. Strong privacy posture by default.
+
+## 9.5 Process tree at full operation
+
+```
+launcher (Finder / Terminal)
+  └── Electron main (Node)
+        ├── Renderer (Chromium)
+        │     ├── Vite-bundled JS (React, marked, highlight.js, transformers.js)
+        │     └── IFrame: workspace HTTP server (Canvas preview)
+        ├── GPU process (Chromium)
+        ├── Utility processes (Chromium - audio, network, storage)
+        ├── HTTP server (Node, in-process on workspace server port)
+        └── mlx_vlm.server (Python child, spawned)
+              └── Python interpreter loading model weights into MLX
+                    ├── HF downloader threads (when fetching model)
+                    └── HTTP server on 127.0.0.1:11437
+```
+
+**On Cmd-Q:** Electron sends SIGTERM to the Python child via `stopServer()` (sync, fire-and-forget). The Python child gets SIGTERM, attempts graceful shutdown of its httpd. If the Electron main exits before the child fully terminates, the child becomes orphaned briefly but receives SIGHUP from the lost parent and exits promptly. **In practice this works.** In edge cases (heavy GC, write-to-HF-cache in flight), there's a small window where the orphan could leave a partial cache file.
+
+## 9.6 Consolidated findings — the things that matter
+
+### Critical (capability- or correctness-breaking)
+
+1. **Multimodal images dropped at the IPC bridge.** `MLXChatMessage.images` declared in `mlx.ts:421` but stripped by `chatStream`'s body construction at line 439. Gemma 4's vision capability — the entire motivation for Patch 4 — is currently unreachable. (§3.8)
+2. **The lying spinner.** Two failure modes: subprocess death (handled correctly) and HF Xet stall (UI sits at last-known progress for the full 10-min `waitForHealth` timeout). Fixes: dead-man timer + `HF_HUB_ENABLE_HF_TRANSFER=1`. (§3.6, §7.4)
+3. **Chat stream has no client-side timeout.** `api.sendChat` await hangs forever if main never emits `done`/`error`. The Stop button works but timeout-based UX exists nowhere. (§6, §7.5.4)
+
+### High (security / capability gaps for stated goals)
+
+4. **`run_bash` has no user-approval gate.** `BASH_DENY` is a six-pattern regex — a speed bump, not a sandbox. Trivial evasions exist (eval-substitution, language wrappers, alias indirection). For Skills + approved-FS, replace with deny-by-default + per-call user approval + sandbox-exec. (§4.2.9, §5.7)
+5. **`fetch_url` is an SSRF surface.** No allowlist, no private-IP block, no size cap, no timeout. The agent can be coaxed into fetching internal resources and leaking them into chat. (§4.2.2)
+6. **`setPermissionCheckHandler(() => true)`** wholesale grants every renderer permission check. (§2.6)
+7. **Workspace HTTP server CORS is wide-open** (`Access-Control-Allow-Origin: *`). Mitigated by 127.0.0.1-only binding, but not zero-risk. (§5.3)
+8. **No test framework, no linter.** Multiple bugs in this audit would have been caught by even minimal smoke tests. (§1)
+
+### Medium (drift / correctness / hygiene)
+
+9. **Stale "mlx-lm" doc comments** in `mlx.ts` (lines 40, 105, 110) survived Patch 4. (§3.3)
+10. **Stale upstream attribution everywhere:** `package.json` description ("Gemma 3"), `author: Ammaar`, `electron-builder.yml:appId`, `index.ts:setAppUserModelId`, `Sidebar.tsx` footer link, `ModelInfo.name` doc comment. (§1.1, §1.3, §8.4)
+11. **`audio:transcribe` IPC + `transcribeAudio` preload method are dead code.** Voice works via `lib/whisper.ts` directly. Remove the dead path. (§8.1 correction)
+12. **`hasModel` in `mlx.ts` is dead-ish** — parameter unused, function unreferenced. (§3.7)
+13. **High-frequency per-token state updates in `Chat.tsx`** trigger one `setConversations + localStorage write` per token. Batch via rAF. (§7.5.4)
+14. **`saveConversations` runs on every keystroke during streaming.** Same fix. (§7.5.3)
+15. **Auto-update is wired but inert** — placeholder publish URL. Either point at a real bucket or remove the dep. (§1.1, §1.3)
+16. **Three switches in `Message.tsx` mirror `tools.ts`'s tool list.** Adding a tool requires four edits. Lift display metadata onto `ToolSpec`. (§8.2)
+17. **No file watcher** — Files tab goes stale if the user edits the workspace in Finder. (§5)
+18. **Iframe in Canvas has no `sandbox` attribute.** Low risk; cheap insurance. (§8.3)
+19. **No structured logging** — `console.log` only. (§3 synthesis)
+
+### Low (cosmetic / minor)
+
+20. **Code/`tsconfig.web.json` path-alias inconsistency** — main uses `@shared`, preload uses relative path `../shared/types`. (§2.1)
+21. **`listTree` cap inconsistency** — 200 vs 300 in different callers. (§5.4)
+22. **`ResizableCanvas` width not persisted.** (§7.5.6)
+23. **`canvasVisible` boolean logic** in `Chat.tsx:226` is over-complicated. (§7 synthesis)
+24. **`setTranscriberModel` exported but unused.** (§8.5)
+25. **Whisper is English-only** (`whisper-base.en`). (§8.5)
+26. **`img-src https:`** wildcard in CSP could be tightened. (§7.1)
+27. **`stopServer` and `stopWorkspaceServer` in `before-quit` are sync fire-and-forget.** Edge case for partial-write corruption. (§2.6 + §3.6)
+28. **MLX `cleanFileContent` requires Unix newlines after ```lang fences.** Windows-style line endings would miss the strip. (§4.3)
+
+## 9.7 Prioritized hardening roadmap
+
+Numbered for tracking. Each has a difficulty (S/M/L) and a value (H/M/L).
+
+### Phase 1 — Resolve user-visible pain (do first)
+
+| # | Item | Difficulty | Value | Files |
+|---|---|---|---|---|
+| 1 | Fix multimodal — forward `MLXChatMessage.images` through `chatStream` body in correct mlx_vlm format | M | H | `mlx.ts` |
+| 2 | Dead-man timer on `setup:status` in renderer (warning at 30s no-progress, prominent at 90s) | S | H | `Setup.tsx` |
+| 3 | Add `HF_HUB_ENABLE_HF_TRANSFER=1` + `pip install hf_transfer` to install step | S | H | `mlx.ts` |
+| 4 | Client-side timeout on `api.sendChat` await (90–120s no chunk → abort + error) | S | M | `Chat.tsx` or `preload/index.ts` |
+| 5 | Finish Patch 4 — replace 3 stale `mlx-lm` strings in `mlx.ts` comments | S | L | `mlx.ts` |
+
+### Phase 2 — Prep for Skills + filesystem access
+
+| # | Item | Difficulty | Value | Files |
+|---|---|---|---|---|
+| 6 | User-approval gate for `run_bash` (new IPC channel + dialog in renderer) | M | H | `tools.ts`, `preload`, `Chat.tsx` |
+| 7 | Replace `BASH_DENY` regex with `sandbox-exec` invocation on macOS | M | H | `workspace.ts` |
+| 8 | Lift display metadata onto `ToolSpec` (verb, icon, label-generator) | S | M | `tools.ts`, `Message.tsx` |
+| 9 | `fetch_url` allowlist + private-IP block + size cap + timeout | M | H | `tools.ts` |
+| 10 | Skills extension point design — registry, manifest, loading, IPC for list/install/uninstall | L | H | new file(s) |
+| 11 | Approved-paths feature — `requestFilesystemAccess`, persistent allowlist, new tools (`fs_read_user_dir`, `fs_write_with_approval`) | L | H | `workspace.ts`, new IPC handlers |
+
+### Phase 3 — Robustness & hygiene
+
+| # | Item | Difficulty | Value | Files |
+|---|---|---|---|---|
+| 12 | Add minimal test suite (Vitest unit + Playwright smoke) — even one E2E test catches multimodal bug class | M | H | new |
+| 13 | Add ESLint + Prettier configs | S | M | new |
+| 14 | Structured logger writing to `<userData>/mlx/logs/` | S | M | `mlx.ts`, new logger module |
+| 15 | DOMPurify on marked output | S | M | `Message.tsx` |
+| 16 | rAF-batched conversation state updates during streaming | S | M | `Chat.tsx` |
+| 17 | Debounced `localStorage` writes | S | L | `Chat.tsx` |
+| 18 | Add `sandbox="allow-scripts allow-same-origin"` on Canvas iframe | S | L | `Canvas.tsx` |
+| 19 | Tighten workspace HTTP server CORS to renderer origin | S | M | `workspace.ts` |
+| 20 | Restrict `setPermissionCheckHandler` to explicit allowlist | S | M | `index.ts` |
+| 21 | File watcher for workspace dirs (chokidar) so Files tab stays fresh | M | M | `workspace.ts`, IPC |
+| 22 | Replace all stale upstream attribution (description, author, appId, footer link, etc.) | S | L | multiple |
+| 23 | Remove dead code: `audio:transcribe`, `hasModel`, `setTranscriberModel`, unused `hasModel` import in index.ts | S | L | multiple |
+| 24 | Real expression parser for `calc` (drop `Function` pattern) | S | L | `tools.ts` |
+| 25 | Real auto-update endpoint OR remove `electron-updater` | M | L | config |
+| 26 | Update `package.json` description to Gemma 4 | S | L | `package.json` |
+
+### Phase 4 — Optional / nice-to-have
+
+| # | Item | Difficulty | Value | Files |
+|---|---|---|---|---|
+| 27 | Persist Canvas width | S | L | `Chat.tsx` |
+| 28 | Consolidate `listTree` max constant | S | L | `index.ts`, `tools.ts`, `workspace.ts` |
+| 29 | Confirm-delete for `delete_file` tool (require explicit `confirm=true`) | S | L | `tools.ts` |
+| 30 | `GEMMA_CHAT_PYTHON` env override for testing | S | L | `mlx.ts` |
+| 31 | Multilingual Whisper model option | S | L | `whisper.ts` |
+| 32 | Expose `temperature` / `max_tokens` in `ChatRequest` | S | L | `shared/types`, `mlx.ts`, UI |
+| 33 | Migrate from upstream's `npmmirror.com` Electron mirror | S | L | `electron-builder.yml` |
+| 34 | Use shared HF cache opt-in (instead of always isolating to `<userData>/mlx/models`) | S | L | `mlx.ts` |
+| 35 | macOS notarization for distribution | M | M | CI / build |
+
+## 9.8 The Skills + filesystem-access goal — concrete next steps
+
+You stated two goals after "improve current abilities": Skills usage, and approved-basis filesystem access. Here's the architectural picture for both, grounded in what we now know.
+
+### Skills (additive tool registration)
+
+The `TOOLS` registry in `tools.ts` (§4) is already the right extension point. A Skill is conceptually:
+- A manifest (`name`, `description`, `version`, `author`, list of provided tools with full `ToolSpec` data + display metadata).
+- A loader (read manifest, register each tool into `TOOLS`, re-render system prompt).
+- A discovery/install path (where do Skills live on disk? how does a user install one?).
+
+Two architectural decisions to make explicitly when we start:
+
+**(a) Same wire format or new one?** Skills register `ToolSpec` entries that emit and consume the same `<action name="...">` XML the existing tools use. **Strongly recommend.** Keeps one parser (the streaming-safe boundary emitter in §4.5), one orchestrator (§2.5), one renderer pipeline. Skills become invisible-to-the-parser additions.
+
+**(b) Where do Skill implementations live?** Three options:
+- **In-process JS** (Skill is a JS module loaded at runtime, runs in main). Fastest, most powerful, highest blast radius.
+- **Subprocess** (Skill is an executable that responds on stdin/stdout, like an LSP server). Slower, sandbox-friendly, language-agnostic.
+- **MCP server** (Skill speaks the Anthropic Model Context Protocol). Future-proof, ecosystem-aligned.
+
+My instinct, given the current architecture, is to start with **subprocess + simple JSON-over-stdin protocol** for the first Skill, validating end-to-end. Then add MCP as a second loader once the first works. In-process is too much capability for too little structure at this stage.
+
+### Approved-basis filesystem access
+
+The pattern that fits the existing architecture:
+- **A persistent allowlist** of paths the user has approved (stored in `<userData>/approved-paths.json`).
+- **New tools** with names like `fs_read_user_path`, `fs_write_user_path`, `fs_list_user_dir` that require the target path to be in the allowlist.
+- **A new IPC handler** `fs:request-access(path)` that surfaces an Electron native dialog ("Allow Gemma Chat to read ~/Documents/?"). User answer is persisted.
+- **A new IPC handler** `fs:list-approved` + `fs:revoke(path)` for management.
+- **The existing `assertInWorkspace` (§5.2) generalizes** to `assertInAllowedPath(path)` — same check, broader root set.
+
+The clean implementation order:
+1. Add `~/Library/Application Support/Gemma Chat/approved-paths.json` read/write.
+2. Add the `fs:request-access` dialog flow.
+3. Add the new tools (`fs_read_user_path` etc.) that go through `assertInAllowedPath`.
+4. Add the management UI (probably a settings pane reachable from the Sidebar footer).
+5. Surface the allowlist state in the system prompt so the model knows what it can access.
+
+This is roughly **5 commits of work**, each independently testable. The `run_bash` user-approval gate from Phase 2 / item #6 should land first — it's the riskier feature and proves the approval-UX pattern Skills + FS will reuse.
+
+## §9 Synthesis — the whole doc in one paragraph
+
+Gemma Chat is a well-architected single-user local-AI Electron app: clean three-process separation, type-safe IPC, a thoughtful tool/agent layer with streaming-safe XML parsing, a path-bounded workspace abstraction with an atomic file primitive set, live in-flight write-to-disk during model token streaming, and a thoughtful UX that mostly stays out of the user's way. It also has two acute issues (the lying spinner under HF Xet stalls; multimodal images silently dropped at the IPC bridge), one large security gap (`run_bash` arbitrary shell with only a regex speed bump), zero tests, and a healthy amount of cosmetic upstream-attribution drift. The architecture is the right foundation for Skills and approved-basis filesystem access; both can be added via additive entries to the existing `TOOLS` registry + preload bridge + new IPC handlers, **without touching the chat orchestrator, the streaming parser, or the rendering pipeline.** Phase 1 of the hardening roadmap (items 1–5) resolves the user-visible pain points and unlocks the actual Gemma 4 vision capability. Phase 2 (items 6–11) lays the security foundation for the stated future goals. Phases 3 and 4 are hygiene that becomes important as the project widens beyond a single-user dev tool.
+
+---
+
+**Document complete.** Every source file in `src/` covered, every IPC channel mapped, every known issue catalogued, every hardening recommendation prioritized.
+
+Next session, the highest-value moves are: (1) Patch 5 — fix multimodal images in `mlx.ts:chatStream` (item #1, ~30 min); (2) Patch 6 — dead-man timer in `Setup.tsx` + HF transfer env var (items #2, #3, ~1–2 hours); (3) start Skills design discussion grounded in §9.8.
