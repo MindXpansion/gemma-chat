@@ -2741,12 +2741,27 @@ These are the load-bearing architectural choices that ripple across multiple Pha
 
 **Why:** It's the most thoughtful filesystem-based skill design in production. It's already what Claude Code uses. Skills authored for Claude Code can drop into Gemma Chat without modification. The progressive disclosure model is *necessary* for an 8B-parameter model whose effective context is tighter than Claude's — loading 30 skills' full bodies would be catastrophic; loading 30 one-line descriptions costs ~3,000 tokens.
 
-**Reconciliation with Bear's Skill v3.1 standard:** Research #4's working model of v3.1 (inferred from the registry — the two `_readme_first_/` standards docs couldn't be read; flagged `[VERIFY]`) appears largely compatible with Anthropic's frontmatter shape. The right move is:
-1. Implement the loader against Anthropic's exact spec.
-2. Read Bear's v3.1 standard once we can (paste, sudo, or permissions fix).
-3. If v3.1 adds fields beyond Anthropic's (e.g., `runtime:`, `model_min:` as Research #4 proposes), the loader treats them as optional metadata — present skills with those fields, ignore them on skills without.
+**Reconciliation with Bear's Skill v3.1 standard (now read and resolved):** v3.1 frontmatter is close to Anthropic's but has MindXpansion-specific fields:
 
-This way we ship without being blocked on v3.1, and we extend to v3.1 conventions as they're confirmed.
+```yaml
+---
+name: <kebab-case-id>                    # no "claude"/"anthropic"; v3.1 §3.4
+description: <[What] + [When] + [Capabilities]>   # ≤1024 chars, includes trigger phrases users would say, no XML; v3.1 §3.1
+allowed-tools:                            # v3.1 §3 — for Claude Code these are Desktop Commander tools; Gemma Chat maps to its own equivalents
+  - <tool spec>
+metadata:                                 # v3.1 §11 API-Ready
+  author: <author>
+  version: <semver>
+compatibility: <description>              # v3.1 §11 — optional, for platform-specific features
+---
+```
+
+**Three notes for the Gemma Chat Skills loader:**
+1. **No `runtime:` or `model_min:` exist in v3.1.** Research #4 proposed these speculatively; they're not in the standard. **Phase 2.3 uses the allowlist approach unambiguously** — no standard amendment needed.
+2. **`allowed-tools` needs a Gemma-Chat-side mapping.** Claude Code resolves entries like `Desktop Commander:read_file` to Desktop Commander MCP tools; Gemma Chat resolves them to its own workspace-bounded `read_file` etc. Map at load time.
+3. **Gemma Chat as a Skill RUNTIME only reads `SKILL.md` + frontmatter.** The full v3.1 artifact (`CLAUDE.md` developer guide, `evaluation-criteria.md`, `references/`, `assets/examples/`, `patterns/{program.md, evaluate.py, train.py, prepare.py, production-feedback.jsonl, health-history.jsonl, user-reported.jsonl, locked-passes.json}`) is build-time + Claude-Code-side. Gemma Chat ignores everything except `SKILL.md`.
+
+**For the `gemma-chat-runtime` meta-skill** (Gemma Chat's own self-improvement record from §10.2.6): v0.2 ships a minimal `SKILL.md` + `patterns/{successful,anti}-patterns.md` only. The full v3.1 infrastructure (autoresearch loop, evaluation-criteria, health monitoring) is Phase 3+ work — meaningful only once enough patterns have accumulated.
 
 ### 10.2.4 The action wire format stays as-is
 
@@ -2801,19 +2816,18 @@ Your "write freely" choice is also defensible:
 
 **Recommendation for your re-confirmation:** start with Research #4's restricted-write boundaries for v0.2 (handoffs + workspace + userData/aios only). Add a single "promote to KG/Hindsight" UI affordance the model can request and the human approves — same approval surface as risky tool calls. Loosen progressively to autonomous writes once we've watched Gemma's pattern-detection quality for a few weeks. **But this is reversible; the call is yours.**
 
-### 10.3.2 The two unread governance docs
+### 10.3.2 The two governance docs (RESOLVED 2026-05-17)
 
-Research #4 was denied read access to:
-- `/Users/bear/Skills/_readme_first_/MindXpansion-CLAUDE-Standards.md`
-- `/Users/bear/Skills/_readme_first_/MindXpansion_Skill_Development_Standard_v3.1.md`
+Both docs were read in full after Bear granted access. The `[VERIFY]` markers in Research #4 §1.4 and §2.2 are now resolved per §10.2.3 above. The Skills loader is unblocked.
 
-The Skill v3.1 manifest structure in Research #4 §1.4 is inferred from the runtime skill registry, not from the standard itself. **Sections marked `[VERIFY]` should be cross-checked before implementing the Skills loader.** Three resolution options:
+**Additional implications surfaced by the full read:**
 
-1. **Grant read access** to `/Users/bear/Skills/_readme_first_/` from this session and have me re-read.
-2. **Paste the contents** of both files inline so I can incorporate them into a v3.1-aware loader spec.
-3. **Ship the Anthropic-format loader first**, treat v3.1 fields as optional extensions, reconcile when the standard is available.
-
-(3) is the lowest-friction path that unblocks Phase 1; (1) or (2) gives the cleanest final design.
+- **§MX1 — "Never repeat what LLMs already know."** Applies to Gemma's system prompts. The current `chatSystemPrompt` / `codeSystemPrompt` in `src/main/tools.ts` largely follow this already, but the code-mode prompt's 70-line opinionated style guide could be audited — anything that's just general programming guidance can be cut. Captured for §10.4 Phase 1.6 sweep.
+- **§G1 — Size ceilings (≤200 lines per CLAUDE.md / rule file).** Doesn't apply to Gemma Chat itself (not a CLAUDE.md/AGENTS.md/rule file). Would apply if we ever ship a `gemma-chat-runtime` SKILL.md back to `/Users/bear/Skills/` (different ceiling: 500/650 target/hard from v3.1 §3).
+- **§MX9 — OUROBOROS co-management protocol.** Gemma Chat is neither OUROBOROS nor the Standards system. If we ever generate a CLAUDE.md file (we don't currently), preserve the `<!-- AIOS-MANAGED: standards=vX.Y -->` HTML comment marker.
+- **§MX4 — Core Partnership Triad (IPP + COI + Temporal).** Bear-and-Claude only. Gemma Chat respects but doesn't invoke. Temporal grounding is the one piece Gemma Chat DOES adopt directly (Phase 1.6).
+- **v3.1 §10 — Three-System Persistence (Neo4j KG + Hindsight + claude-tracks) is REQUIRED for skills.** This validates the hybrid write-boundary call from §10.3.1 and the Phase 2.6 + 2.7 plan.
+- **v3.1 §6 — Anti-Bloat Engineering.** Target 500 lines / 22KB, hard ceiling 650 / 28KB. Apply to any `SKILL.md` we generate. Not applicable to design docs like the one you're reading.
 
 ### 10.3.3 Skills directory: read Bear's master library directly?
 
