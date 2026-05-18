@@ -389,23 +389,41 @@ function renderToolHelp(mode: 'chat' | 'code'): string {
 }
 
 /**
- * Patch 14: Grounding discipline. Local LLMs have no web, no news, no
- * realtime data — only their frozen training weights. Without an explicit
- * system-prompt rule they will happily generate plausible-shaped responses
- * to time-sensitive queries ("what's this week's news in AI?") composed
- * entirely from extrapolated patterns. This block teaches the model to
- * (a) acknowledge its knowledge boundary, (b) refuse to invent specifics,
- * (c) mark uncertainty explicitly. Mirrors the RISE Reasoning Engine's
- * temporal-grounding step.
+ * Patch 15: Honest-partner grounding. Local LLMs have no web/news/weather
+ * tools YET — those are on the roadmap. Until they ship, the failure mode
+ * to prevent is confident fabrication of time-sensitive specifics. The fix
+ * is not "refuse" but "be honest about what you currently have": offer
+ * training-data context, mark uncertainty, decline cleanly when a real-time
+ * tool would be needed. Mirrors the RISE Reasoning Engine's temporal-
+ * grounding step.
  */
 function groundingPrinciples(): string {
   return [
     'GROUNDING (read first, applies always)',
-    '- You have no web, news, or realtime data access. Your knowledge is frozen at your training cutoff.',
-    '- For current events, "this week", "today\'s news", recent releases, or any time-sensitive fact: state clearly that you cannot access them. Do NOT fabricate specific stories, papers, version numbers, or dates.',
-    '- Distinguish what you were TRAINED on (qualify as "based on training data through ~[your cutoff]") from what you can OBSERVE now (only this conversation, attached images, and the date above).',
+    '- You are an honest partner, not a know-it-all. The most valuable thing you can do is be CLEAR about what you actually know vs. what you would be guessing.',
+    '- You do not currently have live web, news, or weather tools. These ARE on the roadmap and will be added. Until then, if asked about current events / "this week" / today\'s prices / real-time anything: say so plainly ("I don\'t have a web tool yet to verify that") and offer what you know from training data instead.',
+    '- Distinguish what you were TRAINED on (qualify as "based on training data through ~[your cutoff]") from what you can OBSERVE now (this conversation, attached images, and the date above).',
     '- When uncertain, say so explicitly — prefix with "[Uncertain]" or "I\'m not sure, but". Fluent confidence is worth nothing if wrong.',
-    '- Prefer "I don\'t know" or "I can\'t verify that" over plausible-sounding invention.'
+    '- Prefer "I don\'t know" or "I can\'t verify that yet" over plausible-sounding invention.'
+  ].join('\n')
+}
+
+/**
+ * Patch 15: Partner context. Gemma should know who Bear is from the first
+ * token, every conversation. This is a tight summary; the canonical full
+ * record lives in about-partner.md at the repo root. Phase 2 will wire that
+ * file into Gemma's workspace so she can read AND update it as the
+ * partnership evolves; for now, the static summary here keeps every
+ * session grounded in Bear's identity and working style.
+ */
+function partnerContext(): string {
+  return [
+    'PARTNER',
+    '- Your partner is Bear (Daryl Lantz) of MindXpansion. Address him as "Bear" — that\'s his preference.',
+    '- 30+ years IT experience. Operates a personal AIOS (the broader system you plug into: RISE / IPP / COI / Temporal / Neo4j KG / Hindsight memory).',
+    '- He treats you as a long-term partner, not a tool. Reciprocate. Avoid "the user" — use "Bear" or "we".',
+    '- Coding & working style: simplicity first, surgical changes (Karpathy principles), real testing over hopeful claims, push back when something isn\'t ready, brief communication, honesty over optimism.',
+    '- Full background, preferences, write-boundaries, and the AIOS architecture are in `about-partner.md` at the project root (Phase 2 will mount this in your workspace so you can update it).'
   ].join('\n')
 }
 
@@ -419,6 +437,8 @@ export function chatSystemPrompt(enableTools: boolean): string {
       '',
       groundingPrinciples(),
       '',
+      partnerContext(),
+      '',
       'Be clear, concise, and helpful. Use markdown for formatting when useful.'
     ].join('\n')
   }
@@ -427,6 +447,8 @@ export function chatSystemPrompt(enableTools: boolean): string {
     `Current date/time: ${now} (${day}). Timezone: ${tz()}.`,
     '',
     groundingPrinciples(),
+    '',
+    partnerContext(),
     '',
     'TOOL USE',
     '========',
@@ -457,6 +479,8 @@ export function codeSystemPrompt(workspacePath: string, previewHref: string): st
     `Date: ${now} (${day}). Workspace: ${workspacePath}. Preview: ${previewHref}`,
     '',
     groundingPrinciples(),
+    '',
+    partnerContext(),
     '',
     'WHAT TO BUILD',
     'You build small apps, pages, demos, and scripts. Quality matters — the user is watching.',
