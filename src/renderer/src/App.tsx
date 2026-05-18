@@ -8,6 +8,7 @@ type AppState =
   | { phase: 'setup'; status: SetupStatus; model: string }
   | { phase: 'ready'; model: string }
   | { phase: 'switching'; model: string; toModel: string; status: SetupStatus }
+  | { phase: 'reconnecting'; model: string; status: SetupStatus }
 
 export default function App() {
   const [state, setState] = useState<AppState>({ phase: 'boot' })
@@ -27,6 +28,11 @@ export default function App() {
             if (prev.phase === 'switching') {
               return { phase: 'ready', model: prev.toModel }
             }
+            // Patch 10: reconnect succeeded — preserve the model the user
+            // was on (no model change), drop the overlay, keep Chat alive.
+            if (prev.phase === 'reconnecting') {
+              return { phase: 'ready', model: prev.model }
+            }
             return { phase: 'ready', model: prev.phase === 'setup' ? prev.model : DEFAULT_MODEL }
           }
           if (status.stage === 'error') {
@@ -34,10 +40,27 @@ export default function App() {
             if (prev.phase === 'switching') {
               return { phase: 'ready', model: prev.model }
             }
+            // Patch 10: reconnect failed — return user to chat. The
+            // failure has already been surfaced as ⚠️ on the assistant
+            // message; kicking them to Setup would lose conversation state.
+            if (prev.phase === 'reconnecting') {
+              return { phase: 'ready', model: prev.model }
+            }
           }
           // If we're in switching phase, keep it as switching
           if (prev.phase === 'switching') {
             return { ...prev, status }
+          }
+          if (prev.phase === 'reconnecting') {
+            return { ...prev, status }
+          }
+          // Patch 10: a setup:status arriving while we're already 'ready'
+          // means MLX is being restarted under us (Patch 9 Reconnect, or
+          // future health-watcher-driven restarts). DO NOT route to Setup
+          // — that unmounts Chat and wipes conversation state. Overlay
+          // instead, same pattern as model:switch.
+          if (prev.phase === 'ready') {
+            return { phase: 'reconnecting', model: prev.model, status }
           }
           const model = prev.phase === 'setup' ? prev.model : DEFAULT_MODEL
           return { phase: 'setup', status, model }
@@ -115,6 +138,15 @@ export default function App() {
   if (state.phase === 'switching') {
     return (
       <div key="switching" className="anim-fade-in h-full w-full">
+        <Chat model={state.model} onSwitchModel={handleSwitchModel} />
+        <SwitchingOverlay status={state.status} />
+      </div>
+    )
+  }
+
+  if (state.phase === 'reconnecting') {
+    return (
+      <div key="reconnecting" className="anim-fade-in h-full w-full">
         <Chat model={state.model} onSwitchModel={handleSwitchModel} />
         <SwitchingOverlay status={state.status} />
       </div>
