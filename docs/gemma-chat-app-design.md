@@ -582,4 +582,344 @@ Section 1 complete. Section 2 (`src/main/index.ts`) is next.
 
 ---
 
-## (Sections 2–7 and 9–10 will be filled in as the file-by-file deep dive continues.)
+# Section 2 — Main Process: `src/main/index.ts`
+
+**Path:** `src/main/index.ts` (596 lines)
+
+**Role:** Electron main-process entry point. Owns the BrowserWindow lifecycle, registers every IPC handler the renderer is allowed to call, orchestrates the MLX setup/install/run flow, and runs the chat inference loop (including tool execution and live file streaming). This is the file the OS invokes when the app launches; everything else in main/ is reached through here.
+
+This is the largest and most behaviorally complex file in the codebase after `tools.ts`. Read it carefully — most production bugs in this app surface through code in this file.
+
+## 2.1 Imports & module-level state
+
+### Imports (lines 1–47)
+
+The first executable code is the EPIPE guard (lines 2–12, see Patch 1), inserted between the `electron` import and all other imports. The position matters: any `console.log` that fires before the guard installs can still crash the process. Placement is correct as-is — the only `console.*` calls in `index.ts` itself are inside callbacks that fire after `app.whenReady()`, well after this guard runs.
+
+After the guard:
+
+| Import | Source | Notable |
+|---|---|---|
+| `app, shell, BrowserWindow, ipcMain, nativeTheme, session, nativeImage` | `electron` | Standard set. `session` is used for permission handlers. |
+| `join` | `path` | For resolving paths relative to compiled `__dirname` (= `out/main/`). |
+| `electronApp, optimizer, is` | `@electron-toolkit/utils` | Electron app helpers; `is.dev` for dev-mode branches. |
+| `AVAILABLE_MODELS` | `@shared/types` | Used for resolving model label by HF repo ID. |
+| `locateMLX, installMLX, startServer, stopServer, hasModel, chatStream, listLocalModels, type MLXChatMessage` | `./mlx` | The MLX subprocess API. `hasModel` is imported but **not used in this file** — dead import, captured for §Hardening. |
+| `TOOLS, chatSystemPrompt, codeSystemPrompt, findNextAction, emitSafeBoundary, runTool, cleanFileContent, type ToolContext` | `./tools` | The tool registry + the streaming tool-call parser. |
+| `ensureWorkspace, startWorkspaceServer, stopWorkspaceServer, getWorkspaceServerPort, previewUrl, listTree, workspaceDir, wsWriteFile` | `./workspace` | Per-conversation workspace dirs + local HTTP server for Canvas previews. |
+| `type ChatRequest, StreamChunk, ToolCall` | `../shared/types` | Type-only imports. **Note:** uses relative path `../shared/types` rather than the `@shared` alias used elsewhere. Cosmetic inconsistency, captured for §Hardening. |
+
+### Module-level state (lines 49, 96, 460)
+
+```ts
+let mainWindow: BrowserWindow | null = null     // line 49
+let mlxPython: string | null = null              // line 96  (the venv python path)
+const chatAbortControllers = new Map<string, AbortController>()  // line 460
+```
+
+Three pieces of mutable state. All are confined to this file (no exports).
+
+- `mainWindow` — the single chat window. The app does not currently support multiple chat windows.
+- `mlxPython` — cached after first successful `ensureMLXRunning()`. Reused by `model:switch` so we don't re-detect Python on every model swap. **Reset on what events? Nothing in this file** — if `mlx_vlm.server` dies, `mlxPython` retains its stale-but-still-correct path, but if the venv is wiped externally we won't notice until the next `startServer` call.
+- `chatAbortControllers` — one per in-flight conversation. Created at the start of `handleChat`, deleted in its `finally`. The `chat:abort` IPC handler reaches into this map to abort the streaming HTTP request to `mlx_vlm.server`.
+
+## 2.2 `createWindow()` (lines 51–90)
+
+Single function, creates the BrowserWindow.
+
+### Window options
+
+| Option | Value | Why it matters |
+|---|---|---|
+| `width / height` | 1280 × 820 | Default size. |
+| `minWidth / minHeight` | 820 × 560 | Hard floor; the Canvas tab depends on having room. |
+| `show: false` | initially hidden | Shown in `ready-to-show` to avoid flash of unstyled content. |
+| `autoHideMenuBar: true` | — | macOS doesn't honor this much; mostly relevant if ever ported. |
+| `backgroundColor: '#0e0e0e'` | dark | Matches the renderer's CSS background. Prevents white flash. |
+| `titleBarStyle: 'hiddenInset'` | macOS | Native traffic-light controls overlaid on custom title bar. |
+| `trafficLightPosition: { x: 14, y: 14 }` | — | Manual positioning to fit the renderer's sidebar layout. |
+| `vibrancy: 'under-window'` + `visualEffectState: 'active'` | macOS | The translucent backdrop. |
+| `icon: '../../build/icon.png'` | — | The dock icon override (lines 467–470 redundantly sets it via `app.dock.setIcon`). |
+
+### `webPreferences` — security posture
+
+| Setting | Value | Implication |
+|---|---|---|
+| `preload: '../preload/index.mjs'` | — | The preload bridge. Must exist after build. |
+| `sandbox: false` | **disabled** | Preload runs with Node-level capabilities. Wider attack surface than `true`, but necessary for the `@electron-toolkit/preload` patterns used. |
+| `contextIsolation: true` | enabled | Preload's globals are not directly visible to renderer JS; bridge via `contextBridge`. Correct. |
+| `nodeIntegration: false` | disabled | Renderer cannot `require('fs')`. Correct. |
+
+**Net security posture:** partially hardened. `contextIsolation` + `nodeIntegration:false` is the correct combination. `sandbox:false` is a meaningful concession but is consistent with using `@electron-toolkit/preload`'s helpers. **No CSP is set anywhere in this file** — neither via `session.defaultSession.webRequest.onHeadersReceived` nor via `<meta http-equiv="Content-Security-Policy">` in the renderer HTML (verify in §7 index.html). For an app that loads `@huggingface/transformers` (which can fetch network resources) this is worth a §Hardening item.
+
+### Window event wiring
+
+- `ready-to-show` → show the window. In dev mode, open devtools detached.
+- `setWindowOpenHandler` → any link the renderer tries to open in a new window is deflected to `shell.openExternal` (system browser). Correct — prevents the app from being used as a browser.
+- Load path: in dev with `ELECTRON_RENDERER_URL` set, load from Vite dev server; otherwise load the built `index.html`. Standard electron-vite pattern.
+
+## 2.3 `send(channel, payload)` (lines 92–94)
+
+```ts
+function send(channel: string, payload: unknown): void {
+  mainWindow?.webContents.send(channel, payload)
+}
+```
+
+The only IPC-outbound helper used throughout the file. **Optional chaining means messages sent before window creation, or after destruction, are silently dropped.** This is correct for the setup flow (we send `setup:status` before/during window creation; the renderer subscribes on mount and may miss early statuses — UX is acceptable because `setup:status` is also queryable via `ipcMain.handle('setup:status')`).
+
+## 2.4 The MLX setup flow
+
+Two functions: `ensureMLXRunning` does the work, `handleSetup` wraps it with status emits and error handling.
+
+### `ensureMLXRunning(model: string): Promise<string>` (lines 98–138)
+
+Linear flow:
+
+1. **Locate Python.** Calls `locateMLX()`. If null, throws `"Python 3.10–3.13 not found. Install via Homebrew: brew install python@3.13"`. **Note:** the message says 3.10–3.13 but the comment in `mlx.ts` (Patch 4 didn't touch this) historically enforced `>=3.10`. Verify upper bound in §3 deep dive — may be stale messaging.
+2. **Install MLX if needed.** If `mlx.installed === false`, emits `installing-mlx` status, calls `installMLX(onProgress)`. The callback forwards pip output to the UI. Returns the venv python path, which is then used as `pythonToUse`.
+3. **Cache the python path** at module scope (`mlxPython = pythonToUse`).
+4. **Emit two setup statuses back-to-back:** `starting-mlx` ("Starting model runtime…") immediately followed by `downloading-model` ("Loading {label}… (first run downloads the model)"). The second overwrites the first in UI almost instantly — the `starting-mlx` stage is essentially never observed by the user. Possible UX simplification: drop the `starting-mlx` emit entirely, or actually wait until the server is up before emitting `downloading-model`. Captured for §Hardening.
+5. **Start the server.** `await startServer(pythonToUse, model, onProgress)`. The onProgress callback emits `downloading-model` with `progress` set. This is what drives the spinner.
+6. **Return the python path.** Caller (`handleSetup`) uses the return value as a signal that we got past `startServer` without throwing.
+
+### `handleSetup(model: string): Promise<void>` (lines 140–152)
+
+Three-line happy path wrapped in try/catch:
+
+```ts
+send('setup:status', { stage: 'checking', message: 'Checking system…' })
+await ensureMLXRunning(model)
+send('setup:status', { stage: 'ready', message: 'Ready to chat.' })
+```
+
+On exception → emits `{ stage: 'error', message: 'Setup failed', error: e.message }`.
+
+**This is the lying-spinner architecture, formally:**
+
+- The UI sees `checking` → `installing-mlx` (optional) → `starting-mlx` → `downloading-model` (possibly many progress updates) → `ready` OR `error`.
+- The transitions out of `downloading-model` (to `ready` or `error`) happen *only* if `ensureMLXRunning` either returns normally or throws.
+- A hung `startServer` promise — which is exactly what happens when `mlx_vlm.server` is jetsam-killed mid-download, since the killed subprocess produces no error event on the parent's spawn handle until its exit is observed (and we may be blocked waiting on HF Xet's HTTP stream, not on the subprocess at all) — produces *neither* a return nor a throw.
+- Therefore the UI remains parked at `downloading-model` with the last-known progress percentage, indefinitely.
+
+The fix space includes: (a) liveness probe of `mlx_vlm.server` from main, (b) liveness probe of the parent download HTTP stream itself, (c) a renderer-side dead-man timer on `setup:status`. All are §Hardening Roadmap items.
+
+## 2.5 The chat orchestration loop — `handleChat(req, channel)` (lines 166–458)
+
+The most behaviorally rich function in the codebase. Roughly 290 lines. Owns the entire conversation turn: build the message list, stream from MLX, parse out inline tool calls, execute them, stream the results, loop until either no tool call is emitted in a round (terminal) or `maxRounds` is hit.
+
+### Constants
+
+```ts
+const MAX_TOOL_ROUNDS_CHAT = 6   // line 154
+const MAX_TOOL_ROUNDS_CODE = 40  // line 155
+```
+
+The hard ceiling on tool rounds in a single user turn. Code (Build tab) gets much more headroom — building anything substantive can easily exceed 6 tool calls. Chat is held to 6 to prevent runaway agentic loops in casual conversation.
+
+### Outer try/finally
+
+- Create `AbortController`, register in `chatAbortControllers` keyed by `conversationId`.
+- `finally`: delete the abort controller from the map. Always runs.
+
+### Building `baseMessages`
+
+```ts
+const baseMessages: MLXChatMessage[] = []
+if (req.mode === 'code') {
+  const wsPath = await ensureWorkspace(req.conversationId)
+  const href = previewUrl(req.conversationId)
+  baseMessages.push({ role: 'system', content: codeSystemPrompt(wsPath, href) })
+} else {
+  baseMessages.push({ role: 'system', content: chatSystemPrompt(req.enableTools) })
+}
+```
+
+**Two system prompts** (defined in `tools.ts`, deep-dived in §4):
+- `chatSystemPrompt(enableTools)` — chat mode, with or without tool access.
+- `codeSystemPrompt(wsPath, href)` — code/Build mode. Tells the model where it's writing files (`wsPath`) and where the user is previewing the output (`href`).
+
+Then it appends the conversation history. For each user/assistant message with tool calls, it appends a synthetic `'tool'`-role message per call: `Result of <action name="${tc.name}">: ${tc.result}`. This is how prior tool results get re-injected into the model's context on subsequent turns.
+
+### The `ToolContext`
+
+```ts
+const ctx: ToolContext = {
+  conversationId: req.conversationId,
+  onFileChange: () => send('workspace:changed', { conversationId: req.conversationId })
+}
+```
+
+Passed to every `runTool` call. `onFileChange` is how the Canvas tab learns to re-list the workspace tree after a tool mutates files.
+
+### `useTools` and `maxRounds`
+
+```ts
+const useTools = req.mode === 'code' || req.enableTools
+const maxRounds = req.mode === 'code' ? MAX_TOOL_ROUNDS_CODE : MAX_TOOL_ROUNDS_CHAT
+```
+
+Code mode always has tools enabled (user can't opt out). Chat mode is gated by `req.enableTools`.
+
+### The outer round loop (lines 207–442)
+
+Up to `maxRounds` iterations. Each round corresponds to one streaming completion from MLX. A round ends either:
+- The model finishes without emitting a tool call → emit `done`, return (terminal).
+- The model emits a tool call → execute it, push result into baseMessages, `break streamLoop`, loop to next round.
+
+### Per-round state (lines 208–220)
+
+```ts
+let buffer = ''                 // accumulating model tokens
+let emittedIdx = 0              // how far into buffer we've emitted to UI
+let firstToken = true           // for initial 'generating' activity transition
+let executedAction = false      // did this round produce a tool call?
+let lastActivityTs = 0          // debounce timer for activity emits
+let pendingAction: { name; target? } | null = null
+
+// Live-write state for write_file streaming
+let livePath: string | null = null
+let liveContentStart = -1
+let lastLiveWrite = 0
+let livePending: Promise<unknown> | null = null
+let lastEmittedContent = ''
+```
+
+The `live-write` state is the most distinctive feature: when the model emits a `write_file` action, we *stream* the contents to disk as they arrive in the token stream, rather than waiting for the action to close. This makes the Canvas tab's preview update in real time as the model "types" code.
+
+### `writeLivePartial()` (lines 221–247)
+
+The live-write worker. Called periodically (every 450ms — see line 323).
+
+1. Slice the buffer from `liveContentStart` to extract whatever the model has emitted *inside* the `<content>` tag so far.
+2. If a `</content>` close tag is present, truncate to that boundary.
+3. Run through `cleanFileContent(partial, livePath)` (in `tools.ts`) — strips markdown code fences or other model artifacts.
+4. If the cleaned content changed since last emit, send `file:streaming` to the renderer with `done: false`. Renderer uses this to live-update the Canvas preview.
+5. Fire a `wsWriteFile` to actually write the partial content to disk, then emit `workspace:changed`. Errors swallowed (partial writes during streaming are expected to fail occasionally).
+6. `livePending` guards against overlapping writes.
+
+### `emitActivity()` (lines 249–266)
+
+Debounced (400ms throttle). Emits `tool` activity if `pendingAction` is set; otherwise `generating`. The `chars` field gives the UI a sense of progress within the phase.
+
+### The inner stream loop — `streamLoop:` (lines 268–419)
+
+`for await (const chunk of chatStream({...}))` — consumes the streaming completion from MLX one chunk at a time. Each chunk has `content` (token text) and possibly `done` (terminator).
+
+For each chunk with content:
+
+1. **First-token transition** (lines 273–277). Emit `generating` activity.
+2. **Append to buffer**.
+3. **Forward raw chunk to devtools.** `chat:raw` channel — for debugging only, not consumed by user-facing UI.
+4. **Detect a pending action** (lines 287–311). If we don't yet have `pendingAction`, look for `<action name="...">` in the buffer. If found, capture the name + extract one of `<path>`, `<url>`, `<query>`, `<command>` as the action's `target` (for activity display). If `pendingAction.target` is still empty on subsequent chunks, keep trying to find one.
+5. **Activate live-write** (lines 313–327). If the pending action is `write_file` and we have a path, set `livePath`. Find `<content>` in the buffer to locate `liveContentStart`. Every 450ms, call `writeLivePartial()`.
+6. **Emit activity** (line 329).
+7. **Tool parsing loop** (lines 331–414). `while (true)`:
+   - If tools disabled (`!useTools`), just emit any unemitted buffer as token text and break.
+   - Call `findNextAction(buffer, emittedIdx)` (in `tools.ts`):
+     - **`null`**: no action *starting* in the remaining buffer. Compute `emitSafeBoundary` (don't emit characters that might be the start of an unparsed `<action`) and emit the safe prefix. Break.
+     - **`'incomplete'`**: an `<action` open tag exists but isn't yet closed. Emit text up to the `<` of `<action` and stop emitting (don't show partial action XML to the user). Break.
+     - **`{ start, end, name, args }`**: a complete action. Emit any text between `emittedIdx` and `found.start`. Advance `emittedIdx = found.end`. Construct a `ToolCall`, emit `tool_call` and `tool` activity. Execute via `runTool(found.name, found.args, ctx)`:
+       - Success → emit `tool_result` with `result`.
+       - Failure → emit `tool_result` with `error`, set `hadError = true`.
+     - Push the assistant's emitted-so-far buffer (without the action XML, conceptually — though the slicing `buffer.slice(0, emittedIdx)` actually includes everything emitted including parsed-action remnants? — verify carefully in §9 with a concrete trace).
+     - Push a synthetic `tool` message: `[ok|error] ${name}: ${result}`.
+     - `executedAction = true`.
+     - If we were live-writing, emit a final `file:streaming` with `done: true`.
+     - Reset all per-action state.
+     - Emit `thinking` activity.
+     - **`break streamLoop`** — abandon the current MLX completion. The next round will start a fresh completion with the updated `baseMessages` that now includes the tool result.
+8. **If `chunk.done`**: `break streamLoop`.
+
+### After the inner loop (lines 421–441)
+
+- If no action was executed this round:
+  - **Code-mode-round-0 special case** (lines 424–436): if the model talked about a plan but didn't write any code, flush the plan text and inject a synthetic user message: `"Good plan. Now start building — emit a write_file action with the first file immediately."` Then `continue` to round 1. This is a real prompt-engineering nudge baked into the orchestrator. (Subtle observation: this fires only on `round === 0`, so if the model meanders for multiple rounds without writing code, we get one nudge then the conversation ends. May want to revisit.)
+  - Otherwise: emit `idle` activity + `done`, return.
+
+### After all rounds exhausted (lines 443–447)
+
+```ts
+emit({ type: 'activity', activity: { kind: 'idle' } })
+emit({ type: 'error',
+  error: `Reached max tool rounds (${maxRounds}). Ask the model to finish up and try again.` })
+```
+
+Capped at `MAX_TOOL_ROUNDS_CODE = 40` for code mode. In practice, hitting this means the model is stuck in a loop (writing the same file repeatedly, fetching the same URL, etc.).
+
+### Outer catch (lines 448–454)
+
+- `AbortError` → emit `done` (clean cancellation by user via `chat:abort`).
+- Anything else → emit `error` with the error message.
+
+## 2.6 App lifecycle — `app.whenReady().then(async () => {...})` (lines 462–582)
+
+Runs once Electron's app is ready. Order matters.
+
+1. **`electronApp.setAppUserModelId('com.ammaar.gemmachat')`** — Windows-only effect (notification grouping). Cosmetic; the literal string is stale upstream attribution (matches `electron-builder.yml`'s `appId`).
+2. **Force dark theme** (`nativeTheme.themeSource = 'dark'`).
+3. **Set dock icon** (macOS only, lines 467–470). Reads `build/icon.png`. **Note:** `createWindow` already sets `icon: ...icon.png`, this is a secondary setter for the dock specifically.
+4. **`browser-window-created` listener** → `optimizer.watchWindowShortcuts(window)` (toolkit helper for standard shortcuts).
+5. **`await startWorkspaceServer()`** — starts the HTTP server that serves workspace files for Canvas previews (deep-dive in §5). **Blocking** — the rest of setup waits.
+6. **Permission handlers** (lines 478–485):
+   - `setPermissionRequestHandler`: only `media` and `mediaKeySystem` are granted (mic for whisper). Everything else denied.
+   - **`setPermissionCheckHandler(() => true)` — grants every permission check.** This is overly permissive. The check handler is invoked for synchronous permission queries; granting them all wholesale means renderer JS can call `navigator.permissions.query('camera').state === 'granted'` and get a misleading yes. Captured for §Hardening.
+7. **Register all `ipcMain.handle` channels** (lines 487–575). See §2.7 below.
+8. **`createWindow()`** — finally create the window.
+9. **`app.on('activate', ...)`** — macOS reactivation. If all windows closed but the app is alive in dock, clicking the dock icon recreates the window.
+
+### Shutdown lifecycle (lines 584–596)
+
+- `window-all-closed`: macOS keeps the app alive (MLX subprocess + workspace server stay warm). Other platforms quit. **The "keep alive on macOS" behavior is intentional** — the comment says so. Practical implication: closing the window does *not* stop MLX. To free the model weights from RAM, the user must explicitly quit (Cmd-Q).
+- `before-quit`: stops MLX server, stops workspace server. Async-fire-and-forget — neither is awaited. The Electron quit flow doesn't wait for these. **Risk:** if the MLX server is mid-request when quit fires, the SIGTERM may produce a half-written HF cache file. Captured for §Hardening (and worth probing in §3 mlx.ts deep dive — does `stopServer` actually wait for the child to exit?).
+
+## 2.7 IPC handler registry (the complete API the renderer can invoke)
+
+All registered inside `app.whenReady` (lines 487–575). Eleven channels.
+
+| Channel | Args | Returns | Effect |
+|---|---|---|---|
+| `setup:start` | `model: string` | `void` | Runs `handleSetup(model)`. Emits `setup:status` repeatedly. Used on first run from `Setup.tsx`. |
+| `model:switch` | `model: string` | `void` | Stops current MLX server, starts a new one for `model`. Emits `setup:status`. Requires `mlxPython` already cached (throws if not — "Please restart the app"). |
+| `setup:status` | — | `{ hasMLX: boolean }` | Synchronous probe — does the venv exist with `mlx_vlm` importable? Used by Setup to decide whether to skip the install step. |
+| `models:list-local` | — | model list | Forwards to `mlx.listLocalModels()`. For the model picker. |
+| `chat:send` | `req: ChatRequest` | `{ channel: string }` | Fires `handleChat(req, channel)` *without awaiting*. Returns the per-conversation channel name (`chat:stream:${conversationId}`) so the renderer knows where to listen for stream chunks. |
+| `chat:abort` | `conversationId: string` | `void` | Aborts the in-flight `chatStream` for this conversation. Triggers the `AbortError` path. |
+| `tools:list` | — | tool metadata | Returns `Object.values(TOOLS).map(...)`. For the UI to display what's available. |
+| `workspace:info` | `conversationId: string` | `WorkspaceInfo` | Ensures the workspace exists, returns `{ conversationId, path, previewUrl }`. |
+| `workspace:list` | `conversationId: string` | `WorkspaceFile[]` | Lists the workspace tree (up to 300 entries). For Canvas file browser. |
+| `workspace:open-external` | `conversationId: string` | `void` | Opens the workspace dir in Finder. |
+| `workspace:server-port` | — | `number` | The port the workspace HTTP server is listening on. |
+| `audio:transcribe` | `{ base64; model }` | `{ text: string }` | **STUB.** Returns `{ text: '' }` always. Comment: "Audio transcription via MLX is not yet supported." Voice input from `whisper.ts` in the renderer fires this handler but silently gets empty text back. **This is a known dead feature.** Captured for §Hardening. |
+
+**Channels not in `handle` (one-way main → renderer, emitted via `send`):**
+
+| Channel | Sender | Payload | Subscribers |
+|---|---|---|---|
+| `setup:status` | `send` in setup flow | `SetupStatus` | `Setup.tsx` |
+| `chat:stream:${conversationId}` | `emit` in handleChat | `StreamChunk` | `Chat.tsx` (per-conversation listener) |
+| `chat:raw` | `send` in handleChat | `{ conversationId, chunk }` | Devtools console only (no production consumer) |
+| `workspace:changed` | `send` after tool runs / live writes | `FileChangeEvent` | `Canvas.tsx` |
+| `file:streaming` | `send` during live write_file | `{ conversationId, path, content, done }` | `Canvas.tsx` (live preview) |
+
+## §2 Synthesis — what `index.ts` tells us
+
+1. **The chat orchestration is more sophisticated than typical Electron-AI apps.** Live in-flight file writes during model streaming, mid-stream tool call parsing with a safe-boundary emitter that won't show partial XML to the user, and two distinct system prompts/round budgets for chat vs. code — all real engineering. Worth preserving as we evolve the app.
+
+2. **The lying-spinner root cause is now fully characterized.** `handleSetup` cannot transition out of `downloading-model` unless `startServer` either returns or throws. A jetsam-killed child whose parent is blocked on an HTTP stream produces neither in the current architecture. **Fix options live in §3 (mlx.ts) and §7 (Setup.tsx).**
+
+3. **The security posture has three soft spots:** the `setPermissionCheckHandler(() => true)` blanket grant, no CSP anywhere, and `sandbox: false` on the BrowserWindow. None are critical on a local-only desktop app, but as we add Skills + filesystem access (your stated goals), the threat model widens — a malicious tool result or user-pasted content becomes a real renderer-side concern.
+
+4. **Voice input is a dead feature.** `audio:transcribe` returns empty text. Either implement it (probably via a separate Python subprocess running `mlx-whisper` or `whisper.cpp`) or remove the affordance from the UI. Captured for §Hardening.
+
+5. **`mlxPython` caching is fragile.** No invalidation on subprocess death. If the venv is wiped or the python binary is moved, the cached path becomes a footgun. Low-likelihood-but-real bug for §Hardening.
+
+6. **`stopServer` and `stopWorkspaceServer` in `before-quit` are fire-and-forget.** The app may quit before they finish, leaving zombie subprocesses or partial files on disk. Verify in §3 deep dive whether they're synchronous-ish (probably yes — `kill()` is sync, but the child's actual exit isn't observed).
+
+7. **Eleven IPC handlers, five outbound channels — the complete API surface.** This is the contract the preload bridge mirrors (§6) and the renderer consumes (§7–8). Adding Skills + approved filesystem access means adding new entries to this table; we should design those additions to match the existing channel-naming and payload-shape conventions.
+
+Section 2 complete. Section 3 (`src/main/mlx.ts`) is next.
+
+---
+
+## (Sections 3–7 and 9–10 will be filled in as the file-by-file deep dive continues.)
