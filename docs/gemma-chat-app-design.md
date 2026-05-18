@@ -922,4 +922,358 @@ Section 2 complete. Section 3 (`src/main/mlx.ts`) is next.
 
 ---
 
-## (Sections 3–7 and 9–10 will be filled in as the file-by-file deep dive continues.)
+# Section 3 — Main Process: `src/main/mlx.ts`
+
+**Path:** `src/main/mlx.ts` (521 lines)
+
+**Role:** Everything to do with the `mlx_vlm.server` Python subprocess: locating a compatible Python, provisioning the dedicated venv, installing `mlx-vlm`, spawning and supervising the server, polling for health, and exposing an OpenAI-compatible streaming chat client. This file is the single point of contact between the Electron main process and the Python ML runtime.
+
+After §2, this is the second-most-load-bearing file in the codebase. A bug here propagates to *every* inference the app performs.
+
+## 3.1 Module-level state & path conventions
+
+### Constants (lines 6–8)
+
+```ts
+const MLX_PORT = 11437     // Patch 2: moved off Ollama's 11434
+const MLX_HOST = `127.0.0.1:${MLX_PORT}`
+const MLX_URL  = `http://${MLX_HOST}`
+```
+
+`MLX_URL` is re-exported at the bottom of the file (line 520). Currently no consumer imports it, but the export makes it available for future diagnostic tooling without re-declaring the constants.
+
+### Mutable state (lines 10–11)
+
+```ts
+let serverProc: ChildProcess | null = null
+let currentModel: string | null = null
+```
+
+Two singletons. **There is only ever one MLX subprocess.** Switching models means stopping the current one and starting a new one (`startServer` enforces this via line 274 short-circuit + line 277 `stopServer()`).
+
+### Path helpers (lines 17–32)
+
+All MLX state lives under `app.getPath('userData')/mlx/`:
+
+| Helper | Returns |
+|---|---|
+| `dataDir()` | `<userData>/mlx` |
+| `venvDir()` | `<userData>/mlx/venv` |
+| `venvPython()` | `<userData>/mlx/venv/bin/python3` |
+| `modelsDir()` | `<userData>/mlx/models` |
+
+On a typical macOS install, `<userData>` is `~/Library/Application Support/Gemma Chat/`. So the actual paths are:
+
+- venv: `~/Library/Application Support/Gemma Chat/mlx/venv/`
+- models (HF cache): `~/Library/Application Support/Gemma Chat/mlx/models/`
+
+**Important for §5/§9:** the HF cache lives *inside the userData directory*, not in the global HF cache (`~/.cache/huggingface`). This is enforced by `startServer` setting `HF_HOME` and `TRANSFORMERS_CACHE` env vars on the spawned child. **Consequence:** a user with 18 GB of Gemma weights elsewhere on disk cannot share them with this app — it re-downloads into its own cache. Captured for §Hardening (could be an opt-in to use the global cache).
+
+## 3.2 System Python detection — `findSystemPython()` (lines 43–96)
+
+Returns the first compatible Python binary it can find, `null` if none. Compatibility: **Python 3.10 through 3.13 inclusive.** 3.14+ is excluded because (per the inline comment, line 40) `mlx-lm` historically didn't publish wheels for 3.14 — **stale comment after Patch 4**, the actual constraint now is `mlx-vlm`'s wheel availability. Captured for §Hardening.
+
+### Search strategy
+
+1. **Versioned binaries first** (lines 45–58). 12 candidate paths, trying both Homebrew bin (`/opt/homebrew/bin/python3.X`), the Homebrew Cellar (`/opt/homebrew/opt/python@3.X/bin/python3.X`), and `/usr/local/bin/python3.X`. Newest version (3.13) tried first.
+2. **Generic `python3` fallback** (lines 73–93). Tries `/opt/homebrew/bin/python3`, `/usr/local/bin/python3`, `/usr/bin/python3`. Parses `--version`, accepts only minor versions 10–13. Logs an explicit skip reason for too-old (<3.10) vs too-new (>3.13).
+
+Each candidate is probed with `spawnSync(...['--version'], { timeout: 5000 })`. **5-second per-candidate timeout** — worst case ≈ 60 seconds if every Homebrew path hangs (unlikely; in practice this returns in milliseconds).
+
+### Notable
+
+- Returns the **first compatible** binary, not the newest. Within Homebrew bin, newer is tried first; once a working one is found we stop. Reasonable.
+- **No environment-variable override** for forcing a specific Python (e.g., `GEMMA_CHAT_PYTHON=/path/to/python3.12`). Captured for §Hardening — useful for testing and for users with non-standard Python installs.
+
+## 3.3 MLX detection — `locateMLX()` (lines 113–159)
+
+Returns one of:
+
+- `{ python: <path>, installed: true }` — venv exists, Python is 3.10+, `mlx_vlm` is importable. Ready to start the server.
+- `{ python: <path>, installed: false }` — either the venv exists but `mlx_vlm` isn't importable (we can `pip install` into the existing venv), or no venv exists yet (use the returned system Python to create one).
+- `null` — no compatible Python found anywhere. Caller must surface an install message.
+
+### Flow (linear)
+
+1. **Probe the venv Python** (lines 114–153).
+   - If `<venvDir>/bin/python3` exists: run `--version`, parse the minor version.
+   - If minor < 10: **delete the venv** (`rmSync(venvDir, {recursive, force})`), fall through to system-Python detection. **Destructive — wipes the entire venv.** Not destructive of anything outside `<userData>/mlx/venv/`, but worth noting: this is one of the few places the app ever calls `rmSync`.
+   - If venv Python is too old to determine version (spawnSync error): **also delete the venv**. The catch-all `} catch {` at line 148 is broad — a transient OS error here would wipe a healthy venv unnecessarily. Low risk in practice (spawnSync rarely throws once the binary exists) but captured for §Hardening.
+   - If version is acceptable: run `python -c "import mlx_vlm; print('ok')"` with a 15-second timeout.
+     - Success → return `{ python: vPy, installed: true }`.
+     - Failure → return `{ python: vPy, installed: false }`. The pip-install step in `installMLX` will run against this existing venv.
+2. **Find a system Python** (lines 155–157). If none, return `null`.
+
+### Stale terminology not caught by Patch 4
+
+Three doc-comment strings still say "mlx-lm":
+- Line 105: `Whether mlx-lm is installed and importable` (JSDoc on `MLXStatus.installed`)
+- Line 110: `Check if mlx-lm is ready to use.` (JSDoc on `locateMLX`)
+- Line 111: `Returns the python path to use and whether mlx_lm is installed.`
+
+The actual code on line 133 correctly probes `import mlx_vlm`. The comments lie. Captured for §Hardening — a single search-replace pass to finish what Patch 4 started.
+
+## 3.4 Installation — `installMLX()` (lines 175–221)
+
+Async, four steps, each one streaming its output via `onProgress`:
+
+1. **Find system Python** (lines 178–183). If absent, throws the same error message the renderer's Setup screen will display verbatim: `"Python 3.10–3.13 not found. Please install Python via Homebrew: brew install python@3.13"`.
+2. **Create the venv** if `<venvPython>` doesn't exist (lines 188–193). `sysPython -m venv <vDir>`. Streamed via `runProcess` so any error output reaches the Setup UI.
+3. **Upgrade pip** (lines 196–200). `vPy -m pip install --upgrade pip --index-url https://pypi.org/simple/`. The explicit `--index-url` (and the env-var forcing in `runProcess`, see §3.5) is **defensive against corporate pip configs** — a user with a `~/.pip/pip.conf` pointing at a private registry would otherwise have install fail or pull the wrong package.
+4. **Install mlx-vlm** (lines 203–207). `vPy -m pip install --upgrade mlx-vlm>=0.5.0 --index-url https://pypi.org/simple/`.
+5. **Verify import** (lines 210–217). `vPy -c "import mlx_vlm; print('ok')"` with 15-second timeout. If the import fails, throws with the **last 300 chars of stderr** (line 215) — useful for diagnostics but the truncation can elide the actual traceback head. Captured for §Hardening — consider keeping full stderr.
+6. **Returns** the venv python path. Caller (`index.ts:ensureMLXRunning`) stores this in `mlxPython` for reuse.
+
+### What this does *not* do
+
+- **No version pin on pip itself.** `--upgrade pip` may bump to a brand-new pip with different semantics; usually safe but a future pip release could break the wheel-resolution heuristics.
+- **No retry on transient network failure.** If PyPI rejects a connection mid-download, the whole install fails. The user has to re-trigger Setup. Captured for §Hardening.
+- **No cleanup on partial failure.** If step 4 fails after step 2 succeeded, the venv is left half-installed. Next `locateMLX` will return `{installed: false}` so retry will work, but disk is dirtied.
+
+## 3.5 `runProcess()` (lines 224–257)
+
+Helper for any subprocess whose output should stream to the Setup UI.
+
+### What it does
+
+- `spawn(cmd, args, { stdio: ['ignore', 'pipe', 'pipe'], env: { ...process.env, PIP_DISABLE_PIP_VERSION_CHECK: '1', PIP_INDEX_URL: 'https://pypi.org/simple/', PIP_EXTRA_INDEX_URL: '' } })`.
+- For each line on stdout or stderr, calls `onProgress({ stage: 'install', message: line.slice(0, 120) })`. **120-char truncation** — long pip lines get cut. Cosmetic for the UI, but means deep diagnostic info doesn't reach the Setup screen.
+- Accumulates stderr into a buffer; if exit code ≠ 0, rejects with `${cmd} ${args[0..2].join(' ')} failed (exit ${code}): ${stderr.slice(-500)}`.
+
+### Notable
+
+- The PIP env-var overrides are belt-and-suspenders alongside the `--index-url` CLI flag. Whichever pip checks first, the result is the same: public PyPI.
+- **`PIP_EXTRA_INDEX_URL: ''` explicitly clears any inherited extra-index.** Prevents a corporate pip.conf from sneaking in via env inheritance.
+- No timeout on the overall process. `pip install mlx-vlm` can take 10+ minutes on a slow network; that's allowed. The Setup UI does *not* show a timeout countdown, just continuous log lines.
+
+## 3.6 Server lifecycle — the bug-prone surface
+
+### `startServer(python, model, onProgress?)` (lines 269–345)
+
+Async, complex. The function is the second-half companion to `installMLX` — once Python and mlx-vlm are ready, this is what gets the model serving requests.
+
+#### Early-exit short-circuit (line 274)
+
+```ts
+if (serverProc && !serverProc.killed && currentModel === model) return
+```
+
+If the server is already running for the same model, no-op. **Subtle bug:** "already running" here means "we have a non-killed ChildProcess handle." It does *not* check that the server is *healthy*. If `startServer` is called twice in rapid succession (e.g., user clicks "Retry" during a stuck download), the second call returns immediately even though the first call is still mid-`waitForHealth`. Practically benign because the second caller will then make chat requests that fail with connection-refused… but worth knowing. Captured for §Hardening.
+
+#### `stopServer()` then `spawn` (lines 277, 293–301)
+
+`stopServer()` (lines 347–354) is **synchronous**: sends `SIGTERM`, nulls out `serverProc` and `currentModel` *immediately* without awaiting the child's actual exit. The new spawn happens right after.
+
+This creates a small race: if the previous server held the port, the new spawn could fail with `EADDRINUSE` if the OS hasn't yet reaped the previous process. In practice 11437 frees up within milliseconds of SIGTERM on macOS, but on a slow machine under load this is a theoretical issue. Captured for §Hardening.
+
+The spawn (line 293):
+```ts
+serverProc = spawn(python, ['-m', 'mlx_vlm.server', '--model', model, '--port', String(MLX_PORT)], {
+  env, stdio: ['ignore', 'pipe', 'pipe'], detached: false
+})
+```
+
+- `stdio: ['ignore', 'pipe', 'pipe']` — we read stdout and stderr, no stdin. Correct.
+- `detached: false` — child is in the Electron main's process group. When Electron quits, the child gets SIGTERM via process-group propagation (in addition to our explicit `stopServer` in `before-quit`).
+
+#### Spawn environment (lines 279–285)
+
+```ts
+env: {
+  ...process.env,
+  HF_HOME: modelsDir(),                  // <userData>/mlx/models
+  TRANSFORMERS_CACHE: modelsDir(),        // (legacy var, same path)
+  HF_HUB_DISABLE_TELEMETRY: '1'
+}
+```
+
+`HF_HOME` is the modern var; `TRANSFORMERS_CACHE` is the legacy one. Setting both belt-and-suspenders. The result: every HF download lands under `<userData>/mlx/models/hub/...` in the HF Hub cache layout.
+
+`HF_HUB_DISABLE_TELEMETRY: '1'` — turns off HF's telemetry pings. Good default for a local-only app.
+
+**Not set, worth noting:**
+- `HF_TOKEN` — gated models (none of the `mlx-community/gemma-4-*` repos are gated as of writing) would fail without one. If we ever support gated Gemma variants, this needs a way in.
+- `HF_HUB_ENABLE_HF_TRANSFER` — would enable `hf_transfer` for faster downloads. Unset means HF falls back to its default downloader (which is where the Xet stall happens). **Captured for §Hardening — enabling `hf_transfer` could plausibly resolve the silent-stall failure mode by switching the transport layer.**
+
+#### Output piping & progress parsing (lines 304–334)
+
+stdout: just logged via `console.log('[mlx]', ...)`. No structured parsing.
+
+stderr is where the action is. For each line:
+1. Always log it (`console.log`).
+2. **Parse HuggingFace download progress** via regex (line 316):
+   ```
+   /Fetching\s+(\d+)\s+files?:\s+(\d+)%.*?(\d+)\/(\d+)/
+   ```
+   Matches HF's tqdm output like `Fetching 8 files:  50%|█████     | 4/8 [00:55<00:59, 14.98s/it]`. Extracts percentage and file counts; emits `onProgress({ message: 'Downloading model files… 4/8', progress: 0.5 })`.
+3. **Detect server-ready signals**: lines containing `Starting httpd` or `starting` → `onProgress({ message: 'Starting server…', progress: 1.0 })`.
+
+**This is the only progress signal the Setup screen ever sees during a download.** If HF's downloader stops emitting tqdm lines (which is what happens during an HF Xet stall — the stream stalls but no error is printed), no `onProgress` ever fires, and the UI sits at the last-reported percentage.
+
+#### Exit handler (lines 335–340)
+
+```ts
+serverProc.on('exit', (code) => {
+  console.log('[mlx] server exited with code', code)
+  earlyExit = { code, stderr: stderrBuf }
+  serverProc = null
+  currentModel = null
+})
+```
+
+Critical for the lying-spinner analysis: **if the subprocess is killed (by anything — explicit SIGTERM, jetsam SIGKILL, OOM, segfault), this handler fires and `earlyExit` becomes non-null.** Node's child-process spawn correctly handles SIGCHLD; this is reliable.
+
+#### `await waitForHealth(600_000, () => earlyExit)` (line 344)
+
+Hands control to the health-poll loop. 10-minute timeout.
+
+### `waitForHealth()` (lines 360–388)
+
+```ts
+while (Date.now() - start < timeoutMs) {
+  const exit = checkEarlyExit()
+  if (exit) throw new Error(`MLX server exited with code ${exit.code}. ${exit.stderr.slice(-500)}`)
+  try {
+    const res = await fetch(`${MLX_URL}/v1/models`)
+    if (res.ok) return
+  } catch (e) { lastError = e }
+  await new Promise((r) => setTimeout(r, 1500))
+}
+throw new Error(`MLX server did not become healthy within ${timeoutMs / 1000}s: ${String(lastError)}`)
+```
+
+Two ways to exit healthy: `/v1/models` returns 200. Three ways to throw: subprocess exited (per `earlyExit`), 10 minutes elapsed without health, or the timeout-on-no-Python in `startServer`'s precondition (above).
+
+**Iteration cadence:** 1500ms sleep between probes. In 10 minutes, ~400 polls.
+
+### The lying spinner, fully resolved
+
+Combining §2.4 + the above, the failure mode breaks down into two distinct cases:
+
+**Case A — subprocess crash (jetsam, OOM, segfault, explicit kill):**
+1. Subprocess dies → Node fires `'exit'` event → `earlyExit` populated.
+2. Next iteration of `waitForHealth` (within 1500ms) → throws.
+3. `ensureMLXRunning` propagates the throw to `handleSetup` → `setup:status { stage: 'error', error: '...' }`.
+4. UI shows the error. **No lying spinner in this case.** This works correctly.
+
+**Case B — HuggingFace download stalls without process death (HF Xet hang):**
+1. Subprocess is alive and the Python interpreter is blocked inside HF's downloader on a socket read that never returns.
+2. No tqdm output → no `onProgress` calls → UI's last-known progress stays frozen.
+3. `/v1/models` returns connection-refused (server hasn't bound the port yet, that happens *after* model download) → `waitForHealth` catches and retries.
+4. This continues for the full **10 minutes** until `waitForHealth` finally throws `MLX server did not become healthy within 600s`.
+5. UI eventually shows the error… but the user has typically given up and force-quit long before the 10-minute mark.
+
+**This is the real lying spinner.** From the user's perspective, it's "the spinner is stuck at 12% for several minutes with no movement." From the system's perspective, it's "we're patiently waiting up to 10 minutes for a healthy server." Both are technically correct; neither serves the user.
+
+### Fix space for the hardening roadmap
+
+1. **No-progress dead-man timer.** If 60–120 seconds elapse with no `onProgress` call AND `waitForHealth` hasn't returned, surface a warning to the UI ("Download appears stalled — check your network or try again"). This is the most impactful single fix.
+2. **Switch HF transport.** Set `HF_HUB_ENABLE_HF_TRANSFER=1` in the spawn env. `hf_transfer` is a Rust-based downloader that doesn't hit the Xet protocol stall. Requires `pip install hf_transfer` as an additional dep.
+3. **Renderer-side stale-status timer.** Independent of main. If `setup:status` hasn't updated in N seconds while in `downloading-model`, show a "this is taking longer than expected — see logs?" banner.
+4. **Shorter overall timeout.** 10 minutes is too long for a "first-run download" given that the failure has a 10-minute tail. 3-4 minutes with the dead-man timer above is plenty.
+
+### `stopServer()` (lines 347–354)
+
+```ts
+export function stopServer(): void {
+  if (serverProc && !serverProc.killed) {
+    serverProc.kill('SIGTERM')
+    serverProc = null
+    currentModel = null
+  }
+}
+```
+
+**Synchronous, fire-and-forget.** Sends SIGTERM, doesn't wait for the child to actually exit before nulling state. The `'exit'` handler will eventually run and set `earlyExit`, but by then `serverProc` is already null.
+
+This is *almost always fine* but interacts poorly with `before-quit` in `index.ts`: that handler calls `stopServer()` and `stopWorkspaceServer()` synchronously, then Electron quits. The child gets SIGTERM but may have unfinished work (writing HF cache, flushing stderr, etc.) when the parent dies. Captured for §Hardening — a proper shutdown would await the child's exit with a SIGKILL fallback after N seconds.
+
+## 3.7 Model management
+
+### `listLocalModels()` (lines 394–403)
+
+Hits `/v1/models` and returns the IDs. **Misleading name:** this lists models *currently loaded by the server*, not models cached on disk. If the server isn't running, returns `[]`. If only Gemma-E4B is loaded, returns just that. Captured for §Hardening — either rename the function or actually scan `<modelsDir>/hub/models--*` for real local availability.
+
+### `hasModel(_name)` (lines 405–412)
+
+**Dead-ish:** the `name` parameter is prefixed with `_` to signal "unused." The function returns `true` if the server has *any* models loaded, not whether the specific named model is local. Unused by `index.ts` (the import was flagged in §2.1 as dead). Captured for §Hardening — remove or fix.
+
+## 3.8 Chat streaming — `chatStream()` (lines 431–482)
+
+The actual inference call. Uses the OpenAI-compatible `/v1/chat/completions` endpoint that `mlx_vlm.server` exposes.
+
+### Request body (lines 437–446)
+
+```ts
+{
+  model: opts.model,
+  messages: opts.messages.map((m) => ({ role: m.role, content: m.content })),
+  stream: true,
+  temperature: opts.temperature ?? 0.7,
+  max_tokens: 8192
+}
+```
+
+**CRITICAL BUG — multimodal images are dropped at the bridge:**
+
+```ts
+interface MLXChatMessage {
+  role: 'user' | 'assistant' | 'system' | 'tool'
+  content: string
+  images?: string[]                                  // ← declared
+}
+// ...later...
+messages: opts.messages.map((m) => ({
+  role: m.role,
+  content: m.content                                  // ← `images` is NOT mapped through
+})),
+```
+
+`MLXChatMessage` advertises an `images?: string[]` field, but `chatStream`'s body construction strips it before it ever reaches `mlx_vlm.server`. **Even if the renderer constructed image-bearing messages, they would never reach the model.** Gemma 4's multimodal capability — the entire motivation for Patch 4 — is currently inaccessible through this code path.
+
+**This is a real, capability-defeating bug.** Captured at the top of §Hardening Roadmap. The fix needs to also confirm the wire format `mlx_vlm.server` expects — likely OpenAI's `[{ type: 'text', text: ... }, { type: 'image_url', image_url: { url: 'data:image/...' } }]` content-array shape, not the flat `images: string[]` we currently model.
+
+### Other parameters
+
+- **`temperature: 0.7`** — default. **Not exposed in `ChatRequest`** (in `shared/types.ts`); the renderer cannot configure this per-message or per-conversation. Captured for §Hardening — temperature/top-p controls are standard UX for chat apps.
+- **`max_tokens: 8192`** — hard-coded ceiling. 8K tokens is enough for most chat turns but constrains long code generation (Build tab) where a single file might already exceed that. Captured for §Hardening.
+
+### Response handling (lines 450–481)
+
+- If `!res.ok || !res.body`, throws with status text + first body snippet.
+- Otherwise iterates `readSSE(res.body)`:
+  - `[DONE]` sentinel → yield `{ done: true }`, return.
+  - Otherwise JSON-parse the event. Extract `choices[0].delta.content` → yield `{ content: deltaText }`. Extract `choices[0].finish_reason === 'stop' | 'length'` → yield `{ done: true }`, return.
+  - Malformed JSON → silently skipped (line 477 catches). Reasonable defensive choice.
+- After the stream ends naturally → yield `{ done: true }` (line 481). Defensive — handles the case where the server closes the connection without an explicit `[DONE]`.
+
+### `readSSE()` (lines 485–518)
+
+Standard SSE parser:
+- `getReader()` on the body, decode UTF-8 with `{ stream: true }` (correct — handles multi-byte char split across chunks).
+- Buffer up to a `\n\n` delimiter (SSE event boundary), parse each `data: ...` line within.
+- Final flush of leftover buffer at end (lines 510–517).
+
+No issues spotted. This is a clean implementation.
+
+## §3 Synthesis
+
+1. **Lying spinner is HF download stall, not subprocess death.** Crash detection works. Stall detection doesn't exist. Single biggest hardening win: a no-progress dead-man timer plus `HF_HUB_ENABLE_HF_TRANSFER=1`.
+
+2. **Multimodal is silently broken at this layer.** The whole point of Patch 4 — Gemma 4's vision capability — is currently unreachable because `MLXChatMessage.images` is dropped before the HTTP request. This needs to lead the hardening roadmap.
+
+3. **Patch 4 was 90% complete.** Three doc-comment occurrences of "mlx-lm" survive in this file. Trivial cleanup.
+
+4. **Defensive pip configuration is well-designed.** The double-protection of CLI `--index-url` + env `PIP_INDEX_URL` + `PIP_EXTRA_INDEX_URL: ''` is the right call for a tool that runs against arbitrary corporate machines.
+
+5. **All MLX state is under userData.** Clean separation; uninstalling means deleting one app-data folder. Nothing else on the system is affected. This is good architecture and worth preserving.
+
+6. **No structured logging.** Everything goes through `console.log`, which means everything is in the terminal where `npm run dev` ran, or buried in macOS Console for the packaged app. A structured logger written to a known file (`<userData>/mlx/logs/`) would make post-mortems of failures dramatically easier. Captured for §Hardening.
+
+7. **No tests.** Same `package.json`-level observation as §1, but this file is where it bites hardest. Even a single integration test that spins up `mlx_vlm.server` against a tiny test model would have caught the `images` drop and the stale `mlx-lm` doc strings.
+
+Section 3 complete. Section 4 (`src/main/tools.ts` — 593 lines, never previously inventoried) is next.
+
+---
+
+## (Sections 4–7 and 9–10 will be filled in as the file-by-file deep dive continues.)
