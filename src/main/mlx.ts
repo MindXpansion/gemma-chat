@@ -268,6 +268,43 @@ export interface ServerProgress {
   progress?: number
 }
 
+/**
+ * Patch 11: Pre-flight port clear. Before spawning a fresh mlx_vlm.server,
+ * SIGKILL any process holding port 11437. This handles orphan MLX processes
+ * left over from a hard quit (audit §2.6) or from a previous server that
+ * failed to release the port cleanly. Without this, the new spawn errors
+ * with EADDRINUSE and waitForHealth gets fooled into reporting the orphan
+ * as healthy.
+ */
+function clearMLXPort(): void {
+  try {
+    const res = spawnSync('lsof', ['-ti', `:${MLX_PORT}`, '-sTCP:LISTEN'], {
+      encoding: 'utf-8'
+    })
+    if (!res.stdout) return
+    const pids = res.stdout
+      .trim()
+      .split('\n')
+      .map((s) => parseInt(s, 10))
+      .filter((n) => Number.isFinite(n) && n > 0)
+    if (pids.length === 0) return
+    console.log(
+      `[mlx] Pre-flight: SIGKILL orphan listeners on :${MLX_PORT}: ${pids.join(', ')}`
+    )
+    for (const pid of pids) {
+      try {
+        process.kill(pid, 'SIGKILL')
+      } catch {
+        // already dead, or not our process — either way, continue
+      }
+    }
+    // Give the kernel a beat to release the port
+    spawnSync('sleep', ['0.3'])
+  } catch (e) {
+    console.log('[mlx] Pre-flight port clear failed (proceeding):', (e as Error).message)
+  }
+}
+
 export async function startServer(
   python: string,
   model: string,
@@ -277,6 +314,11 @@ export async function startServer(
 
   // Kill existing server if running with different model
   stopServer()
+
+  // Patch 11: kill any orphan listener on the port before spawning. Defends
+  // against the §2.6 fire-and-forget shutdown bug AND against any case where
+  // a previous server (ours or someone else's) is still holding 11437.
+  clearMLXPort()
 
   const env = {
     ...process.env,
@@ -346,7 +388,9 @@ export async function startServer(
 
   // Wait for the server to become healthy.
   // First run downloads model weights from HuggingFace, so allow up to 10 min.
-  await waitForHealth(600_000, () => earlyExit)
+  // Patch 11: waitForHealth now verifies ownership — both that our spawned
+  // child is still alive AND that /health reports our model is loaded.
+  await waitForHealth(model, serverProc, 600_000, () => earlyExit)
 }
 
 export function stopServer(): void {
@@ -359,10 +403,20 @@ export function stopServer(): void {
 }
 
 /**
- * Poll the server's /v1/models endpoint until it responds.
- * If the server process exits early, throw immediately.
+ * Poll the server until it reports our model is loaded.
+ *
+ * Patch 11: ownership-verified health. The previous version polled
+ * /v1/models, which returns 200 from any MLX-compatible server — so an
+ * orphan listener (audit §2.6) impersonated a successful start. We now:
+ *   1. Bail if the spawned child has died (catches early bind failures).
+ *   2. Poll /health (returns JSON with `loaded_model`) instead of /v1/models.
+ *   3. Only accept the response when loaded_model === the model we asked for.
+ *      A 200 with a different / null loaded_model is treated as "still
+ *      loading" or "orphan responding" and we keep polling.
  */
 async function waitForHealth(
+  expectedModel: string,
+  proc: ChildProcess,
   timeoutMs: number,
   checkEarlyExit: () => { code: number | null; stderr: string } | null
 ): Promise<void> {
@@ -370,26 +424,48 @@ async function waitForHealth(
   let lastError: unknown = null
 
   while (Date.now() - start < timeoutMs) {
-    // Check if the server process crashed
+    // Check if the server process crashed (exit handler fired)
     const exit = checkEarlyExit()
     if (exit) {
       throw new Error(
         `MLX server exited with code ${exit.code}. ${exit.stderr.slice(-500)}`
       )
     }
+    // Patch 11: catch the race where the child is dead but the exit
+    // handler hasn't fired yet.
+    if (proc.killed || proc.exitCode != null) {
+      throw new Error(
+        `MLX server process (PID ${proc.pid}) died before becoming healthy.`
+      )
+    }
 
     try {
-      const res = await fetch(`${MLX_URL}/v1/models`)
+      const res = await fetch(`${MLX_URL}/health`)
       if (res.ok) {
-        console.log('[mlx] Server is healthy')
-        return
+        const data = (await res.json().catch(() => ({}))) as { loaded_model?: string }
+        if (data.loaded_model === expectedModel) {
+          console.log(
+            `[mlx] Server is healthy (PID ${proc.pid}, model ${expectedModel})`
+          )
+          return
+        }
+        // 200 OK but wrong/no model. Most common cause: an orphan on the
+        // port has a different model loaded, OR our spawn hasn't bound
+        // yet and we're talking to the previous owner. Keep polling —
+        // either our spawn will fail to bind and earlyExit will fire,
+        // or the orphan will eventually be displaced.
+        lastError = new Error(
+          `Server responded with loaded_model=${data.loaded_model ?? 'null'}, expected ${expectedModel}`
+        )
       }
     } catch (e) {
       lastError = e
     }
     await new Promise((r) => setTimeout(r, 1500))
   }
-  throw new Error(`MLX server did not become healthy within ${timeoutMs / 1000}s: ${String(lastError)}`)
+  throw new Error(
+    `MLX server did not become healthy within ${timeoutMs / 1000}s: ${String(lastError)}`
+  )
 }
 
 // ---------------------------------------------------------------------------
