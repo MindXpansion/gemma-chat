@@ -277,10 +277,21 @@ export interface ServerProgress {
  * as healthy.
  */
 function clearMLXPort(): void {
+  // Patch 23: hard 2s timeout on lsof. On macOS Sequoia (Darwin 24+),
+  // spawnSync('lsof', ...) from Electron main can hang indefinitely —
+  // likely TCC prompt for network info access that has no UI to answer.
+  // Without the timeout, the entire setup flow froze silently. If lsof
+  // hangs, we bail and proceed; either the port is free (spawn works)
+  // or we'll get a real EADDRINUSE error to surface.
   try {
     const res = spawnSync('lsof', ['-ti', `:${MLX_PORT}`, '-sTCP:LISTEN'], {
-      encoding: 'utf-8'
+      encoding: 'utf-8',
+      timeout: 2000
     })
+    if (res.error && (res.error as NodeJS.ErrnoException).code === 'ETIMEDOUT') {
+      console.log('[mlx] Pre-flight: lsof timed out (likely macOS TCC), skipping port clear')
+      return
+    }
     if (!res.stdout) return
     const pids = res.stdout
       .trim()
@@ -298,8 +309,8 @@ function clearMLXPort(): void {
         // already dead, or not our process — either way, continue
       }
     }
-    // Give the kernel a beat to release the port
-    spawnSync('sleep', ['0.3'])
+    // Give the kernel a beat to release the port (also bounded by timeout)
+    spawnSync('sleep', ['0.3'], { timeout: 1000 })
   } catch (e) {
     console.log('[mlx] Pre-flight port clear failed (proceeding):', (e as Error).message)
   }
@@ -318,6 +329,7 @@ export async function startServer(
   // Patch 11: kill any orphan listener on the port before spawning. Defends
   // against the §2.6 fire-and-forget shutdown bug AND against any case where
   // a previous server (ours or someone else's) is still holding 11437.
+  // Patch 23: bounded with a hard timeout — lsof can hang under macOS TCC.
   clearMLXPort()
 
   const env = {
