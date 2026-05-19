@@ -403,18 +403,39 @@ async function handleChat(req: ChatRequest, channel: string): Promise<void> {
               emit({ type: 'tool_result', id: call.id, error: result })
             }
 
-            baseMessages.push({ role: 'assistant', content: buffer.slice(0, emittedIdx) })
-            // Patch 26: explicit narration prompt embedded with the tool result.
-            // Without this, E4B sees the raw output (delivered as role:user under
-            // Gemma's chat template since 'tool' isn't a native role for Gemma)
-            // and treats it as "the user pasted something" — defers with "review
-            // the output above" instead of summarizing. The explicit framing
-            // tells the model what its next response should look like.
+            // Patch 28 (Layer 1 of SOTA tool-use stack): route tool results
+            // via OpenAI-shape tool_calls + tool_call_id so Gemma 4's official
+            // chat_template renders them into native <|tool_response> tokens.
+            //
+            // Why this is the foundational fix: the template's forward-scan
+            // for role:'tool' messages ONLY triggers when the prior assistant
+            // message has a `tool_calls` array. Without it, the tool message
+            // is silently DROPPED — the model never sees the result. Every
+            // post-tool hallucination we debugged (weather, distance, the
+            // "I used a real-time search" fabrication) was caused by missing
+            // data, not by the model refusing to use data.
+            //
+            // Patches 26 and 27 were tightening narration prompts the model
+            // never received. With Patch 28 the result actually arrives, in
+            // the exact format Gemma 4 was trained on — narration becomes
+            // the trained behavior.
+            const openAiCallId = call.id // we use the same id we already minted
+            baseMessages.push({
+              role: 'assistant',
+              content: buffer.slice(0, emittedIdx),
+              tool_calls: [{
+                id: openAiCallId,
+                type: 'function',
+                function: {
+                  name: found.name,
+                  arguments: JSON.stringify(found.args)
+                }
+              }]
+            })
             baseMessages.push({
               role: 'tool',
-              content: hadError
-                ? `Tool \`${found.name}\` FAILED. Error:\n\n${result}\n\nExplain the error to Bear in 1-2 sentences and suggest what to try next.`
-                : `Tool \`${found.name}\` returned this result:\n\n${result}\n\nNow narrate this to Bear in 2-5 sentences. Cite SPECIFIC items from the result (e.g. label names, counts, key values) — don't just say "the result is above" or "see the output". Your value is the synthesis, not the acknowledgment.`
+              tool_call_id: openAiCallId,
+              content: hadError ? `Error: ${result}` : result
             })
             executedAction = true
             if (livePath) {

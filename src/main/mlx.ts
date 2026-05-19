@@ -521,6 +521,17 @@ export interface MLXChatMessage {
   role: 'user' | 'assistant' | 'system' | 'tool'
   content: string
   images?: string[]
+  // Patch 28: OpenAI-shape tool-call plumbing. Gemma 4's chat_template.jinja
+  // forward-scan for tool results requires the prior assistant message to have
+  // `tool_calls` AND the tool message to carry `tool_call_id`. Without these
+  // fields, the template silently drops the tool message and the model never
+  // sees the result.
+  tool_calls?: Array<{
+    id: string
+    type: 'function'
+    function: { name: string; arguments: string }
+  }>
+  tool_call_id?: string
 }
 
 export interface MLXChatOptions {
@@ -539,8 +550,15 @@ export async function* chatStream(
     body: JSON.stringify({
       model: opts.model,
       messages: opts.messages.map((m) => {
+        // Patch 28: preserve OpenAI tool_calls/tool_call_id fields so Gemma 4's
+        // chat template forward-scan attaches tool results to the prior
+        // assistant turn as native <|tool_response> blocks.
+        const base: Record<string, unknown> = { role: m.role, content: m.content }
+        if (m.tool_calls && m.tool_calls.length > 0) base.tool_calls = m.tool_calls
+        if (m.tool_call_id) base.tool_call_id = m.tool_call_id
+
         if (!m.images || m.images.length === 0) {
-          return { role: m.role, content: m.content }
+          return base
         }
         // Gemma 4 best practice: images first, text last (per E4B-it model card).
         const parts: Array<
@@ -548,7 +566,8 @@ export async function* chatStream(
           | { type: 'text'; text: string }
         > = m.images.map((url) => ({ type: 'image_url', image_url: { url } }))
         if (m.content) parts.push({ type: 'text', text: m.content })
-        return { role: m.role, content: parts }
+        base.content = parts
+        return base
       }),
       stream: true,
       stream_options: { include_usage: true },
