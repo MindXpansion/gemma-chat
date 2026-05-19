@@ -227,11 +227,12 @@ export async function getSchemaSummary(target: GraphTarget): Promise<string> {
   if ('error' in sessOrErr) return `Error: ${sessOrErr.error}`
   const session = sessOrErr
   try {
-    const [labels, rels, constraints] = await Promise.all([
-      session.run('CALL db.labels() YIELD label RETURN collect(label) AS labels'),
-      session.run('CALL db.relationshipTypes() YIELD relationshipType RETURN collect(relationshipType) AS rels'),
-      session.run('SHOW CONSTRAINTS')
-    ])
+    // Patch 24: SEQUENTIAL, not Promise.all. Neo4j sessions don't support
+    // concurrent transactions — parallel session.run() calls error with
+    // "Queries cannot be run directly on a session with an open transaction".
+    const labels = await session.run('CALL db.labels() YIELD label RETURN collect(label) AS labels')
+    const rels = await session.run('CALL db.relationshipTypes() YIELD relationshipType RETURN collect(relationshipType) AS rels')
+    const constraints = await session.run('SHOW CONSTRAINTS')
 
     const lines: string[] = []
     lines.push(`GRAPH: ${status.label}`)
