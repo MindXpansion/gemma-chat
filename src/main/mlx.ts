@@ -328,18 +328,27 @@ export async function startServer(
     HF_HUB_DISABLE_TELEMETRY: '1',
     // Rust-based downloader — avoids the Xet protocol stall (see audit §3.6 / Patch 6).
     // Requires hf_transfer installed in the venv; installMLX adds it.
-    HF_HUB_ENABLE_HF_TRANSFER: '1'
+    HF_HUB_ENABLE_HF_TRANSFER: '1',
+    // Patch 22: force unbuffered Python output. Without this, when Electron
+    // spawns python with piped stdout/stderr (no TTY), Python switches to
+    // block-buffering and we get NO output until 4-8 KB has accumulated.
+    // Symptom: setup screen looks frozen at "Loading Gemma 4 E4B…" with
+    // zero progress, because mlx_vlm's download/load logs never reach us.
+    PYTHONUNBUFFERED: '1'
   }
 
   // Track early exit so waitForHealth can bail out immediately
   let earlyExit: { code: number | null; stderr: string } | null = null
   let stderrBuf = ''
 
-  console.log(`[mlx] Starting server: ${python} -m mlx_vlm.server --model ${model} --port ${MLX_PORT}`)
+  console.log(`[mlx] Starting server: ${python} -u -m mlx_vlm.server --model ${model} --port ${MLX_PORT}`)
 
   serverProc = spawn(
+    // Patch 22: -u flag is the belt to PYTHONUNBUFFERED's suspenders. Either
+    // alone suffices; both together is the safest against future Python
+    // versions changing default behavior.
     python,
-    ['-m', 'mlx_vlm.server', '--model', model, '--port', String(MLX_PORT)],
+    ['-u', '-m', 'mlx_vlm.server', '--model', model, '--port', String(MLX_PORT)],
     {
       env,
       stdio: ['ignore', 'pipe', 'pipe'],
