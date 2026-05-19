@@ -20,7 +20,12 @@ const KEYS_WE_NEED = [
   'GOOGLE_MAPS_API_KEY',
   'NEO4J_URI',
   'NEO4J_USER',
-  'NEO4J_PASSWORD'
+  'NEO4J_PASSWORD',
+  // Patch 20: dedicated user/db for Gemma's own KG (gemma-chat-memory)
+  'NEO4J_GEMMA_URI',
+  'NEO4J_GEMMA_USER',
+  'NEO4J_GEMMA_PASSWORD',
+  'NEO4J_GEMMA_DATABASE'
 ] as const
 
 const GEMMA_ENV_FILE = join(homedir(), '.gemma-chat.env')

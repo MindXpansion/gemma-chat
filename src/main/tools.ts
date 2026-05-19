@@ -582,6 +582,10 @@ export const TOOLS: Record<string, ToolSpec> = {
   // Patch 19 (Neo4j integration) — Cypher access to Bear's partnership KG
   // (kg-arch-enterprise DBMS at bolt://localhost:7687). Reads creds via
   // env-loader from ~/.intelligence_partner/neo4j-creds.env.
+  // Patch 19/20 — Two Neo4j graphs are accessible:
+  //   aios_kg_*    → Bear's partnership KG (kg-arch-enterprise default DB)
+  //   gemma_kg_*   → Gemma's own RAG-grade KG (gemma-chat-memory DB)
+  // Symmetric API; different boundaries.
   aios_kg_schema: {
     name: 'aios_kg_schema',
     description:
@@ -589,7 +593,7 @@ export const TOOLS: Record<string, ToolSpec> = {
     params: [],
     example: '<action name="aios_kg_schema"></action>',
     mode: 'both',
-    run: async () => getSchemaSummary()
+    run: async () => getSchemaSummary('partnership')
   },
   aios_kg_query: {
     name: 'aios_kg_query',
@@ -613,22 +617,55 @@ export const TOOLS: Record<string, ToolSpec> = {
     mode: 'both',
     run: async (args) => {
       const cypher = typeof args.cypher === 'string' ? args.cypher : ''
-      let params: Record<string, unknown> = {}
-      const rawParams = typeof args.params === 'string' ? args.params.trim() : ''
-      if (rawParams) {
-        try {
-          const parsed = JSON.parse(rawParams)
-          if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
-            params = parsed as Record<string, unknown>
-          } else {
-            return 'Error: params must be a JSON object.'
-          }
-        } catch (e) {
-          return `Error parsing params as JSON: ${(e as Error).message}`
-        }
-      }
-      return runCypher(cypher, params)
+      const parsed = parseParams(args.params)
+      if ('error' in parsed) return parsed.error
+      return runCypher('partnership', cypher, parsed.params)
     }
+  },
+  // Patch 20 (Gemma's own KG) — symmetric tools targeting gemma-chat-memory.
+  // Schema per docs/research/05-neo4j-voyageai-rag-design.md:
+  //   :Document → :Chunk (embeddings), :Conversation → :Turn → :Summary,
+  //   :Workspace → :Observation → :Pattern, :Image, :Entity (deferred)
+  gemma_kg_schema: {
+    name: 'gemma_kg_schema',
+    description:
+      'Return labels, relationship types, and constraints from YOUR OWN knowledge graph (gemma-chat-memory). Same architect discipline applies — call this before crafting Cypher. Schema per research-05: Document/Chunk (RAG corpus), Conversation/Turn/Summary (chat history), Workspace/Observation/Pattern (AIOS), Image, Entity (deferred). All embeddings are 1024-dim cosine.',
+    params: [],
+    example: '<action name="gemma_kg_schema"></action>',
+    mode: 'both',
+    run: async () => getSchemaSummary('gemma')
+  },
+  gemma_kg_query: {
+    name: 'gemma_kg_query',
+    description:
+      'Run a Cypher query against YOUR OWN knowledge graph (gemma-chat-memory). Read AND write. This is your workspace — write freely. Use vector search via `CALL db.index.vector.queryNodes(\'chunk_embedding\', $k, $vec) YIELD node, score` once chunks are ingested (Patch 21+). Result rows capped at 50.',
+    params: [
+      { name: 'cypher', description: 'the Cypher statement', required: true, multiline: true },
+      { name: 'params', description: 'optional JSON object of query parameters', multiline: true }
+    ],
+    example:
+      '<action name="gemma_kg_query">\n<cypher>MATCH (d:Document) RETURN d.uri, d.title, d.indexed_at ORDER BY d.indexed_at DESC LIMIT 20</cypher>\n</action>',
+    mode: 'both',
+    run: async (args) => {
+      const cypher = typeof args.cypher === 'string' ? args.cypher : ''
+      const parsed = parseParams(args.params)
+      if ('error' in parsed) return parsed.error
+      return runCypher('gemma', cypher, parsed.params)
+    }
+  }
+}
+
+function parseParams(raw: unknown): { params: Record<string, unknown> } | { error: string } {
+  const text = typeof raw === 'string' ? raw.trim() : ''
+  if (!text) return { params: {} }
+  try {
+    const parsed = JSON.parse(text)
+    if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+      return { params: parsed as Record<string, unknown> }
+    }
+    return { error: 'Error: params must be a JSON object.' }
+  } catch (e) {
+    return { error: `Error parsing params as JSON: ${(e as Error).message}` }
   }
 }
 
@@ -736,9 +773,15 @@ function aiosSubsystem(): string {
     '- `aios_recall(day_expr, client?)` — episodic recall: what Bear was working on a given day (TaskFlow Pro)',
     '- `aios_week_summary()` — this week\'s TaskFlow activity grouped by day',
     '',
-    'Knowledge-graph tools (Bear\'s partnership KG — kg-arch-enterprise DBMS):',
-    '- `aios_kg_schema()` — labels + relationship types + constraints. ALWAYS call this first before writing Cypher.',
-    '- `aios_kg_query(cypher, params?)` — read OR write Cypher. The neo4j-kg-architect ANTI-PATTERNS block above is binding: pair MERGE with uniqueness constraints, never trust internal id(n), preflight port conflicts. You CANNOT summon the architect subagent — you must internalize its lessons.',
+    'Knowledge graphs — you have TWO:',
+    '',
+    '  (1) BEAR\'S PARTNERSHIP KG (kg-arch-enterprise default DB) — the graph Bear and Claude built together across 354+ sessions. Tread carefully.',
+    '      `aios_kg_schema()` — labels + rel types + constraints. ALWAYS first.',
+    '      `aios_kg_query(cypher, params?)` — read OR write Cypher. The architect anti-patterns block above is binding.',
+    '',
+    '  (2) YOUR OWN KG (gemma-chat-memory DB) — your private workspace. Schema per the RAG design: Document/Chunk (corpus), Conversation/Turn/Summary (chat history), Workspace/Observation/Pattern (AIOS), Image. All embeddings 1024-dim cosine. Write freely.',
+    '      `gemma_kg_schema()` — your graph\'s schema.',
+    '      `gemma_kg_query(cypher, params?)` — your Cypher surface. Vector search via `CALL db.index.vector.queryNodes(\'chunk_embedding\', $k, $vec)` once Patch 21 wires voyageai.',
     '',
     'HARD BOUNDARIES — do not write to:',
     '- `~/Skills/` (sacrosanct master library)',

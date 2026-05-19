@@ -21,44 +21,94 @@ import neo4j, { Driver, Session, QueryResult } from 'neo4j-driver'
  * conflicts).
  */
 
-let driverCache: Driver | null = null
-let driverInitTried = false
+export type GraphTarget = 'partnership' | 'gemma'
+
+interface GraphConfig {
+  uriKey: string
+  userKey: string
+  passKey: string
+  databaseKey?: string // explicit database; if absent, server's default is used
+  label: string
+}
+
+const GRAPH_CONFIGS: Record<GraphTarget, GraphConfig> = {
+  partnership: {
+    uriKey: 'NEO4J_URI',
+    userKey: 'NEO4J_USER',
+    passKey: 'NEO4J_PASSWORD',
+    label: 'partnership KG (kg-arch-enterprise, default neo4j DB)'
+  },
+  gemma: {
+    uriKey: 'NEO4J_GEMMA_URI',
+    userKey: 'NEO4J_GEMMA_USER',
+    passKey: 'NEO4J_GEMMA_PASSWORD',
+    databaseKey: 'NEO4J_GEMMA_DATABASE',
+    label: 'gemma-chat-memory (your own KG)'
+  }
+}
+
+const driverCache: Partial<Record<GraphTarget, Driver>> = {}
+const driverFailures: Partial<Record<GraphTarget, string>> = {}
 
 interface DriverStatus {
   ok: boolean
   uri?: string
   user?: string
+  database?: string
+  label: string
   reason?: string
 }
 
-function tryInitDriver(): DriverStatus {
-  if (driverCache) {
-    return { ok: true, uri: process.env.NEO4J_URI, user: process.env.NEO4J_USER }
-  }
-  if (driverInitTried) {
-    return { ok: false, reason: 'Driver init already failed this session.' }
-  }
-  driverInitTried = true
-
-  const uri = process.env.NEO4J_URI
-  const user = process.env.NEO4J_USER
-  const password = process.env.NEO4J_PASSWORD
-  if (!uri || !user || !password) {
+function tryInitDriver(target: GraphTarget): DriverStatus {
+  const cfg = GRAPH_CONFIGS[target]
+  if (driverCache[target]) {
     return {
-      ok: false,
-      reason:
-        'NEO4J_URI / NEO4J_USER / NEO4J_PASSWORD not set. env-loader reads from ~/.intelligence_partner/neo4j-creds.env at boot.'
+      ok: true,
+      label: cfg.label,
+      uri: process.env[cfg.uriKey],
+      user: process.env[cfg.userKey],
+      database: cfg.databaseKey ? process.env[cfg.databaseKey] : undefined
     }
   }
+  if (driverFailures[target]) {
+    return { ok: false, label: cfg.label, reason: driverFailures[target] }
+  }
+
+  const uri = process.env[cfg.uriKey]
+  const user = process.env[cfg.userKey]
+  const password = process.env[cfg.passKey]
+  if (!uri || !user || !password) {
+    const reason = `${cfg.uriKey} / ${cfg.userKey} / ${cfg.passKey} not set. env-loader reads from ~/.intelligence_partner/neo4j-creds.env (partnership) and ~/.gemma-chat.env (gemma-chat-memory) at boot.`
+    driverFailures[target] = reason
+    return { ok: false, label: cfg.label, reason }
+  }
   try {
-    driverCache = neo4j.driver(uri, neo4j.auth.basic(user, password), {
+    driverCache[target] = neo4j.driver(uri, neo4j.auth.basic(user, password), {
       connectionTimeout: 5000,
       maxConnectionPoolSize: 5
     })
-    return { ok: true, uri, user }
+    return {
+      ok: true,
+      label: cfg.label,
+      uri,
+      user,
+      database: cfg.databaseKey ? process.env[cfg.databaseKey] : undefined
+    }
   } catch (e) {
-    return { ok: false, reason: (e as Error).message }
+    const reason = (e as Error).message
+    driverFailures[target] = reason
+    return { ok: false, label: cfg.label, reason }
   }
+}
+
+function sessionFor(target: GraphTarget): Session | { error: string } {
+  const status = tryInitDriver(target)
+  if (!status.ok) return { error: `Neo4j driver for ${status.label} not initialized. ${status.reason}` }
+  const driver = driverCache[target]!
+  if (status.database) {
+    return driver.session({ database: status.database })
+  }
+  return driver.session()
 }
 
 const WRITE_VERBS_RE = /\b(CREATE|MERGE|SET|DELETE|REMOVE|DROP|FOREACH|CALL\s+apoc\.\w+\.write)\b/i
@@ -139,44 +189,44 @@ function formatResult(result: QueryResult, cypher: string): string {
 }
 
 /**
- * Run a Cypher query against the kg-arch-enterprise DBMS. Accepts both
- * read and write queries; write counters are surfaced in the response.
- * Result rows are capped at 50 to keep Gemma's context manageable.
+ * Run a Cypher query against the targeted graph (partnership | gemma).
+ * Accepts both read and write queries; write counters are surfaced in
+ * the response. Result rows are capped at 50.
  */
 export async function runCypher(
+  target: GraphTarget,
   cypher: string,
   params: Record<string, unknown> = {}
 ): Promise<string> {
   const trimmed = cypher.trim()
   if (!trimmed) return 'Error: cypher query is empty.'
 
-  const status = tryInitDriver()
-  if (!status.ok) return `Error: Neo4j driver not initialized. ${status.reason}`
-
-  let session: Session | null = null
+  const sessOrErr = sessionFor(target)
+  if ('error' in sessOrErr) return `Error: ${sessOrErr.error}`
+  const session = sessOrErr
   try {
-    session = driverCache!.session()
     const result = await session.run(trimmed, params)
     return formatResult(result, trimmed)
   } catch (e) {
     return `Cypher error: ${(e as Error).message}`
   } finally {
-    if (session) await session.close()
+    await session.close()
   }
 }
 
 /**
- * Lightweight schema dump: labels, relationship types, and constraints.
- * Read-only. Useful first-call for Gemma to understand what's in the graph
+ * Lightweight schema dump (labels, rels, constraints) for the targeted
+ * graph. Read-only. Useful first-call for Gemma to understand the graph
  * before crafting a query.
  */
-export async function getSchemaSummary(): Promise<string> {
-  const status = tryInitDriver()
-  if (!status.ok) return `Error: Neo4j driver not initialized. ${status.reason}`
+export async function getSchemaSummary(target: GraphTarget): Promise<string> {
+  const status = tryInitDriver(target)
+  if (!status.ok) return `Error: ${status.label} driver not initialized. ${status.reason}`
 
-  let session: Session | null = null
+  const sessOrErr = sessionFor(target)
+  if ('error' in sessOrErr) return `Error: ${sessOrErr.error}`
+  const session = sessOrErr
   try {
-    session = driverCache!.session()
     const [labels, rels, constraints] = await Promise.all([
       session.run('CALL db.labels() YIELD label RETURN collect(label) AS labels'),
       session.run('CALL db.relationshipTypes() YIELD relationshipType RETURN collect(relationshipType) AS rels'),
@@ -184,13 +234,16 @@ export async function getSchemaSummary(): Promise<string> {
     ])
 
     const lines: string[] = []
-    lines.push(`URI: ${status.uri}  USER: ${status.user}`)
+    lines.push(`GRAPH: ${status.label}`)
+    lines.push(`URI: ${status.uri}  USER: ${status.user}${status.database ? '  DB: ' + status.database : ''}`)
     lines.push('')
     lines.push('LABELS:')
-    lines.push('  ' + (labels.records[0].get('labels') as string[]).sort().join(', '))
+    const labelList = (labels.records[0].get('labels') as string[]).sort()
+    lines.push('  ' + (labelList.length ? labelList.join(', ') : '(none yet)'))
     lines.push('')
     lines.push('RELATIONSHIP TYPES:')
-    lines.push('  ' + (rels.records[0].get('rels') as string[]).sort().join(', '))
+    const relList = (rels.records[0].get('rels') as string[]).sort()
+    lines.push('  ' + (relList.length ? relList.join(', ') : '(none yet)'))
     lines.push('')
     lines.push('CONSTRAINTS:')
     if (constraints.records.length === 0) {
@@ -209,13 +262,16 @@ export async function getSchemaSummary(): Promise<string> {
   } catch (e) {
     return `Schema query error: ${(e as Error).message}`
   } finally {
-    if (session) await session.close()
+    await session.close()
   }
 }
 
 export async function closeNeo4j(): Promise<void> {
-  if (driverCache) {
-    await driverCache.close()
-    driverCache = null
+  for (const target of Object.keys(driverCache) as GraphTarget[]) {
+    const d = driverCache[target]
+    if (d) {
+      await d.close()
+      delete driverCache[target]
+    }
   }
 }
