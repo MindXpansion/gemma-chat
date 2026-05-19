@@ -28,6 +28,10 @@ const MAPS_SCRIPT = join(
   'Skills/temporal-intelligence/scripts/google_maps.py'
 )
 const IPP_DIR = join(homedir(), '.intelligence_partner')
+const ARCHITECT_PATTERNS_DIR = join(
+  homedir(),
+  '.claude/agent-memory/neo4j-kg-architect/patterns'
+)
 
 export const IPP_FILES = ['memory', 'preferences', 'comms', 'soul', 'ideals'] as const
 export type IppFile = (typeof IPP_FILES)[number]
@@ -294,6 +298,36 @@ export function episodicRecall(dayExpr: string, client?: string): string {
  */
 export function weekSummary(): string {
   return runPython(TEMPORAL_SCRIPT, ['--week'], 10_000)
+}
+
+// ── neo4j-kg-architect institutional knowledge (Patch 19) ──────────────
+
+let architectPatternsCache: string | null = null
+
+/**
+ * Read the architect subagent's successful + anti pattern files and
+ * concat for injection into Gemma's system prompt. The architect is a
+ * Claude Code subagent Gemma can't summon directly; this gives her the
+ * lessons it has learned across 354+ sessions so she can wield Cypher
+ * with the same discipline.
+ *
+ * Cached for app session — restart to refresh.
+ */
+export function loadArchitectPatterns(): string {
+  if (architectPatternsCache !== null) return architectPatternsCache
+  const sections: string[] = []
+  for (const file of ['anti-patterns.md', 'successful-patterns.md']) {
+    const p = join(ARCHITECT_PATTERNS_DIR, file)
+    if (!existsSync(p)) continue
+    try {
+      const body = readFileSync(p, 'utf-8').trim()
+      sections.push(`### neo4j-kg-architect / ${file}\n\n${body}`)
+    } catch {
+      // skip
+    }
+  }
+  architectPatternsCache = sections.join('\n\n---\n\n')
+  return architectPatternsCache
 }
 
 // ── RISE cognitive protocol (taught via system prompt) ──────────────────

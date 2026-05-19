@@ -16,10 +16,16 @@ import { join } from 'path'
  * Only mirrors a whitelist of keys we actually use. Does NOT echo values.
  */
 
-const KEYS_WE_NEED = ['GOOGLE_MAPS_API_KEY'] as const
+const KEYS_WE_NEED = [
+  'GOOGLE_MAPS_API_KEY',
+  'NEO4J_URI',
+  'NEO4J_USER',
+  'NEO4J_PASSWORD'
+] as const
 
 const GEMMA_ENV_FILE = join(homedir(), '.gemma-chat.env')
 const ZSHENV = join(homedir(), '.zshenv')
+const IPP_NEO4J_CREDS = join(homedir(), '.intelligence_partner/neo4j-creds.env')
 
 function parseDotenv(body: string): Record<string, string> {
   const out: Record<string, string> = {}
@@ -57,6 +63,7 @@ function readFileSafely(path: string): string {
 export function loadAiosEnv(): string[] {
   const sources: Record<string, string>[] = []
   if (existsSync(GEMMA_ENV_FILE)) sources.push(parseDotenv(readFileSafely(GEMMA_ENV_FILE)))
+  if (existsSync(IPP_NEO4J_CREDS)) sources.push(parseDotenv(readFileSafely(IPP_NEO4J_CREDS)))
   if (existsSync(ZSHENV)) sources.push(parseDotenv(readFileSafely(ZSHENV)))
 
   const populated: string[] = []

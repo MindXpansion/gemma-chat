@@ -12,6 +12,7 @@ import { appendObservation, observationsPath } from './aios'
 import {
   loadTemporalContext,
   loadPartnerProfile,
+  loadArchitectPatterns,
   risePrinciples,
   readIppFile,
   editIppFile,
@@ -24,6 +25,7 @@ import {
   weekSummary,
   IPP_FILES
 } from './aios-integration'
+import { runCypher, getSchemaSummary } from './aios-neo4j'
 
 export interface ToolContext {
   conversationId: string
@@ -576,6 +578,57 @@ export const TOOLS: Record<string, ToolSpec> = {
     example: '<action name="aios_week_summary"></action>',
     mode: 'both',
     run: async () => weekSummary()
+  },
+  // Patch 19 (Neo4j integration) — Cypher access to Bear's partnership KG
+  // (kg-arch-enterprise DBMS at bolt://localhost:7687). Reads creds via
+  // env-loader from ~/.intelligence_partner/neo4j-creds.env.
+  aios_kg_schema: {
+    name: 'aios_kg_schema',
+    description:
+      'Return labels, relationship types, and constraints from Bear\'s partnership knowledge graph (kg-arch-enterprise). Always call this FIRST when working with the KG — never craft Cypher without knowing the schema.',
+    params: [],
+    example: '<action name="aios_kg_schema"></action>',
+    mode: 'both',
+    run: async () => getSchemaSummary()
+  },
+  aios_kg_query: {
+    name: 'aios_kg_query',
+    description:
+      'Run a Cypher query against Bear\'s partnership KG (kg-arch-enterprise). Accepts read AND write queries. The neo4j-kg-architect anti-patterns (loaded into your prompt) apply — especially: pair MERGE with a uniqueness constraint, never trust internal id(n), preflight port conflicts. Result rows capped at 50.',
+    params: [
+      {
+        name: 'cypher',
+        description: 'the Cypher statement',
+        required: true,
+        multiline: true
+      },
+      {
+        name: 'params',
+        description: 'optional JSON object of query parameters',
+        multiline: true
+      }
+    ],
+    example:
+      '<action name="aios_kg_query">\n<cypher>MATCH (s:Session)-[:DURING]->(p:Phase {name: $phase}) RETURN s.id, s.started_at LIMIT 10</cypher>\n<params>{"phase": "Phase 3"}</params>\n</action>',
+    mode: 'both',
+    run: async (args) => {
+      const cypher = typeof args.cypher === 'string' ? args.cypher : ''
+      let params: Record<string, unknown> = {}
+      const rawParams = typeof args.params === 'string' ? args.params.trim() : ''
+      if (rawParams) {
+        try {
+          const parsed = JSON.parse(rawParams)
+          if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+            params = parsed as Record<string, unknown>
+          } else {
+            return 'Error: params must be a JSON object.'
+          }
+        } catch (e) {
+          return `Error parsing params as JSON: ${(e as Error).message}`
+        }
+      }
+      return runCypher(cypher, params)
+    }
   }
 }
 
@@ -683,6 +736,10 @@ function aiosSubsystem(): string {
     '- `aios_recall(day_expr, client?)` — episodic recall: what Bear was working on a given day (TaskFlow Pro)',
     '- `aios_week_summary()` — this week\'s TaskFlow activity grouped by day',
     '',
+    'Knowledge-graph tools (Bear\'s partnership KG — kg-arch-enterprise DBMS):',
+    '- `aios_kg_schema()` — labels + relationship types + constraints. ALWAYS call this first before writing Cypher.',
+    '- `aios_kg_query(cypher, params?)` — read OR write Cypher. The neo4j-kg-architect ANTI-PATTERNS block above is binding: pair MERGE with uniqueness constraints, never trust internal id(n), preflight port conflicts. You CANNOT summon the architect subagent — you must internalize its lessons.',
+    '',
     'HARD BOUNDARIES — do not write to:',
     '- `~/Skills/` (sacrosanct master library)',
     '- The partnership KG (`kg-arch-enterprise` default DB)',
@@ -703,6 +760,17 @@ function partnerProfileBlock(): string {
   const body = loadPartnerProfile()
   if (!body) return ''
   return ['PARTNER PROFILE (from ~/.intelligence_partner/ — your durable record of Bear)', '', body].join('\n')
+}
+
+function architectPatternsBlock(): string {
+  const body = loadArchitectPatterns()
+  if (!body) return ''
+  return [
+    'NEO4J-KG-ARCHITECT INSTITUTIONAL KNOWLEDGE',
+    '(Loaded from ~/.claude/agent-memory/neo4j-kg-architect/patterns/. You cannot SUMMON the architect subagent from gemma-chat — but its lessons are yours. Apply them whenever you use aios_kg_query.)',
+    '',
+    body
+  ].join('\n')
 }
 
 export function chatSystemPrompt(enableTools: boolean): string {
@@ -733,6 +801,8 @@ export function chatSystemPrompt(enableTools: boolean): string {
     partnerContext(),
     '',
     partnerProfileBlock(),
+    '',
+    architectPatternsBlock(),
     '',
     risePrinciples(),
     '',
@@ -770,6 +840,8 @@ export function codeSystemPrompt(workspacePath: string, previewHref: string): st
     partnerContext(),
     '',
     partnerProfileBlock(),
+    '',
+    architectPatternsBlock(),
     '',
     risePrinciples(),
     '',

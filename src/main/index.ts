@@ -634,4 +634,6 @@ app.on('window-all-closed', () => {
 app.on('before-quit', () => {
   stopServer()
   stopWorkspaceServer()
+  // Patch 19: close Neo4j driver pool (fire-and-forget, app is exiting)
+  import('./aios-neo4j').then((m) => m.closeNeo4j()).catch(() => {})
 })
