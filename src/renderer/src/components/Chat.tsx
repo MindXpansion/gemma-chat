@@ -84,6 +84,10 @@ export default function Chat({ model, onSwitchModel }: Props) {
     setActiveId(c.id)
   }
 
+  function renameConversation(id: string, title: string): void {
+    setConversations((cs) => cs.map((c) => (c.id === id ? { ...c, title } : c)))
+  }
+
   function deleteConversation(id: string): void {
     setConversations((cs) => {
       const filtered = cs.filter((c) => c.id !== id)
@@ -257,6 +261,7 @@ export default function Chat({ model, onSwitchModel }: Props) {
         onSelect={setActiveId}
         onNew={() => createConversation(activeConversation.mode)}
         onDelete={deleteConversation}
+        onRename={renameConversation}
       />
       <div className="flex min-w-0 flex-1">
         <div className="flex min-w-0 flex-1 flex-col">
