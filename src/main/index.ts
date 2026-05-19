@@ -404,9 +404,17 @@ async function handleChat(req: ChatRequest, channel: string): Promise<void> {
             }
 
             baseMessages.push({ role: 'assistant', content: buffer.slice(0, emittedIdx) })
+            // Patch 26: explicit narration prompt embedded with the tool result.
+            // Without this, E4B sees the raw output (delivered as role:user under
+            // Gemma's chat template since 'tool' isn't a native role for Gemma)
+            // and treats it as "the user pasted something" — defers with "review
+            // the output above" instead of summarizing. The explicit framing
+            // tells the model what its next response should look like.
             baseMessages.push({
               role: 'tool',
-              content: `[${hadError ? 'error' : 'ok'}] ${found.name}: ${result}`
+              content: hadError
+                ? `Tool \`${found.name}\` FAILED. Error:\n\n${result}\n\nExplain the error to Bear in 1-2 sentences and suggest what to try next.`
+                : `Tool \`${found.name}\` returned this result:\n\n${result}\n\nNow narrate this to Bear in 2-5 sentences. Cite SPECIFIC items from the result (e.g. label names, counts, key values) — don't just say "the result is above" or "see the output". Your value is the synthesis, not the acknowledgment.`
             })
             executedAction = true
             if (livePath) {
