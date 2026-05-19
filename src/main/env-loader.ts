@@ -25,7 +25,9 @@ const KEYS_WE_NEED = [
   'NEO4J_GEMMA_URI',
   'NEO4J_GEMMA_USER',
   'NEO4J_GEMMA_PASSWORD',
-  'NEO4J_GEMMA_DATABASE'
+  'NEO4J_GEMMA_DATABASE',
+  // Patch 21: voyageai for embeddings + reranker
+  'VOYAGE_API_KEY'
 ] as const
 
 const GEMMA_ENV_FILE = join(homedir(), '.gemma-chat.env')

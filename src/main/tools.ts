@@ -26,6 +26,7 @@ import {
   IPP_FILES
 } from './aios-integration'
 import { runCypher, getSchemaSummary } from './aios-neo4j'
+import { ingestPath, recall, formatRecallHits } from './aios-rag'
 
 export interface ToolContext {
   conversationId: string
@@ -638,7 +639,7 @@ export const TOOLS: Record<string, ToolSpec> = {
   gemma_kg_query: {
     name: 'gemma_kg_query',
     description:
-      'Run a Cypher query against YOUR OWN knowledge graph (gemma-chat-memory). Read AND write. This is your workspace — write freely. Use vector search via `CALL db.index.vector.queryNodes(\'chunk_embedding\', $k, $vec) YIELD node, score` once chunks are ingested (Patch 21+). Result rows capped at 50.',
+      'Run a Cypher query against YOUR OWN knowledge graph (gemma-chat-memory). Read AND write. This is your workspace — write freely. Use vector search via `CALL db.index.vector.queryNodes(\'chunk_embedding\', $k, $vec) YIELD node, score`. Result rows capped at 50.',
     params: [
       { name: 'cypher', description: 'the Cypher statement', required: true, multiline: true },
       { name: 'params', description: 'optional JSON object of query parameters', multiline: true }
@@ -651,6 +652,66 @@ export const TOOLS: Record<string, ToolSpec> = {
       const parsed = parseParams(args.params)
       if ('error' in parsed) return parsed.error
       return runCypher('gemma', cypher, parsed.params)
+    }
+  },
+  // Patch 21 (RAG ingestion + recall) — voyageai-backed
+  gemma_ingest: {
+    name: 'gemma_ingest',
+    description:
+      'Index a markdown/text file (or directory of them) into gemma-chat-memory for semantic recall. Idempotent on sha256 — re-ingesting an unchanged file is a no-op. Uses voyage-3-large at 1024 dim. Cost ≈ $0.18 per million tokens (~$0.02 per 100KB of prose).',
+    params: [
+      { name: 'path', description: 'absolute path to a .md/.txt file or a directory', required: true },
+      { name: 'recursive', description: 'true to walk subdirectories (default false)' }
+    ],
+    example:
+      '<action name="gemma_ingest">\n<path>/Users/bear/Development/gemma-chat/docs/research</path>\n</action>',
+    mode: 'both',
+    run: async (args) => {
+      const path = String(args.path ?? '').trim()
+      if (!path) return 'Error: path is required.'
+      const recursive = args.recursive === true || args.recursive === 'true'
+      const results = await ingestPath(path, recursive)
+      const lines: string[] = []
+      let totalChunks = 0
+      let totalTokens = 0
+      let totalCost = 0
+      for (const r of results) {
+        if (r.status === 'indexed') {
+          lines.push(`✓ ${r.uri} — ${r.chunks} chunks, ${r.tokens} tokens, $${(r.cost_usd ?? 0).toFixed(4)}`)
+          totalChunks += r.chunks ?? 0
+          totalTokens += r.tokens ?? 0
+          totalCost += r.cost_usd ?? 0
+        } else if (r.status === 'skipped-existing') {
+          lines.push(`• ${r.uri} — already indexed`)
+        } else {
+          lines.push(`✗ ${r.uri} — ${r.message}`)
+        }
+      }
+      lines.push('')
+      lines.push(
+        `TOTAL: ${totalChunks} chunks, ${totalTokens} tokens, $${totalCost.toFixed(4)}`
+      )
+      return lines.join('\n')
+    }
+  },
+  gemma_recall: {
+    name: 'gemma_recall',
+    description:
+      'Semantic recall from gemma-chat-memory. Embeds the query (voyage-3-large) and vector-searches the Chunk index. Returns top-K matches with document title and chunk text. Best for "what did I write about X" or "find the doc that mentions Y" questions.',
+    params: [
+      { name: 'query', description: 'what you\'re looking for', required: true, multiline: true },
+      { name: 'k', description: 'how many matches to return (default 5, max 25)' }
+    ],
+    example:
+      '<action name="gemma_recall">\n<query>voyage embedding model and dimensions</query>\n<k>5</k>\n</action>',
+    mode: 'both',
+    run: async (args) => {
+      const query = String(args.query ?? '').trim()
+      if (!query) return 'Error: query is required.'
+      const kRaw = typeof args.k === 'number' ? args.k : parseInt(String(args.k ?? '5'), 10)
+      const k = Math.max(1, Math.min(25, Number.isFinite(kRaw) ? kRaw : 5))
+      const hits = await recall(query, k)
+      return formatRecallHits(hits)
     }
   }
 }
@@ -781,7 +842,9 @@ function aiosSubsystem(): string {
     '',
     '  (2) YOUR OWN KG (gemma-chat-memory DB) — your private workspace. Schema per the RAG design: Document/Chunk (corpus), Conversation/Turn/Summary (chat history), Workspace/Observation/Pattern (AIOS), Image. All embeddings 1024-dim cosine. Write freely.',
     '      `gemma_kg_schema()` — your graph\'s schema.',
-    '      `gemma_kg_query(cypher, params?)` — your Cypher surface. Vector search via `CALL db.index.vector.queryNodes(\'chunk_embedding\', $k, $vec)` once Patch 21 wires voyageai.',
+    '      `gemma_kg_query(cypher, params?)` — your Cypher surface.',
+    '      `gemma_ingest(path, recursive?)` — index a .md/.txt file or directory into Chunks (voyage-3-large @ 1024 dim, idempotent on sha256). Cost ~$0.18/M tokens.',
+    '      `gemma_recall(query, k?)` — semantic recall via vector search. Use this when Bear asks "what did I write about X" or you need to ground in indexed content.',
     '',
     'HARD BOUNDARIES — do not write to:',
     '- `~/Skills/` (sacrosanct master library)',
