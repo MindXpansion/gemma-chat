@@ -437,6 +437,16 @@ async function handleChat(req: ChatRequest, channel: string): Promise<void> {
               tool_call_id: openAiCallId,
               content: hadError ? `Error: ${result}` : result
             })
+            // Patch 28.5 (Layer 1.5): minimal nudge after <|tool_response|>.
+            // Without it, the model sometimes treats its assistant turn as
+            // complete and emits a stop token instead of narrating. A trivial
+            // user turn gives Gemma a clean generation prompt to respond on.
+            // Ephemeral — lives only in baseMessages for this LLM call, never
+            // persisted to conversation history.
+            baseMessages.push({
+              role: 'user',
+              content: 'Now respond to me in plain text — narrate if the result is data, confirm briefly if it was an action.'
+            })
             executedAction = true
             if (livePath) {
               send('file:streaming', {
