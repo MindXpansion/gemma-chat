@@ -1029,6 +1029,31 @@ function partnerContext(): string {
  *   - Reference to the loaded intelligence-partner profile (injected above)
  *   - Memory tools (ipp_*, aios_observe) and their write boundaries
  */
+/**
+ * Patch 31: the live mount list, injected into every system prompt build.
+ * Without this Gemma can't know what's mounted without calling fs_mounts —
+ * and she won't think to, so she wrongly claims a workspace doesn't exist.
+ * The system prompt is rebuilt per request, so this is always current.
+ */
+function currentMountsBlock(): string {
+  const mounts = listMounts()
+  const lines = [
+    'ROOTS AVAILABLE RIGHT NOW (this is live — trust it, do not claim a workspace is missing without checking here):',
+    '- home → ~/GemmaWorkspace  [read-write]'
+  ]
+  if (mounts.length === 0) {
+    lines.push('- (no external workspaces mounted)')
+  } else {
+    for (const m of mounts) {
+      lines.push(`- ${m.id} → ${m.path}  [${m.mode}${m.indexed ? ', indexed' : ''}]`)
+    }
+    lines.push(
+      'When Bear names one of these workspaces, use its id directly as the `root` argument and act — traverse with fs_tree, read with fs_read. Do NOT ask him to re-specify a path that is already listed here.'
+    )
+  }
+  return lines.join('\n')
+}
+
 function aiosSubsystem(): string {
   return [
     'YOUR MEMORY SURFACE',
@@ -1070,12 +1095,14 @@ function aiosSubsystem(): string {
     'FILESYSTEM (Patch 31) — you have real file access via `fs_*` tools:',
     '- `home` is your own persistent workspace at ~/GemmaWorkspace — always read-write. Your notes, generated files, shared docs live here.',
     '- Bear can also MOUNT external workspaces (codebases, project folders). Each has a posture mode: read-only, read-write-confirm, or read-write-free.',
-    '- `fs_mounts()` — list every root you can reach and its mode. Call this first if unsure what `root` values are valid.',
     '- `fs_tree(root, path?, max_depth?)` — directory structure. `fs_list(root, path?)` — one directory.',
     '- `fs_search(root, query, path?, max_depth?)` — case-insensitive content grep; returns file:line matches.',
     '- `fs_read(root, path)` — read a text file. `fs_write(root, path, content)` — create/overwrite (Home only until Layer 3).',
+    '- `fs_mounts()` — re-list roots (the live list below is usually enough).',
     '- Every fs tool takes a `root` argument: `home`, or a mounted workspace id. Defaults to `home`.',
     '- For codebases larger than your context window: traverse structure with fs_tree/fs_search, read specific files with fs_read — never try to dump a whole tree into one response.',
+    '',
+    currentMountsBlock(),
     '',
     'HARD BOUNDARIES — do not write to:',
     '- `~/Skills/` (sacrosanct master library)',
