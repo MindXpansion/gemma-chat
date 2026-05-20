@@ -328,3 +328,79 @@ export async function fsDelete(absRoot: string, relPath: string): Promise<void> 
   const target = await safeResolve(absRoot, relPath, true)
   await rm(target, { recursive: true, force: true })
 }
+
+// --- Content search --------------------------------------------------------
+
+export interface SearchHit {
+  path: string
+  line: number
+  text: string
+}
+
+/** Per-call caps — keep a search result well inside the context budget. */
+const MAX_SEARCH_HITS = 80
+const MAX_SEARCH_FILE_BYTES = 512 * 1024
+
+/**
+ * Case-insensitive substring search across text files under a root.
+ * Skips dotfiles, .git, node_modules, binary files, and oversized files.
+ */
+export async function fsSearch(
+  absRoot: string,
+  query: string,
+  startRel: string,
+  maxDepth: number
+): Promise<{ hits: SearchHit[]; truncated: boolean }> {
+  const start = startRel ? await safeResolve(absRoot, startRel, true) : await realpath(absRoot)
+  const needle = query.toLowerCase()
+  const hits: SearchHit[] = []
+  let truncated = false
+
+  async function walk(dir: string, prefix: string, depth: number): Promise<void> {
+    if (depth > maxDepth || hits.length >= MAX_SEARCH_HITS) {
+      if (hits.length >= MAX_SEARCH_HITS) truncated = true
+      return
+    }
+    let dirents
+    try {
+      dirents = await readdir(dir, { withFileTypes: true })
+    } catch {
+      return
+    }
+    for (const d of dirents) {
+      if (hits.length >= MAX_SEARCH_HITS) {
+        truncated = true
+        return
+      }
+      if (d.name.startsWith('.') || SKIP_DIRS.has(d.name)) continue
+      const rel = prefix ? `${prefix}/${d.name}` : d.name
+      const abs = join(dir, d.name)
+      if (d.isDirectory()) {
+        await walk(abs, rel, depth + 1)
+        continue
+      }
+      let buf
+      try {
+        const s = await stat(abs)
+        if (s.size > MAX_SEARCH_FILE_BYTES) continue
+        buf = await readFile(abs)
+      } catch {
+        continue
+      }
+      if (buf.subarray(0, 8192).includes(0)) continue // binary
+      const lines = buf.toString('utf-8').split('\n')
+      for (let i = 0; i < lines.length; i++) {
+        if (lines[i].toLowerCase().includes(needle)) {
+          hits.push({ path: rel, line: i + 1, text: lines[i].trim().slice(0, 200) })
+          if (hits.length >= MAX_SEARCH_HITS) {
+            truncated = true
+            return
+          }
+        }
+      }
+    }
+  }
+
+  await walk(start, startRel, 1)
+  return { hits, truncated }
+}

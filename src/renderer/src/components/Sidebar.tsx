@@ -1,3 +1,5 @@
+import WorkspaceBar from './WorkspaceBar'
+
 interface Conversation {
   id: string
   title: string
@@ -80,6 +82,8 @@ export default function Sidebar({
           </div>
         ))}
       </div>
+      <WorkspaceBar />
+
       <div className="no-drag border-t border-white/[0.06] p-3 text-[11px] text-ink-400">
         <div className="flex items-center justify-between">
           <div className="flex items-center gap-1.5">

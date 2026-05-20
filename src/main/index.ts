@@ -1,4 +1,4 @@
-import { app, shell, BrowserWindow, ipcMain, nativeTheme, session, nativeImage } from 'electron'
+import { app, shell, BrowserWindow, ipcMain, nativeTheme, session, nativeImage, dialog } from 'electron'
 // EPIPE guard — Electron main can lose stdout to a closed pipe at startup,
 // which turns the first console.log into an uncaught exception that crashes the app.
 // See locateMLX() in ./mlx for the first call that surfaces this.
@@ -654,6 +654,37 @@ app.whenReady().then(async () => {
   })
 
   ipcMain.handle('workspace:server-port', async () => getWorkspaceServerPort())
+
+  // Patch 31 L2: mount management for Gemma's filesystem access.
+  ipcMain.handle('gemmafs:list-mounts', async () => {
+    const fs = await import('./gemma-fs')
+    return fs.listMounts()
+  })
+  ipcMain.handle('gemmafs:pick-folder', async () => {
+    const r = await dialog.showOpenDialog({
+      properties: ['openDirectory', 'createDirectory'],
+      title: 'Mount a workspace for Gemma'
+    })
+    return r.canceled || !r.filePaths[0] ? null : r.filePaths[0]
+  })
+  ipcMain.handle(
+    'gemmafs:add-mount',
+    async (_e, { path, mode }: { path: string; mode: 'ro' | 'rw-confirm' | 'rw-free' }) => {
+      const fs = await import('./gemma-fs')
+      return fs.addMount(path, mode)
+    }
+  )
+  ipcMain.handle('gemmafs:remove-mount', async (_e, id: string) => {
+    const fs = await import('./gemma-fs')
+    return fs.removeMount(id)
+  })
+  ipcMain.handle(
+    'gemmafs:set-mode',
+    async (_e, { id, mode }: { id: string; mode: 'ro' | 'rw-confirm' | 'rw-free' }) => {
+      const fs = await import('./gemma-fs')
+      return fs.setMountMode(id, mode)
+    }
+  )
 
   ipcMain.handle(
     'audio:transcribe',

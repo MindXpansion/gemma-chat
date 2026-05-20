@@ -33,6 +33,7 @@ import {
   fsWrite,
   fsList,
   fsTree,
+  fsSearch,
   listMounts,
   MAX_FILE_BYTES,
   type FsTreeEntry
@@ -331,19 +332,40 @@ async function fsWriteTool(
   if (!path) return 'Error: missing <path>'
   const r = resolveRoot(root)
   if ('error' in r) return `Error: ${r.error}`
-  if (r.mode === 'ro') {
-    return `Error: "${root}" is mounted read-only. Re-mount it read-write to edit.`
-  }
-  if (r.mode === 'rw-confirm') {
-    return `Error: "${root}" is read-write-confirm — per-write confirmation lands in Layer 3. Use Home for now, or re-mount as read-write-free.`
+  if (root !== 'home') {
+    return `Error: writing to mounted workspaces lands in Layer 3 (write gating). For now fs_write only targets your Home. Read access to "${root}" works via fs_read / fs_tree / fs_list / fs_search.`
   }
   try {
     await fsWrite(r.absRoot, path, content)
     ctx.onFileChange?.()
     const lines = content.split('\n').length
-    return `Wrote ${root}:${path} (${content.length} bytes, ${lines} lines).`
+    return `Wrote ${root}:${path} (${content.length} bytes, ${lines} line${lines === 1 ? '' : 's'}).`
   } catch (e) {
     return `Error writing ${root}:${path} — ${(e as Error).message}`
+  }
+}
+
+async function fsSearchTool(args: Record<string, unknown>): Promise<string> {
+  const root = String(args.root ?? 'home').trim()
+  const query = String(args.query ?? '').trim()
+  const path = String(args.path ?? '').trim()
+  if (!query) return 'Error: missing <query>'
+  const depthRaw =
+    typeof args.max_depth === 'number'
+      ? args.max_depth
+      : parseInt(String(args.max_depth ?? ''), 10)
+  const maxDepth = Number.isFinite(depthRaw) && depthRaw > 0 ? depthRaw : 100
+  const r = resolveRoot(root)
+  if ('error' in r) return `Error: ${r.error}`
+  try {
+    const { hits, truncated } = await fsSearch(r.absRoot, query, path, maxDepth)
+    if (hits.length === 0) return `No matches for "${query}" in ${root}:${path || '/'}.`
+    const body = hits.map((h) => `${h.path}:${h.line}: ${h.text}`).join('\n')
+    return truncated
+      ? body + `\n[…search capped at ${hits.length} hits. Narrow <query> or <path>.]`
+      : body
+  } catch (e) {
+    return `Error searching ${root}:${path || '/'} — ${(e as Error).message}`
   }
 }
 
@@ -873,6 +895,20 @@ export const TOOLS: Record<string, ToolSpec> = {
     mode: 'both',
     run: fsListTool
   },
+  fs_search: {
+    name: 'fs_search',
+    description:
+      'Case-insensitive content search across text files in a root. Returns file:line: matched-text. Skips binaries, .git, node_modules. Capped at 80 hits — narrow the query or path if truncated.',
+    params: [
+      { name: 'root', description: 'root name: `home` or a mounted workspace id (default home)' },
+      { name: 'query', description: 'text to search for', required: true },
+      { name: 'path', description: 'subpath to scope the search (optional)' },
+      { name: 'max_depth', description: 'max levels deep to search (optional)' }
+    ],
+    example: '<action name="fs_search">\n<root>home</root>\n<query>TODO</query>\n</action>',
+    mode: 'both',
+    run: fsSearchTool
+  },
   fs_read: {
     name: 'fs_read',
     description:
@@ -1036,7 +1072,8 @@ function aiosSubsystem(): string {
     '- Bear can also MOUNT external workspaces (codebases, project folders). Each has a posture mode: read-only, read-write-confirm, or read-write-free.',
     '- `fs_mounts()` — list every root you can reach and its mode. Call this first if unsure what `root` values are valid.',
     '- `fs_tree(root, path?, max_depth?)` — directory structure. `fs_list(root, path?)` — one directory.',
-    '- `fs_read(root, path)` — read a text file. `fs_write(root, path, content)` — create/overwrite.',
+    '- `fs_search(root, query, path?, max_depth?)` — case-insensitive content grep; returns file:line matches.',
+    '- `fs_read(root, path)` — read a text file. `fs_write(root, path, content)` — create/overwrite (Home only until Layer 3).',
     '- Every fs tool takes a `root` argument: `home`, or a mounted workspace id. Defaults to `home`.',
     '- For codebases larger than your context window: traverse structure with fs_tree/fs_search, read specific files with fs_read — never try to dump a whole tree into one response.',
     '',

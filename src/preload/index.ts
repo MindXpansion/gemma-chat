@@ -109,7 +109,27 @@ const api = {
   },
 
   transcribeAudio: (base64: string, model: string): Promise<{ text: string }> =>
-    ipcRenderer.invoke('audio:transcribe', { base64, model })
+    ipcRenderer.invoke('audio:transcribe', { base64, model }),
+
+  // Patch 31 L2: Gemma filesystem mount management
+  listMounts: (): Promise<GemmaMount[]> => ipcRenderer.invoke('gemmafs:list-mounts'),
+  pickFolder: (): Promise<string | null> => ipcRenderer.invoke('gemmafs:pick-folder'),
+  addMount: (path: string, mode: MountMode): Promise<GemmaMount> =>
+    ipcRenderer.invoke('gemmafs:add-mount', { path, mode }),
+  removeMount: (id: string): Promise<boolean> =>
+    ipcRenderer.invoke('gemmafs:remove-mount', id),
+  setMountMode: (id: string, mode: MountMode): Promise<boolean> =>
+    ipcRenderer.invoke('gemmafs:set-mode', { id, mode })
+}
+
+export type MountMode = 'ro' | 'rw-confirm' | 'rw-free'
+export interface GemmaMount {
+  id: string
+  name: string
+  path: string
+  mode: MountMode
+  indexed: boolean
+  indexedAt?: number
 }
 
 contextBridge.exposeInMainWorld('api', api)
