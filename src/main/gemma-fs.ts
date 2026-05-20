@@ -135,11 +135,30 @@ export async function setMountIndexed(id: string, indexed: boolean): Promise<voi
 // --- Root resolution -------------------------------------------------------
 
 export function resolveRoot(root: string): ResolvedRoot | { error: string } {
-  const r = (root || 'home').trim()
-  if (r === 'home') {
+  // Tolerate what small models actually emit: placeholder <brackets>,
+  // surrounding quotes, leading/trailing whitespace.
+  let r = (root || 'home').trim().replace(/^[<"'`]+|[>"'`]+$/g, '').trim()
+
+  if (r === 'home' || r === HOME_DIR || r === '~/GemmaWorkspace' || r === '~') {
     return { absRoot: HOME_DIR, mode: 'rw-free', label: 'Home (~/GemmaWorkspace)' }
   }
-  const m = state.mounts.find((x) => x.id === r || x.name === r)
+
+  // Exact mount id or display name.
+  let m = state.mounts.find((x) => x.id === r || x.name === r)
+
+  // Forgiving: a small model often passes a full path or basename instead
+  // of the short mount id. Match those against the registry too.
+  if (!m && (r.includes('/') || r.startsWith('~'))) {
+    const resolved = resolve(r.replace(/^~(?=\/|$)/, homedir()))
+    const base = basename(resolved)
+    if (resolved === HOME_DIR || base === 'GemmaWorkspace') {
+      return { absRoot: HOME_DIR, mode: 'rw-free', label: 'Home (~/GemmaWorkspace)' }
+    }
+    m = state.mounts.find(
+      (x) => x.path === resolved || basename(x.path) === base || x.name === base
+    )
+  }
+
   if (!m) {
     const valid = ['home', ...state.mounts.map((x) => x.id)].join(', ')
     return { error: `Unknown root "${root}". Valid roots: ${valid}` }

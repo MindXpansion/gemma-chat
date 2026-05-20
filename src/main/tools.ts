@@ -1197,10 +1197,12 @@ function currentMountsBlock(): string {
     lines.push('- (no external workspaces mounted)')
   } else {
     for (const m of mounts) {
-      lines.push(`- ${m.id} → ${m.path}  [${m.mode}${m.indexed ? ', indexed' : ''}]`)
+      lines.push(`- id:${m.id}  →  ${m.path}  [${m.mode}${m.indexed ? ', indexed' : ''}]`)
     }
     lines.push(
-      'When Bear names one of these workspaces, use its id directly as the `root` argument and act — traverse with fs_tree, read with fs_read. Do NOT ask him to re-specify a path that is already listed here.'
+      'The `root` argument is the short id on the LEFT (e.g. `' +
+        mounts[0].id +
+        '`) — never the path, never a placeholder like <name>. When Bear names a workspace, map it to its id and act immediately (fs_tree, fs_read, fs_bash). If a tool error says "Valid roots: …", just retry with one of those — do not ask Bear to confirm what the error already told you.'
     )
   }
   return lines.join('\n')
