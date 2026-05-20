@@ -472,10 +472,25 @@ async function fsSearchTool(args: Record<string, unknown>): Promise<string> {
   try {
     const { hits, truncated } = await fsSearch(r.absRoot, query, path, maxDepth)
     if (hits.length === 0) return `No matches for "${query}" in ${root}:${path || '/'}.`
-    const body = hits.map((h) => `${h.path}:${h.line}: ${h.text}`).join('\n')
+    // Group by file, order files by hit count (most relevant first).
+    const byFile = new Map<string, typeof hits>()
+    for (const h of hits) {
+      const arr = byFile.get(h.path)
+      if (arr) arr.push(h)
+      else byFile.set(h.path, [h])
+    }
+    const ordered = [...byFile.entries()].sort((a, b) => b[1].length - a[1].length)
+    const body = ordered
+      .map(
+        ([file, fhits]) =>
+          `${file}  (${fhits.length} match${fhits.length === 1 ? '' : 'es'})\n` +
+          fhits.map((h) => `  ${h.line}: ${h.text}`).join('\n')
+      )
+      .join('\n\n')
+    const header = `${hits.length} match${hits.length === 1 ? '' : 'es'} across ${byFile.size} file${byFile.size === 1 ? '' : 's'}:`
     return truncated
-      ? body + `\n[…search capped at ${hits.length} hits. Narrow <query> or <path>.]`
-      : body
+      ? `${header}\n\n${body}\n\n[…search capped at ${hits.length} hits. Narrow <query> or <path>.]`
+      : `${header}\n\n${body}`
   } catch (e) {
     return `Error searching ${root}:${path || '/'} — ${(e as Error).message}`
   }

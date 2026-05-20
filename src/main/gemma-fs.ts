@@ -44,8 +44,13 @@ export interface ResolvedRoot {
 
 const HOME_DIR = join(homedir(), 'GemmaWorkspace')
 
-/** Single-file read cap — protects the context window (design §6 Q3). */
-export const MAX_FILE_BYTES = 256 * 1024
+/**
+ * Single-file read cap — protects the context window. 64KB ≈ ~16K tokens,
+ * which fits a small model's window alongside the system prompt. (256KB,
+ * the original cap, was ~64K tokens — bigger than E4B's whole context.)
+ * Past the cap, fs_read truncates and points Gemma at fs_search.
+ */
+export const MAX_FILE_BYTES = 64 * 1024
 /** Tree/list node cap for a single call. */
 const MAX_TREE_NODES = 600
 
@@ -252,7 +257,9 @@ export async function fsTree(
     }
   }
 
-  await walk(start, startRel, 1)
+  // Walk with an empty prefix so displayed paths (and thus indentation)
+  // are relative to the queried subpath, not the root.
+  await walk(start, '', 1)
   return { entries, truncated }
 }
 
