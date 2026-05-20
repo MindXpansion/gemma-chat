@@ -119,6 +119,23 @@ export function rowIdTitle(n: Record<string, unknown>): NotebookRef {
   return { id, title }
 }
 
+/**
+ * Pull an array of rows out of a CLI JSON payload. The notebooklm CLI
+ * wraps lists in an object — `list --json` returns
+ * { "notebooks": [...], "count": N } — so a bare-array assumption fails.
+ * Handles both a top-level array and the common wrapper keys.
+ */
+export function extractRows(data: unknown): Record<string, unknown>[] {
+  if (Array.isArray(data)) return data as Record<string, unknown>[]
+  if (data && typeof data === 'object') {
+    const obj = data as Record<string, unknown>
+    for (const key of ['notebooks', 'sources', 'artifacts', 'items', 'results', 'data']) {
+      if (Array.isArray(obj[key])) return obj[key] as Record<string, unknown>[]
+    }
+  }
+  return []
+}
+
 // 60s cache so resolveNotebook doesn't re-list on every nlm call.
 let nbListCache: { at: number; list: NotebookRef[] } | null = null
 
@@ -129,9 +146,10 @@ export async function getNotebookList(force = false): Promise<NotebookRef[]> {
   }
   const r = await runNotebookLM(['list', '--json'], 45_000)
   if (!r.ok) throw new Error(nlmErrorText(r))
-  const data = parseNlmJson<Record<string, unknown>[]>(r.stdout)
-  const list = Array.isArray(data) ? data.map(rowIdTitle) : []
-  nbListCache = { at: Date.now(), list }
+  const rows = extractRows(parseNlmJson(r.stdout))
+  const list = rows.map(rowIdTitle)
+  // Don't cache an empty result — likely a transient parse/RPC miss.
+  if (list.length > 0) nbListCache = { at: Date.now(), list }
   return list
 }
 

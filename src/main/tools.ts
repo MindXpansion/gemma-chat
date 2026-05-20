@@ -48,7 +48,8 @@ import {
   nlmErrorText,
   parseNlmJson,
   resolveNotebook,
-  rowIdTitle
+  rowIdTitle,
+  extractRows
 } from './notebooklm'
 import { ensureGemmaHome } from './gemma-fs'
 
@@ -579,10 +580,10 @@ async function nlmNotebooks(args: Record<string, unknown>): Promise<string> {
   const filter = String(args.filter ?? '').trim().toLowerCase()
   const r = await runNotebookLM(['list', '--json'], 45_000)
   if (!r.ok) return nlmErrorText(r)
-  const data = parseNlmJson<Record<string, unknown>[]>(r.stdout)
-  if (!Array.isArray(data) || data.length === 0) return nlmRun(['list'], 45_000)
+  const parsed = extractRows(parseNlmJson(r.stdout))
+  if (parsed.length === 0) return nlmRun(['list'], 45_000)
 
-  let rows = data.map(rowIdTitle)
+  let rows = parsed.map(rowIdTitle)
   const total = rows.length
   if (filter) rows = rows.filter((n) => n.title.toLowerCase().includes(filter))
   if (rows.length === 0) {
@@ -607,8 +608,13 @@ async function nlmCreate(args: Record<string, unknown>): Promise<string> {
   const r = await runNotebookLM(['create', title, '--json'], 45_000)
   if (!r.ok) return nlmErrorText(r)
   const data = parseNlmJson<Record<string, unknown>>(r.stdout)
-  if (data && typeof data === 'object') {
-    const { id, title: t } = rowIdTitle(data)
+  // create --json may return the notebook directly or wrapped ({notebook:…}).
+  const nbObj =
+    data && typeof data === 'object'
+      ? ((data.notebook as Record<string, unknown>) ?? data)
+      : null
+  if (nbObj) {
+    const { id, title: t } = rowIdTitle(nbObj)
     return `Created notebook "${t}" — id: ${id}`
   }
   return r.stdout.trim() || '(notebook created)'
