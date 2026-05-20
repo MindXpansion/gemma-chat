@@ -135,9 +135,12 @@ export async function setMountIndexed(id: string, indexed: boolean): Promise<voi
 // --- Root resolution -------------------------------------------------------
 
 export function resolveRoot(root: string): ResolvedRoot | { error: string } {
-  // Tolerate what small models actually emit: placeholder <brackets>,
-  // surrounding quotes, leading/trailing whitespace.
-  let r = (root || 'home').trim().replace(/^[<"'`]+|[>"'`]+$/g, '').trim()
+  // Tolerate what small models actually emit: placeholder <brackets>
+  // anywhere (Gemma wraps values like /Users/bear/<_Autonomous>),
+  // surrounding quotes, stray whitespace.
+  let r = (root || 'home')
+    .replace(/[<>]/g, '')
+    .replace(/^["'`\s]+|["'`\s]+$/g, '')
 
   if (r === 'home' || r === HOME_DIR || r === '~/GemmaWorkspace' || r === '~') {
     return { absRoot: HOME_DIR, mode: 'rw-free', label: 'Home (~/GemmaWorkspace)' }
