@@ -45,6 +45,15 @@ import {
 } from './workspace'
 import type { ChatRequest, StreamChunk, ToolCall } from '../shared/types'
 import { loadAiosEnv } from './env-loader'
+import {
+  initHeartbeat,
+  shutdownHeartbeat,
+  getHeartbeatState,
+  setHeartbeatEnabled,
+  setHeartbeatCadence,
+  runTickNow,
+  heartbeatEvents
+} from './heartbeat'
 
 // Patch 18: mirror config-file API keys into process.env so spawned Python
 // scripts (temporal-intelligence, google_maps, weather) inherit them even
@@ -557,6 +566,19 @@ app.whenReady().then(async () => {
     console.error('[gemma-fs] init failed:', (e as Error).message)
   }
 
+  // Patch 34: Autonomous Heartbeat — restore state, resume the timer if it
+  // was left enabled. The heartbeat reads currentModel and skips a tick
+  // whenever a user chat is mid-stream (single shared MLX server).
+  try {
+    heartbeatEvents.on('event', (ev) => send('heartbeat:event', ev))
+    await initHeartbeat({
+      getModel: () => currentModel,
+      isBusy: () => chatAbortControllers.size > 0
+    })
+  } catch (e) {
+    console.error('[heartbeat] init failed:', (e as Error).message)
+  }
+
   session.defaultSession.setPermissionRequestHandler((_wc, permission, callback) => {
     if (permission === 'media' || permission === 'mediaKeySystem') {
       callback(true)
@@ -713,6 +735,16 @@ app.whenReady().then(async () => {
     }
   )
 
+  // Patch 34: Autonomous Heartbeat controls.
+  ipcMain.handle('heartbeat:get-state', async () => getHeartbeatState())
+  ipcMain.handle('heartbeat:set-enabled', async (_e, on: boolean) =>
+    setHeartbeatEnabled(on)
+  )
+  ipcMain.handle('heartbeat:set-cadence', async (_e, minutes: number) =>
+    setHeartbeatCadence(minutes)
+  )
+  ipcMain.handle('heartbeat:tick-now', async () => runTickNow())
+
   ipcMain.handle(
     'audio:transcribe',
     async (_e, { base64: _base64, model: _model }: { base64: string; model: string }) => {
@@ -739,6 +771,7 @@ app.on('window-all-closed', () => {
 })
 
 app.on('before-quit', () => {
+  shutdownHeartbeat()
   stopServer()
   stopWorkspaceServer()
   // Patch 19: close Neo4j driver pool (fire-and-forget, app is exiting)

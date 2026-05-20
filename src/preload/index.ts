@@ -4,7 +4,10 @@ import type {
   SetupStatus,
   StreamChunk,
   WorkspaceInfo,
-  WorkspaceFile
+  WorkspaceFile,
+  HeartbeatState,
+  HeartbeatEvent,
+  HeartbeatTickResult
 } from '../shared/types'
 
 const api = {
@@ -123,7 +126,22 @@ const api = {
 
   // Patch 31 L3: answer an rw-confirm prompt
   replyToolConfirm: (id: string, approved: boolean): Promise<void> =>
-    ipcRenderer.invoke('tool:confirm-reply', { id, approved })
+    ipcRenderer.invoke('tool:confirm-reply', { id, approved }),
+
+  // Patch 34: Autonomous Heartbeat controls
+  heartbeatGetState: (): Promise<HeartbeatState> =>
+    ipcRenderer.invoke('heartbeat:get-state'),
+  heartbeatSetEnabled: (on: boolean): Promise<HeartbeatState> =>
+    ipcRenderer.invoke('heartbeat:set-enabled', on),
+  heartbeatSetCadence: (minutes: number): Promise<HeartbeatState> =>
+    ipcRenderer.invoke('heartbeat:set-cadence', minutes),
+  heartbeatTickNow: (): Promise<HeartbeatTickResult> =>
+    ipcRenderer.invoke('heartbeat:tick-now'),
+  onHeartbeatEvent: (cb: (ev: HeartbeatEvent) => void): (() => void) => {
+    const listener = (_: IpcRendererEvent, ev: HeartbeatEvent): void => cb(ev)
+    ipcRenderer.on('heartbeat:event', listener)
+    return () => ipcRenderer.removeListener('heartbeat:event', listener)
+  }
 }
 
 export type MountMode = 'ro' | 'rw-confirm' | 'rw-free'

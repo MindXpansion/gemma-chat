@@ -133,3 +133,39 @@ export const AVAILABLE_MODELS: ModelInfo[] = [
 
 export const DEFAULT_MODEL = 'mlx-community/gemma-4-e4b-it-4bit'
 
+/**
+ * Patch 34: Autonomous Heartbeat. A main-process timer fires self-directed
+ * research ticks on a cadence. Each tick runs a fresh-context, offline-safe
+ * tool loop and appends a dated journal file to ~/GemmaWorkspace/research/.
+ */
+export interface HeartbeatState {
+  enabled: boolean
+  cadenceMinutes: number
+  tickCount: number
+  lastTickAt?: number
+  lastTickStatus?: 'ok' | 'skipped' | 'error'
+  lastError?: string
+  /** true while a tick is currently running */
+  ticking: boolean
+}
+
+export interface HeartbeatTickResult {
+  status: 'ok' | 'skipped' | 'error'
+  journalPath?: string
+  summary?: string
+  error?: string
+}
+
+export type HeartbeatEvent =
+  | { type: 'state'; state: HeartbeatState }
+  | { type: 'tick-start'; tick: number; objective: string }
+  | { type: 'tick-tool'; tick: number; tool: string }
+  | {
+      type: 'tick-end'
+      tick: number
+      status: 'ok' | 'skipped' | 'error'
+      journalPath?: string
+      summary?: string
+      error?: string
+    }
+
