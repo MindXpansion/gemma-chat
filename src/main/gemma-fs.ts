@@ -2,6 +2,7 @@ import { app } from 'electron'
 import { mkdir, readFile, writeFile, rm, rename, stat, readdir, realpath } from 'fs/promises'
 import { join, resolve, relative, dirname, isAbsolute, basename } from 'path'
 import { homedir } from 'os'
+import { spawn } from 'child_process'
 import { assertInWorkspace } from './workspace'
 
 /**
@@ -403,4 +404,76 @@ export async function fsSearch(
 
   await walk(start, startRel, 1)
   return { hits, truncated }
+}
+
+// --- Shell --------------------------------------------------------------
+
+const BASH_DENY =
+  /\b(rm\s+-rf\s+\/|sudo|:\(\)\s*\{|chmod\s+777\s+\/|mkfs|dd\s+if=|shutdown|reboot)\b/i
+
+export interface BashResult {
+  exitCode: number | null
+  stdout: string
+  stderr: string
+  truncated: boolean
+  durationMs: number
+}
+
+/** Run a shell command inside a root's directory. Deny-pattern screened. */
+export async function fsBash(
+  absRoot: string,
+  command: string,
+  timeoutMs = 60_000,
+  maxBytes = 16_000
+): Promise<BashResult> {
+  if (BASH_DENY.test(command)) {
+    throw new Error('Blocked by safety policy: command contains a denied pattern.')
+  }
+  const cwd = await realpath(absRoot)
+  const start = Date.now()
+  return new Promise((resolveP) => {
+    const proc = spawn('/bin/bash', ['-lc', command], {
+      cwd,
+      env: { ...process.env, FORCE_COLOR: '0', NO_COLOR: '1' }
+    })
+    let stdout = ''
+    let stderr = ''
+    let truncated = false
+    const killTimer = setTimeout(() => {
+      proc.kill('SIGKILL')
+      truncated = true
+    }, timeoutMs)
+    proc.stdout.on('data', (d: Buffer) => {
+      if (stdout.length < maxBytes) {
+        stdout += d.toString('utf-8')
+        if (stdout.length >= maxBytes) {
+          stdout = stdout.slice(0, maxBytes) + '\n[…output truncated]'
+          truncated = true
+        }
+      }
+    })
+    proc.stderr.on('data', (d: Buffer) => {
+      if (stderr.length < maxBytes) {
+        stderr += d.toString('utf-8')
+        if (stderr.length >= maxBytes) {
+          stderr = stderr.slice(0, maxBytes) + '\n[…stderr truncated]'
+          truncated = true
+        }
+      }
+    })
+    proc.on('close', (code) => {
+      clearTimeout(killTimer)
+      resolveP({ exitCode: code, stdout, stderr, truncated, durationMs: Date.now() - start })
+    })
+    proc.on('error', (e) => {
+      clearTimeout(killTimer)
+      resolveP({
+        exitCode: -1,
+        stdout,
+        stderr: (stderr + '\n' + String(e)).trim(),
+        truncated,
+        durationMs: Date.now() - start
+      })
+    })
+  })
 }

@@ -119,7 +119,11 @@ const api = {
   removeMount: (id: string): Promise<boolean> =>
     ipcRenderer.invoke('gemmafs:remove-mount', id),
   setMountMode: (id: string, mode: MountMode): Promise<boolean> =>
-    ipcRenderer.invoke('gemmafs:set-mode', { id, mode })
+    ipcRenderer.invoke('gemmafs:set-mode', { id, mode }),
+
+  // Patch 31 L3: answer an rw-confirm prompt
+  replyToolConfirm: (id: string, approved: boolean): Promise<void> =>
+    ipcRenderer.invoke('tool:confirm-reply', { id, approved })
 }
 
 export type MountMode = 'ro' | 'rw-confirm' | 'rw-free'

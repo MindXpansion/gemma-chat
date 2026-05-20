@@ -209,7 +209,24 @@ async function handleChat(req: ChatRequest, channel: string): Promise<void> {
 
     const ctx: ToolContext = {
       conversationId: req.conversationId,
-      onFileChange: () => send('workspace:changed', { conversationId: req.conversationId })
+      onFileChange: () => send('workspace:changed', { conversationId: req.conversationId }),
+      // Patch 31 L3: ask Bear to approve a write/bash op on an rw-confirm
+      // mount. Resolves true on approve, false on deny / abort / 5-min timeout.
+      requestConfirm: (payload) =>
+        new Promise<boolean>((resolveConfirm) => {
+          const id = `confirm_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`
+          let settled = false
+          const settle = (approved: boolean): void => {
+            if (settled) return
+            settled = true
+            pendingConfirms.delete(id)
+            resolveConfirm(approved)
+          }
+          pendingConfirms.set(id, settle)
+          emit({ type: 'tool_confirm', id, payload })
+          abort.signal.addEventListener('abort', () => settle(false))
+          setTimeout(() => settle(false), 5 * 60 * 1000)
+        })
     }
 
     const useTools = req.mode === 'code' || req.enableTools
@@ -510,6 +527,9 @@ async function handleChat(req: ChatRequest, channel: string): Promise<void> {
 }
 
 const chatAbortControllers = new Map<string, AbortController>()
+// Patch 31 L3: pending rw-confirm prompts, keyed by confirm id. The renderer
+// answers via the 'tool:confirm-reply' IPC, which resolves the stored promise.
+const pendingConfirms = new Map<string, (approved: boolean) => void>()
 
 app.whenReady().then(async () => {
   electronApp.setAppUserModelId('com.ammaar.gemmachat')
@@ -653,6 +673,14 @@ app.whenReady().then(async () => {
   })
 
   ipcMain.handle('workspace:server-port', async () => getWorkspaceServerPort())
+
+  // Patch 31 L3: renderer's answer to an rw-confirm prompt.
+  ipcMain.handle(
+    'tool:confirm-reply',
+    async (_e, { id, approved }: { id: string; approved: boolean }) => {
+      pendingConfirms.get(id)?.(approved)
+    }
+  )
 
   // Patch 31 L2: mount management for Gemma's filesystem access.
   ipcMain.handle('gemmafs:list-mounts', async () => {

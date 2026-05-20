@@ -1,10 +1,18 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
-import { AVAILABLE_MODELS, type AgentMode, type ChatMessage, type ToolCall, type StreamChunk } from '@shared/types'
+import {
+  AVAILABLE_MODELS,
+  type AgentMode,
+  type ChatMessage,
+  type ToolCall,
+  type StreamChunk,
+  type ConfirmPayload
+} from '@shared/types'
 import gemmaLogoUrl from '../assets/gemma-logo.png'
 import Composer from './Composer'
 import Message from './Message'
 import Sidebar from './Sidebar'
 import Canvas from './Canvas'
+import ConfirmCard from './ConfirmCard'
 
 interface Props {
   model: string
@@ -63,6 +71,10 @@ export default function Chat({ model, onSwitchModel }: Props) {
   })
   const [activeId, setActiveId] = useState<string>(() => conversations[0].id)
   const [streaming, setStreaming] = useState(false)
+  const [pendingConfirm, setPendingConfirm] = useState<{
+    id: string
+    payload: ConfirmPayload
+  } | null>(null)
   const streamRef = useRef<{ abort: boolean }>({ abort: false })
 
   const activeConversation = useMemo(
@@ -167,6 +179,12 @@ export default function Chat({ model, onSwitchModel }: Props) {
         },
         (chunk: StreamChunk) => {
           if (streamRef.current.abort) return
+          // Patch 31 L3: a write/bash op on an rw-confirm mount is waiting on
+          // Bear. Surface the card; don't touch the conversation.
+          if (chunk.type === 'tool_confirm') {
+            setPendingConfirm({ id: chunk.id, payload: chunk.payload })
+            return
+          }
           setConversations((cs) =>
             cs.map((c) => {
               if (c.id !== activeId) return c
@@ -213,6 +231,7 @@ export default function Chat({ model, onSwitchModel }: Props) {
 
   async function handleStop(): Promise<void> {
     streamRef.current.abort = true
+    setPendingConfirm(null)
     await window.api.abortChat(activeId)
     setStreaming(false)
   }
@@ -280,6 +299,19 @@ export default function Chat({ model, onSwitchModel }: Props) {
             onRegenerate={handleRegenerate}
             onReconnect={handleReconnect}
           />
+          {pendingConfirm && (
+            <ConfirmCard
+              payload={pendingConfirm.payload}
+              onApprove={() => {
+                window.api.replyToolConfirm(pendingConfirm.id, true)
+                setPendingConfirm(null)
+              }}
+              onDeny={() => {
+                window.api.replyToolConfirm(pendingConfirm.id, false)
+                setPendingConfirm(null)
+              }}
+            />
+          )}
           <Composer
             onSend={handleSend}
             onStop={handleStop}

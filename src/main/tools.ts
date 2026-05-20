@@ -34,14 +34,21 @@ import {
   fsList,
   fsTree,
   fsSearch,
+  fsEdit,
+  fsDelete,
+  fsBash,
   listMounts,
   MAX_FILE_BYTES,
   type FsTreeEntry
 } from './gemma-fs'
+import type { ConfirmPayload } from '../shared/types'
 
 export interface ToolContext {
   conversationId: string
   onFileChange?: () => void
+  // Patch 31 L3: write/bash ops on an rw-confirm mount call this to ask
+  // Bear for approval. Resolves true (approved) or false (denied/timeout).
+  requestConfirm?: (payload: ConfirmPayload) => Promise<boolean>
 }
 
 export interface ToolSpec {
@@ -322,6 +329,36 @@ async function fsReadTool(args: Record<string, unknown>): Promise<string> {
   }
 }
 
+/**
+ * Patch 31 L3: posture gate for write/bash ops. Home is always free; a
+ * mount is gated by its mode — ro rejects, rw-free proceeds, rw-confirm
+ * asks Bear via ctx.requestConfirm before proceeding.
+ */
+async function gateMutation(
+  root: string,
+  mode: string,
+  ctx: ToolContext,
+  payload: { tool: string; action: string; detail?: string }
+): Promise<{ ok: true } | { ok: false; msg: string }> {
+  if (root === 'home' || mode === 'rw-free') return { ok: true }
+  if (mode === 'ro') {
+    return { ok: false, msg: `"${root}" is mounted read-only — re-mount it read-write to make changes.` }
+  }
+  // rw-confirm
+  if (!ctx.requestConfirm) {
+    return { ok: false, msg: 'Confirmation channel unavailable — cannot act on a confirm-mode mount.' }
+  }
+  const approved = await ctx.requestConfirm({
+    tool: payload.tool,
+    root,
+    action: payload.action,
+    detail: payload.detail
+  })
+  return approved
+    ? { ok: true }
+    : { ok: false, msg: `Bear declined this operation on "${root}". Nothing was changed.` }
+}
+
 async function fsWriteTool(
   args: Record<string, unknown>,
   ctx: ToolContext
@@ -332,9 +369,12 @@ async function fsWriteTool(
   if (!path) return 'Error: missing <path>'
   const r = resolveRoot(root)
   if ('error' in r) return `Error: ${r.error}`
-  if (root !== 'home') {
-    return `Error: writing to mounted workspaces lands in Layer 3 (write gating). For now fs_write only targets your Home. Read access to "${root}" works via fs_read / fs_tree / fs_list / fs_search.`
-  }
+  const gate = await gateMutation(root, r.mode, ctx, {
+    tool: 'fs_write',
+    action: `Write ${path}`,
+    detail: `${content.length} bytes into ${root}:${path}`
+  })
+  if (!gate.ok) return `Error: ${gate.msg}`
   try {
     await fsWrite(r.absRoot, path, content)
     ctx.onFileChange?.()
@@ -342,6 +382,77 @@ async function fsWriteTool(
     return `Wrote ${root}:${path} (${content.length} bytes, ${lines} line${lines === 1 ? '' : 's'}).`
   } catch (e) {
     return `Error writing ${root}:${path} — ${(e as Error).message}`
+  }
+}
+
+async function fsEditTool(args: Record<string, unknown>, ctx: ToolContext): Promise<string> {
+  const root = String(args.root ?? 'home').trim()
+  const path = String(args.path ?? '').trim()
+  const oldStr = typeof args.old_string === 'string' ? args.old_string : ''
+  const newStr = typeof args.new_string === 'string' ? args.new_string : ''
+  const replaceAll = args.replace_all === true || args.replace_all === 'true'
+  if (!path) return 'Error: missing <path>'
+  if (!oldStr) return 'Error: missing <old_string>'
+  const r = resolveRoot(root)
+  if ('error' in r) return `Error: ${r.error}`
+  const gate = await gateMutation(root, r.mode, ctx, {
+    tool: 'fs_edit',
+    action: `Edit ${path}`,
+    detail: `In ${root}:${path}\n— replace: ${oldStr.slice(0, 160)}\n+ with: ${newStr.slice(0, 160)}`
+  })
+  if (!gate.ok) return `Error: ${gate.msg}`
+  try {
+    const occurrences = await fsEdit(r.absRoot, path, oldStr, newStr, replaceAll)
+    ctx.onFileChange?.()
+    return `Edited ${root}:${path} (${occurrences} replacement${occurrences === 1 ? '' : 's'}).`
+  } catch (e) {
+    return `Error editing ${root}:${path} — ${(e as Error).message}`
+  }
+}
+
+async function fsDeleteTool(args: Record<string, unknown>, ctx: ToolContext): Promise<string> {
+  const root = String(args.root ?? 'home').trim()
+  const path = String(args.path ?? '').trim()
+  if (!path) return 'Error: missing <path>'
+  const r = resolveRoot(root)
+  if ('error' in r) return `Error: ${r.error}`
+  const gate = await gateMutation(root, r.mode, ctx, {
+    tool: 'fs_delete',
+    action: `Delete ${path}`,
+    detail: `Remove ${root}:${path}`
+  })
+  if (!gate.ok) return `Error: ${gate.msg}`
+  try {
+    await fsDelete(r.absRoot, path)
+    ctx.onFileChange?.()
+    return `Deleted ${root}:${path}.`
+  } catch (e) {
+    return `Error deleting ${root}:${path} — ${(e as Error).message}`
+  }
+}
+
+async function fsBashTool(args: Record<string, unknown>, ctx: ToolContext): Promise<string> {
+  const root = String(args.root ?? 'home').trim()
+  const command = String(args.command ?? '').trim()
+  if (!command) return 'Error: missing <command>'
+  const r = resolveRoot(root)
+  if ('error' in r) return `Error: ${r.error}`
+  const gate = await gateMutation(root, r.mode, ctx, {
+    tool: 'fs_bash',
+    action: `Run a shell command in ${root}`,
+    detail: command.slice(0, 400)
+  })
+  if (!gate.ok) return `Error: ${gate.msg}`
+  try {
+    const res = await fsBash(r.absRoot, command)
+    ctx.onFileChange?.()
+    const parts = [`exit=${res.exitCode ?? 'killed'} (${res.durationMs}ms)`]
+    if (res.stdout) parts.push('stdout:\n' + res.stdout)
+    if (res.stderr) parts.push('stderr:\n' + res.stderr)
+    if (res.truncated) parts.push('[output truncated]')
+    return parts.join('\n')
+  } catch (e) {
+    return `Error: ${(e as Error).message}`
   }
 }
 
@@ -924,7 +1035,7 @@ export const TOOLS: Record<string, ToolSpec> = {
   fs_write: {
     name: 'fs_write',
     description:
-      'Create or overwrite a text file in a root. Home is always writable. Mounted workspaces must be in a read-write mode (read-only mounts and confirm-mode are gated).',
+      'Create or overwrite a text file in a root. Home is always writable. On a mounted workspace: read-only mounts reject; confirm mounts ask Bear first; free mounts write immediately.',
     params: [
       { name: 'root', description: 'root name: `home` or a mounted workspace id (default home)' },
       { name: 'path', description: 'file path within the root', required: true },
@@ -934,6 +1045,47 @@ export const TOOLS: Record<string, ToolSpec> = {
       '<action name="fs_write">\n<root>home</root>\n<path>notes/today.md</path>\n<content>\n# Notes\nFirst entry.\n</content>\n</action>',
     mode: 'both',
     run: fsWriteTool
+  },
+  // Patch 31 (Layer 3): mutation tools — posture-gated on mounts.
+  fs_edit: {
+    name: 'fs_edit',
+    description:
+      'Replace an exact snippet in a file. old_string must match once (or pass replace_all). Posture-gated on mounts like fs_write.',
+    params: [
+      { name: 'root', description: 'root name: `home` or a mounted workspace id (default home)' },
+      { name: 'path', description: 'file path within the root', required: true },
+      { name: 'old_string', description: 'exact text to find', required: true, multiline: true },
+      { name: 'new_string', description: 'replacement text', required: true, multiline: true },
+      { name: 'replace_all', description: 'true to replace every occurrence' }
+    ],
+    example:
+      '<action name="fs_edit">\n<root>home</root>\n<path>notes/today.md</path>\n<old_string>First entry.</old_string>\n<new_string>First entry. Updated.</new_string>\n</action>',
+    mode: 'both',
+    run: fsEditTool
+  },
+  fs_delete: {
+    name: 'fs_delete',
+    description:
+      'Delete a file or directory from a root. Posture-gated on mounts. Refuses anything inside a .git directory.',
+    params: [
+      { name: 'root', description: 'root name: `home` or a mounted workspace id (default home)' },
+      { name: 'path', description: 'path to delete within the root', required: true }
+    ],
+    example: '<action name="fs_delete">\n<root>home</root>\n<path>notes/old.md</path>\n</action>',
+    mode: 'both',
+    run: fsDeleteTool
+  },
+  fs_bash: {
+    name: 'fs_bash',
+    description:
+      'Run a shell command inside a root\'s directory (npm, git, tests, build tools). Posture-gated on mounts — read-only mounts refuse, confirm mounts ask Bear, free mounts run immediately. Dangerous patterns are always blocked. 60s timeout.',
+    params: [
+      { name: 'root', description: 'root name: `home` or a mounted workspace id (default home)' },
+      { name: 'command', description: 'shell command to run', required: true, multiline: true }
+    ],
+    example: '<action name="fs_bash">\n<root>home</root>\n<command>ls -la</command>\n</action>',
+    mode: 'both',
+    run: fsBashTool
   }
 }
 
@@ -1097,9 +1249,11 @@ function aiosSubsystem(): string {
     '- Bear can also MOUNT external workspaces (codebases, project folders). Each has a posture mode: read-only, read-write-confirm, or read-write-free.',
     '- `fs_tree(root, path?, max_depth?)` — directory structure. `fs_list(root, path?)` — one directory.',
     '- `fs_search(root, query, path?, max_depth?)` — case-insensitive content grep; returns file:line matches.',
-    '- `fs_read(root, path)` — read a text file. `fs_write(root, path, content)` — create/overwrite (Home only until Layer 3).',
+    '- `fs_read(root, path)` — read a text file. `fs_write` / `fs_edit` / `fs_delete` — create, patch, remove.',
+    '- `fs_bash(root, command)` — run shell commands (npm, git, tests) inside a root.',
     '- `fs_mounts()` — re-list roots (the live list below is usually enough).',
     '- Every fs tool takes a `root` argument: `home`, or a mounted workspace id. Defaults to `home`.',
+    '- WRITE POSTURE: Home is always writable. A mounted workspace obeys its mode — read-only refuses changes, confirm asks Bear before each change, free applies immediately. Don\'t promise an edit on a read-only mount; if a change is gated, just attempt it — the tool handles the prompt.',
     '- For codebases larger than your context window: traverse structure with fs_tree/fs_search, read specific files with fs_read — never try to dump a whole tree into one response.',
     '',
     currentMountsBlock(),

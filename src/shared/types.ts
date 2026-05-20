@@ -71,11 +71,20 @@ export type AgentActivity =
   | { kind: 'generating'; chars?: number }
   | { kind: 'tool'; tool: string; target?: string; chars?: number }
 
+/** Patch 31 L3: a write/bash op on an rw-confirm mount, awaiting Bear's call. */
+export interface ConfirmPayload {
+  tool: string
+  root: string
+  action: string
+  detail?: string
+}
+
 export type StreamChunk =
   | { type: 'token'; text: string }
   | { type: 'tool_call'; call: ToolCall }
   | { type: 'tool_result'; id: string; result?: string; error?: string }
   | { type: 'activity'; activity: AgentActivity }
+  | { type: 'tool_confirm'; id: string; payload: ConfirmPayload }
   | { type: 'done' }
   | { type: 'error'; error: string }
 
