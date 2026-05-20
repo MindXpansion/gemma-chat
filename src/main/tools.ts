@@ -43,7 +43,13 @@ import {
   type FsTreeEntry
 } from './gemma-fs'
 import type { ConfirmPayload } from '../shared/types'
-import { runNotebookLM, nlmErrorText, parseNlmJson } from './notebooklm'
+import {
+  runNotebookLM,
+  nlmErrorText,
+  parseNlmJson,
+  resolveNotebook,
+  rowIdTitle
+} from './notebooklm'
 import { ensureGemmaHome } from './gemma-fs'
 
 export interface ToolContext {
@@ -553,35 +559,46 @@ async function nlmRun(args: string[], timeoutMs?: number, cwd?: string): Promise
  * CLI accepts partial ids, so stripping the ellipsis (and stray quotes/
  * brackets) yields a value that still matches.
  */
-function cleanNbId(raw: unknown): string {
-  return String(raw ?? '')
-    .trim()
-    .replace(/[<>"'`]/g, '')
-    .replace(/[.…\s]+$/, '')
-    .trim()
+/**
+ * Resolve the `notebook` argument the way a human refers to a notebook —
+ * by TITLE (partial, case-insensitive) or by id. Empty arg → '' (the CLI
+ * then uses its current-notebook context). On no/ambiguous match returns
+ * an { error } the caller surfaces directly.
+ */
+async function resolveNbArg(
+  args: Record<string, unknown>
+): Promise<{ id: string; matched?: string } | { error: string }> {
+  const raw = String(args.notebook ?? '').trim()
+  if (!raw) return { id: '' }
+  const r = await resolveNotebook(raw)
+  if ('error' in r) return r
+  return { id: r.id, matched: r.title }
 }
 
-/** Pull a usable id + title out of a CLI JSON row, field-name-agnostic. */
-function rowIdTitle(n: Record<string, unknown>): { id: string; title: string } {
-  const id = String(n.id ?? n.notebook_id ?? n.notebookId ?? n.uuid ?? '?')
-  const title = String(n.title ?? n.name ?? '(untitled)')
-  return { id, title }
-}
-
-async function nlmNotebooks(): Promise<string> {
+async function nlmNotebooks(args: Record<string, unknown>): Promise<string> {
+  const filter = String(args.filter ?? '').trim().toLowerCase()
   const r = await runNotebookLM(['list', '--json'], 45_000)
   if (!r.ok) return nlmErrorText(r)
   const data = parseNlmJson<Record<string, unknown>[]>(r.stdout)
-  if (Array.isArray(data) && data.length > 0) {
-    return data
-      .map((n) => {
-        const { id, title } = rowIdTitle(n)
-        return `${id}  ·  ${title}`
-      })
-      .join('\n')
+  if (!Array.isArray(data) || data.length === 0) return nlmRun(['list'], 45_000)
+
+  let rows = data.map(rowIdTitle)
+  const total = rows.length
+  if (filter) rows = rows.filter((n) => n.title.toLowerCase().includes(filter))
+  if (rows.length === 0) {
+    return `No notebooks match "${filter}" (of ${total} total). Try a broader term.`
   }
-  // --json gave nothing parseable — fall back to the plain table.
-  return nlmRun(['list'], 45_000)
+  // Bear has 150+ notebooks — don't dump them all into context. Show a
+  // page; tell Gemma to filter to narrow.
+  const CAP = 50
+  const shown = rows.slice(0, CAP)
+  const head = filter
+    ? `${rows.length} notebook${rows.length === 1 ? '' : 's'} matching "${filter}" (of ${total}):`
+    : `${total} notebooks — name any by TITLE, no id needed. Pass <filter> to search:`
+  const body = shown.map((n) => `• ${n.title}   [${n.id}]`).join('\n')
+  return rows.length > CAP
+    ? `${head}\n${body}\n… ${rows.length - CAP} more — pass a <filter> to narrow.`
+    : `${head}\n${body}`
 }
 
 async function nlmCreate(args: Record<string, unknown>): Promise<string> {
@@ -598,36 +615,40 @@ async function nlmCreate(args: Record<string, unknown>): Promise<string> {
 }
 
 async function nlmSummary(args: Record<string, unknown>): Promise<string> {
-  const nb = cleanNbId(args.notebook)
+  const nb = await resolveNbArg(args)
+  if ('error' in nb) return `Error: ${nb.error}`
   const a = ['summary', '--topics']
-  if (nb) a.push('-n', nb)
+  if (nb.id) a.push('-n', nb.id)
   return nlmRun(a, 90_000)
 }
 
 async function nlmAsk(args: Record<string, unknown>): Promise<string> {
   const question = String(args.question ?? '').trim()
-  const nb = cleanNbId(args.notebook)
   if (!question) return 'Error: missing <question>'
+  const nb = await resolveNbArg(args)
+  if ('error' in nb) return `Error: ${nb.error}`
   const a = ['ask', question]
-  if (nb) a.push('-n', nb)
+  if (nb.id) a.push('-n', nb.id)
   return nlmRun(a, 120_000)
 }
 
 async function nlmSources(args: Record<string, unknown>): Promise<string> {
-  const nb = cleanNbId(args.notebook)
+  const nb = await resolveNbArg(args)
+  if ('error' in nb) return `Error: ${nb.error}`
   const a = ['source', 'list']
-  if (nb) a.push('-n', nb)
+  if (nb.id) a.push('-n', nb.id)
   return nlmRun(a, 45_000)
 }
 
 async function nlmSourceAdd(args: Record<string, unknown>): Promise<string> {
   const content = String(args.content ?? '').trim()
-  const nb = cleanNbId(args.notebook)
+  if (!content) return 'Error: missing <content> (a URL, file path, or text)'
+  const nb = await resolveNbArg(args)
+  if ('error' in nb) return `Error: ${nb.error}`
   const type = String(args.type ?? '').trim()
   const title = String(args.title ?? '').trim()
-  if (!content) return 'Error: missing <content> (a URL, file path, or text)'
   const a = ['source', 'add', content]
-  if (nb) a.push('-n', nb)
+  if (nb.id) a.push('-n', nb.id)
   if (type) a.push('--type', type)
   if (title) a.push('--title', title)
   return nlmRun(a, 120_000)
@@ -635,14 +656,15 @@ async function nlmSourceAdd(args: Record<string, unknown>): Promise<string> {
 
 async function nlmResearch(args: Record<string, unknown>): Promise<string> {
   const query = String(args.query ?? '').trim()
-  const nb = cleanNbId(args.notebook)
+  if (!query) return 'Error: missing <query>'
+  const nb = await resolveNbArg(args)
+  if ('error' in nb) return `Error: ${nb.error}`
   const from = String(args.from ?? '').trim()
   const mode = String(args.mode ?? '').trim()
-  if (!query) return 'Error: missing <query>'
   // Always --no-wait: research can take minutes; kick off, then check via
   // nlm_sources. Blocking a tool call for minutes is poor UX.
   const a = ['source', 'add-research', query, '--no-wait']
-  if (nb) a.push('-n', nb)
+  if (nb.id) a.push('-n', nb.id)
   if (from) a.push('--from', from)
   if (mode) a.push('--mode', mode)
   return nlmRun(a, 60_000)
@@ -650,34 +672,37 @@ async function nlmResearch(args: Record<string, unknown>): Promise<string> {
 
 async function nlmGenerate(args: Record<string, unknown>): Promise<string> {
   const type = String(args.type ?? '').trim()
-  const description = String(args.description ?? '').trim()
-  const nb = cleanNbId(args.notebook)
   if (!type) return 'Error: missing <type> (audio, video, slide-deck, mind-map, report, flashcards, quiz, infographic)'
+  const nb = await resolveNbArg(args)
+  if ('error' in nb) return `Error: ${nb.error}`
+  const description = String(args.description ?? '').trim()
   const a = ['generate', type]
   if (description) a.push(description)
-  if (nb) a.push('-n', nb)
+  if (nb.id) a.push('-n', nb.id)
   // Generation can take minutes; give it room. If it still times out the
   // artifact keeps generating server-side — nlm_artifacts will find it.
   return nlmRun(a, 240_000)
 }
 
 async function nlmArtifacts(args: Record<string, unknown>): Promise<string> {
-  const nb = cleanNbId(args.notebook)
+  const nb = await resolveNbArg(args)
+  if ('error' in nb) return `Error: ${nb.error}`
   const type = String(args.type ?? '').trim()
   const a = ['artifact', 'list']
-  if (nb) a.push('-n', nb)
+  if (nb.id) a.push('-n', nb.id)
   if (type) a.push('--type', type)
   return nlmRun(a, 45_000)
 }
 
 async function nlmDownload(args: Record<string, unknown>): Promise<string> {
   const type = String(args.type ?? '').trim()
-  const nb = cleanNbId(args.notebook)
   if (!type) return 'Error: missing <type> (audio, video, slide-deck, report, …)'
+  const nb = await resolveNbArg(args)
+  if ('error' in nb) return `Error: ${nb.error}`
   // Download into Gemma's Home so the artifact is reachable via fs_read.
   const home = await ensureGemmaHome()
   const a = ['download', type]
-  if (nb) a.push('-n', nb)
+  if (nb.id) a.push('-n', nb.id)
   const out = await nlmRun(a, 180_000, home)
   return `${out}\n\n(Saved under your Home — ~/GemmaWorkspace. Use fs_list home to see it.)`
 }
@@ -1305,9 +1330,12 @@ export const TOOLS: Record<string, ToolSpec> = {
   // Patch 33: NotebookLM CLI — multi-source research notebooks + media.
   nlm_notebooks: {
     name: 'nlm_notebooks',
-    description: 'List all of Bear\'s NotebookLM notebooks (id + title).',
-    params: [],
-    example: '<action name="nlm_notebooks"></action>',
+    description:
+      'List Bear\'s NotebookLM notebooks. He has 150+ — pass `filter` to search by title keyword instead of listing everything. You can then refer to any notebook by its TITLE in other nlm_ tools; you do NOT need its id.',
+    params: [
+      { name: 'filter', description: 'optional title keyword to narrow the list (e.g. "agentic")' }
+    ],
+    example: '<action name="nlm_notebooks">\n<filter>autonomous</filter>\n</action>',
     mode: 'both',
     run: nlmNotebooks
   },
@@ -1322,7 +1350,7 @@ export const TOOLS: Record<string, ToolSpec> = {
   nlm_sources: {
     name: 'nlm_sources',
     description: 'List the sources in a NotebookLM notebook.',
-    params: [{ name: 'notebook', description: 'notebook id (partial ok); omit for current' }],
+    params: [{ name: 'notebook', description: 'notebook TITLE or id — partial title works; omit to use the current notebook' }],
     example: '<action name="nlm_sources">\n<notebook>abc123</notebook>\n</action>',
     mode: 'both',
     run: nlmSources
@@ -1333,7 +1361,7 @@ export const TOOLS: Record<string, ToolSpec> = {
       'Add a source to a NotebookLM notebook. Content can be a URL, a YouTube link, a file path, or inline text — type is auto-detected.',
     params: [
       { name: 'content', description: 'URL, file path, or text to add', required: true, multiline: true },
-      { name: 'notebook', description: 'notebook id (partial ok); omit for current' },
+      { name: 'notebook', description: 'notebook TITLE or id — partial title works; omit to use the current notebook' },
       { name: 'type', description: 'override: url | text | file | youtube' },
       { name: 'title', description: 'title for inline-text sources' }
     ],
@@ -1348,7 +1376,7 @@ export const TOOLS: Record<string, ToolSpec> = {
       'Ask a NotebookLM notebook a question. NotebookLM synthesizes an answer across ALL the notebook\'s sources, with inline [1][2] citations. Use this for multi-document synthesis bigger than your own recall.',
     params: [
       { name: 'question', description: 'the question', required: true, multiline: true },
-      { name: 'notebook', description: 'notebook id (partial ok); omit for current' }
+      { name: 'notebook', description: 'notebook TITLE or id — partial title works; omit to use the current notebook' }
     ],
     example:
       '<action name="nlm_ask">\n<notebook>abc123</notebook>\n<question>What do these sources agree on about agent memory?</question>\n</action>',
@@ -1358,7 +1386,7 @@ export const TOOLS: Record<string, ToolSpec> = {
   nlm_summary: {
     name: 'nlm_summary',
     description: 'Get a NotebookLM notebook\'s AI-generated summary and suggested topics.',
-    params: [{ name: 'notebook', description: 'notebook id (partial ok); omit for current' }],
+    params: [{ name: 'notebook', description: 'notebook TITLE or id — partial title works; omit to use the current notebook' }],
     example: '<action name="nlm_summary">\n<notebook>abc123</notebook>\n</action>',
     mode: 'both',
     run: nlmSummary
@@ -1369,7 +1397,7 @@ export const TOOLS: Record<string, ToolSpec> = {
       'Have NotebookLM search the web (or Google Drive) for a topic and add the results as sources to a notebook. Runs in the background — kicked off immediately; check with nlm_sources shortly after.',
     params: [
       { name: 'query', description: 'what to research', required: true },
-      { name: 'notebook', description: 'notebook id (partial ok); omit for current' },
+      { name: 'notebook', description: 'notebook TITLE or id — partial title works; omit to use the current notebook' },
       { name: 'from', description: 'web (default) or drive' },
       { name: 'mode', description: 'fast (default) or deep' }
     ],
@@ -1385,7 +1413,7 @@ export const TOOLS: Record<string, ToolSpec> = {
     params: [
       { name: 'type', description: 'audio | video | slide-deck | mind-map | report | flashcards | quiz | infographic', required: true },
       { name: 'description', description: 'natural-language steer, e.g. "deep dive on chapter 3, casual tone"', multiline: true },
-      { name: 'notebook', description: 'notebook id (partial ok); omit for current' }
+      { name: 'notebook', description: 'notebook TITLE or id — partial title works; omit to use the current notebook' }
     ],
     example:
       '<action name="nlm_generate">\n<notebook>abc123</notebook>\n<type>audio</type>\n<description>deep dive on the key themes, conversational</description>\n</action>',
@@ -1397,7 +1425,7 @@ export const TOOLS: Record<string, ToolSpec> = {
     description:
       'List the artifacts in a NotebookLM notebook and their generation status. Use after nlm_generate to see if a podcast/video/etc. is ready.',
     params: [
-      { name: 'notebook', description: 'notebook id (partial ok); omit for current' },
+      { name: 'notebook', description: 'notebook TITLE or id — partial title works; omit to use the current notebook' },
       { name: 'type', description: 'filter: audio | video | slide-deck | report | …' }
     ],
     example: '<action name="nlm_artifacts">\n<notebook>abc123</notebook>\n</action>',
@@ -1410,7 +1438,7 @@ export const TOOLS: Record<string, ToolSpec> = {
       'Download a completed NotebookLM artifact (audio/video/report/…) into Gemma\'s Home (~/GemmaWorkspace) so it can be opened or referenced.',
     params: [
       { name: 'type', description: 'audio | video | slide-deck | report | …', required: true },
-      { name: 'notebook', description: 'notebook id (partial ok); omit for current' }
+      { name: 'notebook', description: 'notebook TITLE or id — partial title works; omit to use the current notebook' }
     ],
     example: '<action name="nlm_download">\n<notebook>abc123</notebook>\n<type>audio</type>\n</action>',
     mode: 'both',
@@ -1592,7 +1620,8 @@ function aiosSubsystem(): string {
     '',
     'NOTEBOOKLM (Patch 33) — Bear\'s Google NotebookLM, via the `nlm_*` tools:',
     '- NotebookLM is a hosted multi-source synthesis engine. Reach for it when a task needs reasoning ACROSS many documents, or when Bear wants a generated artifact (podcast, video, slide deck, report, mind-map).',
-    '- `nlm_notebooks` list · `nlm_create` new · `nlm_sources` / `nlm_source_add` manage sources (URL, YouTube, file, text).',
+    '- Bear has 150+ notebooks. REFER TO THEM BY TITLE — every nlm_ tool resolves a partial, case-insensitive title to the right notebook; you almost never need a raw id. When Bear names a notebook, pass that name straight through as `notebook`.',
+    '- `nlm_notebooks` lists/searches — pass `filter` to search by keyword rather than dumping all 150. `nlm_create` new · `nlm_sources` / `nlm_source_add` manage sources (URL, YouTube, file, text).',
     '- `nlm_ask` — ask a notebook a question; NotebookLM answers across all its sources with citations.',
     '- `nlm_summary` · `nlm_research` (web/drive search → adds sources, runs in background).',
     '- `nlm_generate` makes an artifact (audio/video/slide-deck/report/…); `nlm_artifacts` checks status; `nlm_download` saves it to your Home.',

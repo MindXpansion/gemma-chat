@@ -57,7 +57,9 @@ export function runNotebookLM(
     })
     let stdout = ''
     let stderr = ''
-    const MAX = 24_000
+    // Generous — `list` over a large library is sizable. Memory-safety cap
+    // only; each tool is responsible for what it returns to the model.
+    const MAX = 400_000
     let killed = false
     const timer = setTimeout(() => {
       killed = true
@@ -103,6 +105,84 @@ export function nlmErrorText(r: NlmResult): string {
   }
   const msg = (r.stderr || r.stdout || 'unknown error').trim()
   return `NotebookLM CLI error: ${msg.slice(0, 600)}`
+}
+
+export interface NotebookRef {
+  id: string
+  title: string
+}
+
+/** Pull a usable id + title out of a CLI JSON row, field-name-agnostic. */
+export function rowIdTitle(n: Record<string, unknown>): NotebookRef {
+  const id = String(n.id ?? n.notebook_id ?? n.notebookId ?? n.uuid ?? '?')
+  const title = String(n.title ?? n.name ?? '(untitled)')
+  return { id, title }
+}
+
+// 60s cache so resolveNotebook doesn't re-list on every nlm call.
+let nbListCache: { at: number; list: NotebookRef[] } | null = null
+
+/** Fetch (and cache) the full notebook list as {id,title} rows. */
+export async function getNotebookList(force = false): Promise<NotebookRef[]> {
+  if (!force && nbListCache && Date.now() - nbListCache.at < 60_000) {
+    return nbListCache.list
+  }
+  const r = await runNotebookLM(['list', '--json'], 45_000)
+  if (!r.ok) throw new Error(nlmErrorText(r))
+  const data = parseNlmJson<Record<string, unknown>[]>(r.stdout)
+  const list = Array.isArray(data) ? data.map(rowIdTitle) : []
+  nbListCache = { at: Date.now(), list }
+  return list
+}
+
+/**
+ * Resolve a notebook the way a human refers to one: by TITLE (full or
+ * partial, case-insensitive) or by id (full or prefix). This is the fix
+ * for "work with notebooks naturally" — Gemma should never need an exact
+ * UUID. Returns the matched notebook, or a clear error on no/ambiguous
+ * match.
+ */
+export async function resolveNotebook(
+  query: string
+): Promise<NotebookRef | { error: string }> {
+  const q = query
+    .replace(/[<>"'`]/g, '')
+    .replace(/[.…\s]+$/, '')
+    .trim()
+  if (!q) return { error: 'no notebook specified' }
+
+  let list: NotebookRef[]
+  try {
+    list = await getNotebookList()
+  } catch (e) {
+    return { error: (e as Error).message }
+  }
+
+  // 1. exact id
+  const exactId = list.find((n) => n.id === q)
+  if (exactId) return exactId
+  // 2. id prefix (unique)
+  const idPre = list.filter((n) => n.id.startsWith(q))
+  if (idPre.length === 1) return idPre[0]
+  // 3. exact title (case-insensitive)
+  const ql = q.toLowerCase()
+  const exactTitle = list.find((n) => n.title.toLowerCase() === ql)
+  if (exactTitle) return exactTitle
+  // 4. title substring (case-insensitive, unique)
+  const titleSub = list.filter((n) => n.title.toLowerCase().includes(ql))
+  if (titleSub.length === 1) return titleSub[0]
+  if (titleSub.length > 1) {
+    return {
+      error: `"${query}" matches ${titleSub.length} notebooks — be more specific. Candidates: ${titleSub
+        .slice(0, 6)
+        .map((n) => `"${n.title}"`)
+        .join(', ')}`
+    }
+  }
+  if (idPre.length > 1) {
+    return { error: `id prefix "${q}" matches ${idPre.length} notebooks — give more characters.` }
+  }
+  return { error: `no notebook matches "${query}". Use nlm_notebooks to see the list.` }
 }
 
 /** Try to parse JSON the CLI emitted; returns null if it isn't JSON. */
