@@ -156,6 +156,12 @@ export interface HeartbeatTickResult {
   error?: string
 }
 
+export interface HeartbeatJournalEntry {
+  name: string
+  mtimeMs: number
+  size: number
+}
+
 export type HeartbeatEvent =
   | { type: 'state'; state: HeartbeatState }
   | { type: 'tick-start'; tick: number; objective: string }

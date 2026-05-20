@@ -9,19 +9,23 @@ interface Conversation {
 interface Props {
   conversations: Conversation[]
   activeId: string
+  view: 'chat' | 'heartbeat'
   onSelect: (id: string) => void
   onNew: () => void
   onDelete: (id: string) => void
   onRename: (id: string, title: string) => void
+  onOpenHeartbeat: () => void
 }
 
 export default function Sidebar({
   conversations,
   activeId,
+  view,
   onSelect,
   onNew,
   onDelete,
-  onRename
+  onRename,
+  onOpenHeartbeat
 }: Props) {
   return (
     <div className="drag flex h-full w-60 shrink-0 flex-col border-r border-white/[0.06] bg-black/20">
@@ -37,13 +41,27 @@ export default function Sidebar({
           New chat
         </button>
       </div>
+      <div className="no-drag px-2 pb-1">
+        <button
+          onClick={onOpenHeartbeat}
+          className={`flex w-full items-center gap-2 rounded-lg px-3 py-2 text-left text-[13px] transition-all duration-200 ease-out ${
+            view === 'heartbeat'
+              ? 'bg-white/[0.07] text-white'
+              : 'text-ink-200 hover:bg-white/[0.03]'
+          }`}
+        >
+          <span className="text-[13px] text-emerald-400/90">♥</span>
+          Heartbeat
+        </button>
+      </div>
+
       <div className="no-drag min-h-0 flex-1 overflow-y-auto px-2 pb-4">
         {conversations.map((c) => (
           <div key={c.id} className="group relative">
             <button
               onClick={() => onSelect(c.id)}
               className={`w-full truncate rounded-lg px-3 py-2 pr-14 text-left text-[13px] transition-all duration-200 ease-out ${
-                activeId === c.id
+                view === 'chat' && activeId === c.id
                   ? 'bg-white/[0.07] text-white'
                   : 'text-ink-200 hover:bg-white/[0.03]'
               }`}

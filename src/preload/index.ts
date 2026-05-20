@@ -7,7 +7,8 @@ import type {
   WorkspaceFile,
   HeartbeatState,
   HeartbeatEvent,
-  HeartbeatTickResult
+  HeartbeatTickResult,
+  HeartbeatJournalEntry
 } from '../shared/types'
 
 const api = {
@@ -137,6 +138,10 @@ const api = {
     ipcRenderer.invoke('heartbeat:set-cadence', minutes),
   heartbeatTickNow: (): Promise<HeartbeatTickResult> =>
     ipcRenderer.invoke('heartbeat:tick-now'),
+  heartbeatListJournal: (): Promise<HeartbeatJournalEntry[]> =>
+    ipcRenderer.invoke('heartbeat:journal-list'),
+  heartbeatReadJournal: (name: string): Promise<string> =>
+    ipcRenderer.invoke('heartbeat:journal-read', name),
   onHeartbeatEvent: (cb: (ev: HeartbeatEvent) => void): (() => void) => {
     const listener = (_: IpcRendererEvent, ev: HeartbeatEvent): void => cb(ev)
     ipcRenderer.on('heartbeat:event', listener)

@@ -13,6 +13,7 @@ import Message from './Message'
 import Sidebar from './Sidebar'
 import Canvas from './Canvas'
 import ConfirmCard from './ConfirmCard'
+import Heartbeat from './Heartbeat'
 
 interface Props {
   model: string
@@ -70,6 +71,7 @@ export default function Chat({ model, onSwitchModel }: Props) {
     return loaded.length ? loaded : [newConversation()]
   })
   const [activeId, setActiveId] = useState<string>(() => conversations[0].id)
+  const [view, setView] = useState<'chat' | 'heartbeat'>('chat')
   const [streaming, setStreaming] = useState(false)
   const [pendingConfirm, setPendingConfirm] = useState<{
     id: string
@@ -277,11 +279,22 @@ export default function Chat({ model, onSwitchModel }: Props) {
       <Sidebar
         conversations={conversations}
         activeId={activeId}
-        onSelect={setActiveId}
-        onNew={() => createConversation(activeConversation.mode)}
+        view={view}
+        onSelect={(id) => {
+          setActiveId(id)
+          setView('chat')
+        }}
+        onNew={() => {
+          createConversation(activeConversation.mode)
+          setView('chat')
+        }}
         onDelete={deleteConversation}
         onRename={renameConversation}
+        onOpenHeartbeat={() => setView('heartbeat')}
       />
+      {view === 'heartbeat' ? (
+        <Heartbeat />
+      ) : (
       <div className="flex min-w-0 flex-1">
         <div className="flex min-w-0 flex-1 flex-col">
           <Header
@@ -333,6 +346,7 @@ export default function Chat({ model, onSwitchModel }: Props) {
           />
         )}
       </div>
+      )}
     </div>
   )
 }

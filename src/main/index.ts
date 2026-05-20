@@ -52,6 +52,8 @@ import {
   setHeartbeatEnabled,
   setHeartbeatCadence,
   runTickNow,
+  listJournal,
+  readJournal,
   heartbeatEvents
 } from './heartbeat'
 
@@ -744,6 +746,10 @@ app.whenReady().then(async () => {
     setHeartbeatCadence(minutes)
   )
   ipcMain.handle('heartbeat:tick-now', async () => runTickNow())
+  ipcMain.handle('heartbeat:journal-list', async () => listJournal())
+  ipcMain.handle('heartbeat:journal-read', async (_e, name: string) =>
+    readJournal(name)
+  )
 
   ipcMain.handle(
     'audio:transcribe',

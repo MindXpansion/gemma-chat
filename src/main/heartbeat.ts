@@ -1,11 +1,16 @@
 import { app } from 'electron'
 import { EventEmitter } from 'events'
-import { mkdir, readFile, writeFile, readdir } from 'fs/promises'
+import { mkdir, readFile, writeFile, readdir, stat } from 'fs/promises'
 import { join } from 'path'
 import { chatStream, type MLXChatMessage } from './mlx'
 import { TOOLS, findNextAction, runTool, type ToolContext, type ParsedAction } from './tools'
 import { ensureGemmaHome } from './gemma-fs'
-import type { HeartbeatState, HeartbeatEvent, HeartbeatTickResult } from '../shared/types'
+import type {
+  HeartbeatState,
+  HeartbeatEvent,
+  HeartbeatTickResult,
+  HeartbeatJournalEntry
+} from '../shared/types'
 
 /**
  * Patch 34 — Autonomous Heartbeat (Layer 1: the engine).
@@ -254,6 +259,42 @@ async function recentNotes(n: number): Promise<string> {
 function stamp(d: Date): string {
   const p = (n: number): string => String(n).padStart(2, '0')
   return `${d.getFullYear()}${p(d.getMonth() + 1)}${p(d.getDate())}-${p(d.getHours())}${p(d.getMinutes())}${p(d.getSeconds())}`
+}
+
+/** List the tick journal files, newest first. */
+export async function listJournal(): Promise<HeartbeatJournalEntry[]> {
+  let dir: string
+  try {
+    dir = await ticksDir()
+  } catch {
+    return []
+  }
+  let names: string[]
+  try {
+    names = (await readdir(dir)).filter((f) => f.endsWith('.md'))
+  } catch {
+    return []
+  }
+  const out: HeartbeatJournalEntry[] = []
+  for (const name of names) {
+    try {
+      const s = await stat(join(dir, name))
+      out.push({ name, mtimeMs: s.mtimeMs, size: s.size })
+    } catch {
+      // skip unreadable
+    }
+  }
+  out.sort((a, b) => b.mtimeMs - a.mtimeMs)
+  return out
+}
+
+/** Read one tick journal file. The name is validated to block traversal. */
+export async function readJournal(name: string): Promise<string> {
+  if (!/^tick-[\w-]+\.md$/.test(name)) {
+    throw new Error(`invalid journal name: ${name}`)
+  }
+  const dir = await ticksDir()
+  return readFile(join(dir, name), 'utf-8')
 }
 
 // --- Prompt -----------------------------------------------------------------
