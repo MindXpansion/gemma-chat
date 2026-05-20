@@ -43,7 +43,7 @@ import {
   type FsTreeEntry
 } from './gemma-fs'
 import type { ConfirmPayload } from '../shared/types'
-import { runNotebookLM, nlmErrorText } from './notebooklm'
+import { runNotebookLM, nlmErrorText, parseNlmJson } from './notebooklm'
 import { ensureGemmaHome } from './gemma-fs'
 
 export interface ToolContext {
@@ -547,18 +547,58 @@ async function nlmRun(args: string[], timeoutMs?: number, cwd?: string): Promise
   return out || '(done — no output)'
 }
 
+/**
+ * Patch 33 fix: sanitize a notebook id. The CLI's table output clips long
+ * UUIDs with a trailing "…" / "..."; Gemma copies the clipped form. The
+ * CLI accepts partial ids, so stripping the ellipsis (and stray quotes/
+ * brackets) yields a value that still matches.
+ */
+function cleanNbId(raw: unknown): string {
+  return String(raw ?? '')
+    .trim()
+    .replace(/[<>"'`]/g, '')
+    .replace(/[.…\s]+$/, '')
+    .trim()
+}
+
+/** Pull a usable id + title out of a CLI JSON row, field-name-agnostic. */
+function rowIdTitle(n: Record<string, unknown>): { id: string; title: string } {
+  const id = String(n.id ?? n.notebook_id ?? n.notebookId ?? n.uuid ?? '?')
+  const title = String(n.title ?? n.name ?? '(untitled)')
+  return { id, title }
+}
+
 async function nlmNotebooks(): Promise<string> {
+  const r = await runNotebookLM(['list', '--json'], 45_000)
+  if (!r.ok) return nlmErrorText(r)
+  const data = parseNlmJson<Record<string, unknown>[]>(r.stdout)
+  if (Array.isArray(data) && data.length > 0) {
+    return data
+      .map((n) => {
+        const { id, title } = rowIdTitle(n)
+        return `${id}  ·  ${title}`
+      })
+      .join('\n')
+  }
+  // --json gave nothing parseable — fall back to the plain table.
   return nlmRun(['list'], 45_000)
 }
 
 async function nlmCreate(args: Record<string, unknown>): Promise<string> {
   const title = String(args.title ?? '').trim()
   if (!title) return 'Error: missing <title>'
-  return nlmRun(['create', title], 45_000)
+  const r = await runNotebookLM(['create', title, '--json'], 45_000)
+  if (!r.ok) return nlmErrorText(r)
+  const data = parseNlmJson<Record<string, unknown>>(r.stdout)
+  if (data && typeof data === 'object') {
+    const { id, title: t } = rowIdTitle(data)
+    return `Created notebook "${t}" — id: ${id}`
+  }
+  return r.stdout.trim() || '(notebook created)'
 }
 
 async function nlmSummary(args: Record<string, unknown>): Promise<string> {
-  const nb = String(args.notebook ?? '').trim()
+  const nb = cleanNbId(args.notebook)
   const a = ['summary', '--topics']
   if (nb) a.push('-n', nb)
   return nlmRun(a, 90_000)
@@ -566,7 +606,7 @@ async function nlmSummary(args: Record<string, unknown>): Promise<string> {
 
 async function nlmAsk(args: Record<string, unknown>): Promise<string> {
   const question = String(args.question ?? '').trim()
-  const nb = String(args.notebook ?? '').trim()
+  const nb = cleanNbId(args.notebook)
   if (!question) return 'Error: missing <question>'
   const a = ['ask', question]
   if (nb) a.push('-n', nb)
@@ -574,7 +614,7 @@ async function nlmAsk(args: Record<string, unknown>): Promise<string> {
 }
 
 async function nlmSources(args: Record<string, unknown>): Promise<string> {
-  const nb = String(args.notebook ?? '').trim()
+  const nb = cleanNbId(args.notebook)
   const a = ['source', 'list']
   if (nb) a.push('-n', nb)
   return nlmRun(a, 45_000)
@@ -582,7 +622,7 @@ async function nlmSources(args: Record<string, unknown>): Promise<string> {
 
 async function nlmSourceAdd(args: Record<string, unknown>): Promise<string> {
   const content = String(args.content ?? '').trim()
-  const nb = String(args.notebook ?? '').trim()
+  const nb = cleanNbId(args.notebook)
   const type = String(args.type ?? '').trim()
   const title = String(args.title ?? '').trim()
   if (!content) return 'Error: missing <content> (a URL, file path, or text)'
@@ -595,7 +635,7 @@ async function nlmSourceAdd(args: Record<string, unknown>): Promise<string> {
 
 async function nlmResearch(args: Record<string, unknown>): Promise<string> {
   const query = String(args.query ?? '').trim()
-  const nb = String(args.notebook ?? '').trim()
+  const nb = cleanNbId(args.notebook)
   const from = String(args.from ?? '').trim()
   const mode = String(args.mode ?? '').trim()
   if (!query) return 'Error: missing <query>'
@@ -611,7 +651,7 @@ async function nlmResearch(args: Record<string, unknown>): Promise<string> {
 async function nlmGenerate(args: Record<string, unknown>): Promise<string> {
   const type = String(args.type ?? '').trim()
   const description = String(args.description ?? '').trim()
-  const nb = String(args.notebook ?? '').trim()
+  const nb = cleanNbId(args.notebook)
   if (!type) return 'Error: missing <type> (audio, video, slide-deck, mind-map, report, flashcards, quiz, infographic)'
   const a = ['generate', type]
   if (description) a.push(description)
@@ -622,7 +662,7 @@ async function nlmGenerate(args: Record<string, unknown>): Promise<string> {
 }
 
 async function nlmArtifacts(args: Record<string, unknown>): Promise<string> {
-  const nb = String(args.notebook ?? '').trim()
+  const nb = cleanNbId(args.notebook)
   const type = String(args.type ?? '').trim()
   const a = ['artifact', 'list']
   if (nb) a.push('-n', nb)
@@ -632,7 +672,7 @@ async function nlmArtifacts(args: Record<string, unknown>): Promise<string> {
 
 async function nlmDownload(args: Record<string, unknown>): Promise<string> {
   const type = String(args.type ?? '').trim()
-  const nb = String(args.notebook ?? '').trim()
+  const nb = cleanNbId(args.notebook)
   if (!type) return 'Error: missing <type> (audio, video, slide-deck, report, …)'
   // Download into Gemma's Home so the artifact is reachable via fs_read.
   const home = await ensureGemmaHome()
