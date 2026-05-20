@@ -36,6 +36,7 @@ interface FsState {
 }
 
 export interface ResolvedRoot {
+  id: string // 'home' or the mount id
   absRoot: string
   mode: MountMode // 'home' resolves as rw-free
   label: string
@@ -143,7 +144,7 @@ export function resolveRoot(root: string): ResolvedRoot | { error: string } {
     .replace(/^["'`\s]+|["'`\s]+$/g, '')
 
   if (r === 'home' || r === HOME_DIR || r === '~/GemmaWorkspace' || r === '~') {
-    return { absRoot: HOME_DIR, mode: 'rw-free', label: 'Home (~/GemmaWorkspace)' }
+    return { id: 'home', absRoot: HOME_DIR, mode: 'rw-free', label: 'Home (~/GemmaWorkspace)' }
   }
 
   // Exact mount id or display name.
@@ -155,7 +156,7 @@ export function resolveRoot(root: string): ResolvedRoot | { error: string } {
     const resolved = resolve(r.replace(/^~(?=\/|$)/, homedir()))
     const base = basename(resolved)
     if (resolved === HOME_DIR || base === 'GemmaWorkspace') {
-      return { absRoot: HOME_DIR, mode: 'rw-free', label: 'Home (~/GemmaWorkspace)' }
+      return { id: 'home', absRoot: HOME_DIR, mode: 'rw-free', label: 'Home (~/GemmaWorkspace)' }
     }
     m = state.mounts.find(
       (x) => x.path === resolved || basename(x.path) === base || x.name === base
@@ -166,7 +167,7 @@ export function resolveRoot(root: string): ResolvedRoot | { error: string } {
     const valid = ['home', ...state.mounts.map((x) => x.id)].join(', ')
     return { error: `Unknown root "${root}". Valid roots: ${valid}` }
   }
-  return { absRoot: m.path, mode: m.mode, label: m.name }
+  return { id: m.id, absRoot: m.path, mode: m.mode, label: m.name }
 }
 
 /**

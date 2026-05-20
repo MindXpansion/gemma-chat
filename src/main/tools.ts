@@ -38,6 +38,7 @@ import {
   fsDelete,
   fsBash,
   listMounts,
+  setMountIndexed,
   MAX_FILE_BYTES,
   type FsTreeEntry
 } from './gemma-fs'
@@ -520,6 +521,43 @@ async function fsTreeTool(args: Record<string, unknown>): Promise<string> {
   }
 }
 
+async function fsIndexTool(args: Record<string, unknown>): Promise<string> {
+  const root = String(args.root ?? '').trim()
+  if (!root) return 'Error: missing <root> — name the workspace to index (a mount id, or `home`).'
+  const r = resolveRoot(root)
+  if ('error' in r) return `Error: ${r.error}`
+  try {
+    const results = await ingestPath(r.absRoot, true, r.id)
+    let indexed = 0
+    let skipped = 0
+    let errored = 0
+    let chunks = 0
+    let tokens = 0
+    let cost = 0
+    for (const res of results) {
+      if (res.status === 'indexed') {
+        indexed++
+        chunks += res.chunks ?? 0
+        tokens += res.tokens ?? 0
+        cost += res.cost_usd ?? 0
+      } else if (res.status === 'skipped-existing') {
+        skipped++
+      } else {
+        errored++
+      }
+    }
+    if (r.id !== 'home') await setMountIndexed(r.id, true)
+    return [
+      `Indexed workspace "${r.label}" into gemma-chat-memory.`,
+      `Files: ${indexed} newly indexed, ${skipped} already current, ${errored} skipped/errored.`,
+      `${chunks} chunks, ${tokens} tokens embedded (voyage-3-large), $${cost.toFixed(4)}.`,
+      `Semantic recall over this workspace is now available — use gemma_recall with mount="${r.id}".`
+    ].join('\n')
+  } catch (e) {
+    return `Error indexing ${root}: ${(e as Error).message}`
+  }
+}
+
 async function fsMountsTool(): Promise<string> {
   const mounts = listMounts()
   const lines = ['ROOTS available to fs_* tools:', '  home → ~/GemmaWorkspace  [read-write, always]']
@@ -955,20 +993,24 @@ export const TOOLS: Record<string, ToolSpec> = {
   gemma_recall: {
     name: 'gemma_recall',
     description:
-      'Semantic recall from gemma-chat-memory. Embeds the query (voyage-3-large) and vector-searches the Chunk index. Returns top-K matches with document title and chunk text. Best for "what did I write about X" or "find the doc that mentions Y" questions.',
+      'Semantic recall from gemma-chat-memory. Embeds the query (voyage-3-large) and vector-searches the Chunk index. Returns top-K matches with document title and chunk text. Best for "what did I write about X", "find the doc that mentions Y", or searching an indexed codebase. Pass `mount` to scope recall to one indexed workspace.',
     params: [
       { name: 'query', description: 'what you\'re looking for', required: true, multiline: true },
-      { name: 'k', description: 'how many matches to return (default 5, max 25)' }
+      { name: 'k', description: 'how many matches to return (default 5, max 25)' },
+      { name: 'mount', description: 'optional: a workspace id to scope recall to (must have been fs_index\'d)' }
     ],
     example:
-      '<action name="gemma_recall">\n<query>voyage embedding model and dimensions</query>\n<k>5</k>\n</action>',
+      '<action name="gemma_recall">\n<query>where is the auth middleware defined</query>\n<mount>autonomous</mount>\n</action>',
     mode: 'both',
     run: async (args) => {
       const query = String(args.query ?? '').trim()
       if (!query) return 'Error: query is required.'
       const kRaw = typeof args.k === 'number' ? args.k : parseInt(String(args.k ?? '5'), 10)
       const k = Math.max(1, Math.min(25, Number.isFinite(kRaw) ? kRaw : 5))
-      const hits = await recall(query, k)
+      const mountRaw = String(args.mount ?? '').trim()
+      const mount = mountRaw ? resolveRoot(mountRaw) : null
+      if (mount && 'error' in mount) return `Error: ${mount.error}`
+      const hits = await recall(query, k, mount ? mount.id : undefined)
       return formatRecallHits(hits)
     }
   },
@@ -1086,6 +1128,18 @@ export const TOOLS: Record<string, ToolSpec> = {
     example: '<action name="fs_bash">\n<root>home</root>\n<command>ls -la</command>\n</action>',
     mode: 'both',
     run: fsBashTool
+  },
+  // Patch 31 (Layer 4): semantic indexing of a whole workspace.
+  fs_index: {
+    name: 'fs_index',
+    description:
+      'Chunk + embed every text/code file in a workspace into gemma-chat-memory so you can semantically recall across the WHOLE codebase — even one far larger than your context window. Skips node_modules/.git/build dirs, lockfiles, and files over 256KB. Idempotent on sha256. After indexing, use gemma_recall with the matching mount filter. Costs ~$0.18 per million tokens embedded.',
+    params: [
+      { name: 'root', description: 'workspace to index: a mounted workspace id, or `home`', required: true }
+    ],
+    example: '<action name="fs_index">\n<root>autonomous</root>\n</action>',
+    mode: 'both',
+    run: fsIndexTool
   }
 }
 
@@ -1253,6 +1307,7 @@ function aiosSubsystem(): string {
     '- `fs_search(root, query, path?, max_depth?)` — case-insensitive content grep; returns file:line matches.',
     '- `fs_read(root, path)` — read a text file. `fs_write` / `fs_edit` / `fs_delete` — create, patch, remove.',
     '- `fs_bash(root, command)` — run shell commands (npm, git, tests) inside a root.',
+    '- `fs_index(root)` — chunk+embed a whole workspace into gemma-chat-memory; afterwards `gemma_recall(query, mount=<id>)` semantically searches the entire codebase, even one larger than your context window. Best move for "where is X" / "how does Y work" on a big repo.',
     '- `fs_mounts()` — re-list roots (the live list below is usually enough).',
     '- Every fs tool takes a `root` argument: `home`, or a mounted workspace id. Defaults to `home`.',
     '- WRITE POSTURE: Home is always writable. A mounted workspace obeys its mode — read-only refuses changes, confirm asks Bear before each change, free applies immediately. Don\'t promise an edit on a read-only mount; if a change is gated, just attempt it — the tool handles the prompt.',

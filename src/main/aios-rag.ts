@@ -17,7 +17,35 @@ import { embedTexts } from './aios-voyage'
  * Document with the same sha already exists, ingestion is a no-op.
  */
 
-const SUPPORTED_EXT = new Set(['.md', '.markdown', '.txt'])
+// Patch 31 L4: prose + code. The paragraph chunker handles both — code
+// splits cleanly on blank lines. (voyage-code-3 routing is a future
+// refinement; voyage-3-large is one shared 1024-dim space for now.)
+const SUPPORTED_EXT = new Set([
+  '.md', '.markdown', '.txt', '.rst',
+  '.ts', '.tsx', '.js', '.jsx', '.mjs', '.cjs',
+  '.py', '.go', '.rs', '.java', '.rb', '.php', '.swift', '.kt', '.scala',
+  '.c', '.cpp', '.cc', '.h', '.hpp', '.cs',
+  '.sh', '.bash', '.sql', '.json', '.yaml', '.yml', '.toml',
+  '.html', '.css', '.scss', '.vue', '.svelte'
+])
+
+// Directories never worth embedding — dependency trees, build output, VCS.
+const SKIP_INGEST_DIRS = new Set([
+  'node_modules', '.git', 'dist', 'build', '.next', 'out', 'target',
+  '.venv', 'venv', '__pycache__', '.cache', 'coverage', '.turbo', 'vendor'
+])
+
+// Skip files that are large, generated, or otherwise low-value to embed.
+const MAX_INGEST_FILE_BYTES = 256 * 1024
+function isLowValueFile(name: string): boolean {
+  return (
+    /-lock\.(json|yaml)$/.test(name) ||
+    /\.min\.(js|css)$/.test(name) ||
+    name === 'package-lock.json' ||
+    name === 'yarn.lock' ||
+    name === 'pnpm-lock.yaml'
+  )
+}
 
 // Chunking knobs — paragraph-based, ~500 token target per chunk
 const TARGET_CHUNK_TOKENS = 500
@@ -131,7 +159,7 @@ export interface IngestResult {
  * Ingest a single markdown / text file into gemma-chat-memory.
  * Idempotent on sha256. Returns a status row.
  */
-export async function ingestFile(filepath: string): Promise<IngestResult> {
+export async function ingestFile(filepath: string, mount?: string): Promise<IngestResult> {
   const uri = fileToUri(filepath)
   if (!existsSync(filepath)) {
     return { uri, status: 'error', message: `file does not exist: ${filepath}` }
@@ -141,6 +169,11 @@ export async function ingestFile(filepath: string): Promise<IngestResult> {
     return { uri, status: 'error', message: `unsupported extension ${ext}; supported: ${[...SUPPORTED_EXT].join(', ')}` }
   }
 
+  const stat = statSync(filepath)
+  if (stat.size > MAX_INGEST_FILE_BYTES) {
+    return { uri, status: 'error', message: `file too large to index (${stat.size} bytes, cap ${MAX_INGEST_FILE_BYTES})` }
+  }
+
   let text: string
   try {
     text = readFileSync(filepath, 'utf-8')
@@ -148,7 +181,6 @@ export async function ingestFile(filepath: string): Promise<IngestResult> {
     return { uri, status: 'error', message: `read failed: ${(e as Error).message}` }
   }
   const sha = sha256(text)
-  const stat = statSync(filepath)
 
   const ses = ippGemmaSession()
   try {
@@ -179,10 +211,10 @@ export async function ingestFile(filepath: string): Promise<IngestResult> {
     const docResult = await ses.run(
       `MERGE (d:Document {uri: $uri})
        ON CREATE SET d.sha256 = $sha, d.mime = 'text/markdown', d.title = $title,
-                     d.bytes = $bytes, d.source_path = $path,
+                     d.bytes = $bytes, d.source_path = $path, d.mount = $mount,
                      d.created_at = datetime(), d.indexed_at = datetime(),
                      d.source_modified_at = datetime({epochMillis: $mtime})
-       ON MATCH SET d.sha256 = $sha, d.indexed_at = datetime(),
+       ON MATCH SET d.sha256 = $sha, d.indexed_at = datetime(), d.mount = $mount,
                     d.source_modified_at = datetime({epochMillis: $mtime})
        RETURN d`,
       {
@@ -191,6 +223,7 @@ export async function ingestFile(filepath: string): Promise<IngestResult> {
         title,
         bytes: neo4j.int(stat.size),
         path: resolve(filepath),
+        mount: mount ?? null,
         mtime: neo4j.int(stat.mtimeMs)
       }
     )
@@ -254,29 +287,34 @@ export async function ingestFile(filepath: string): Promise<IngestResult> {
  */
 export async function ingestPath(
   filepath: string,
-  recursive = false
+  recursive = false,
+  mount?: string
 ): Promise<IngestResult[]> {
   if (!existsSync(filepath)) {
     return [{ uri: filepath, status: 'error', message: 'path does not exist' }]
   }
   const stat = statSync(filepath)
   if (stat.isFile()) {
-    return [await ingestFile(filepath)]
+    return [await ingestFile(filepath, mount)]
   }
   // Directory
   const results: IngestResult[] = []
   const entries = readdirSync(filepath, { withFileTypes: true })
   for (const entry of entries) {
+    if (entry.name.startsWith('.') && entry.name !== '.') continue
     const full = join(filepath, entry.name)
     if (entry.isDirectory()) {
-      if (recursive) {
-        const nested = await ingestPath(full, true)
-        results.push(...nested)
+      if (recursive && !SKIP_INGEST_DIRS.has(entry.name)) {
+        results.push(...(await ingestPath(full, true, mount)))
       }
       continue
     }
-    if (entry.isFile() && SUPPORTED_EXT.has(extname(entry.name).toLowerCase())) {
-      results.push(await ingestFile(full))
+    if (
+      entry.isFile() &&
+      SUPPORTED_EXT.has(extname(entry.name).toLowerCase()) &&
+      !isLowValueFile(entry.name)
+    ) {
+      results.push(await ingestFile(full, mount))
     }
   }
   return results
@@ -298,22 +336,36 @@ export interface RecallHit {
  * Chunk index, return top K with document context. No reranker yet
  * (Patch 22 will add rerank-2).
  */
-export async function recall(query: string, k = 5): Promise<RecallHit[]> {
+export async function recall(query: string, k = 5, mount?: string): Promise<RecallHit[]> {
   if (!query.trim()) return []
   const embedResult = await embedTexts([query], { inputType: 'query' })
   const queryVec = embedResult.vectors[0]
 
   const ses = ippGemmaSession()
   try {
-    const result = await ses.run(
-      `CALL db.index.vector.queryNodes('chunk_embedding', $k, $vec)
-       YIELD node, score
-       MATCH (d:Document)-[:HAS_CHUNK]->(node)
-       RETURN score, node.uuid AS chunk_uuid, node.chunk_index AS chunk_index,
-              node.text AS text, d.title AS document_title, d.uri AS document_uri
-       ORDER BY score DESC`,
-      { k: neo4j.int(k), vec: queryVec }
-    )
+    // When scoping to a mount, over-fetch from the vector index then filter
+    // and LIMIT — the ANN call itself can't post-filter on a property.
+    const fetch = mount ? Math.min(k * 8, 200) : k
+    const cypher = mount
+      ? `CALL db.index.vector.queryNodes('chunk_embedding', $fetch, $vec)
+         YIELD node, score
+         MATCH (d:Document)-[:HAS_CHUNK]->(node)
+         WHERE d.mount = $mount
+         RETURN score, node.uuid AS chunk_uuid, node.chunk_index AS chunk_index,
+                node.text AS text, d.title AS document_title, d.uri AS document_uri
+         ORDER BY score DESC LIMIT $k`
+      : `CALL db.index.vector.queryNodes('chunk_embedding', $fetch, $vec)
+         YIELD node, score
+         MATCH (d:Document)-[:HAS_CHUNK]->(node)
+         RETURN score, node.uuid AS chunk_uuid, node.chunk_index AS chunk_index,
+                node.text AS text, d.title AS document_title, d.uri AS document_uri
+         ORDER BY score DESC`
+    const result = await ses.run(cypher, {
+      fetch: neo4j.int(fetch),
+      k: neo4j.int(k),
+      vec: queryVec,
+      mount: mount ?? null
+    })
     return result.records.map((r) => ({
       score: r.get('score'),
       chunk_uuid: r.get('chunk_uuid'),

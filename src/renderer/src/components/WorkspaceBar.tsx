@@ -55,6 +55,10 @@ export default function WorkspaceBar() {
 
   useEffect(() => {
     refresh()
+    // fs_index runs inside a chat turn (not via this bar) — refresh on
+    // window focus so the "indexed" dot reflects reality afterward.
+    window.addEventListener('focus', refresh)
+    return () => window.removeEventListener('focus', refresh)
   }, [refresh])
 
   async function onMountClick(): Promise<void> {
@@ -106,6 +110,12 @@ export default function WorkspaceBar() {
           <span className="truncate" title={m.path}>
             {m.name}
           </span>
+          {m.indexed && (
+            <span
+              title="Indexed into gemma-chat-memory — semantic recall available"
+              className="h-1.5 w-1.5 shrink-0 rounded-full bg-sky-400"
+            />
+          )}
           <button
             onClick={() => cycleMode(m)}
             title="Click to change posture mode"
