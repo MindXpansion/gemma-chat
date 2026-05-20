@@ -27,6 +27,16 @@ import {
 } from './aios-integration'
 import { runCypher, getSchemaSummary } from './aios-neo4j'
 import { ingestPath, recall, formatRecallHits } from './aios-rag'
+import {
+  resolveRoot,
+  fsRead,
+  fsWrite,
+  fsList,
+  fsTree,
+  listMounts,
+  MAX_FILE_BYTES,
+  type FsTreeEntry
+} from './gemma-fs'
 
 export interface ToolContext {
   conversationId: string
@@ -273,6 +283,121 @@ async function runBash(args: Record<string, unknown>, ctx: ToolContext): Promise
 async function openPreview(_args: Record<string, unknown>, ctx: ToolContext): Promise<string> {
   const url = previewUrl(ctx.conversationId)
   return `Preview is live at ${url}. The Canvas pane on the right shows it.`
+}
+
+// --- Patch 31 (Layer 1): filesystem tools — Home + multi-mount registry ----
+
+function formatTree(entries: FsTreeEntry[]): string {
+  return entries
+    .map((e) => {
+      const depth = e.path.split('/').length - 1
+      const indent = '  '.repeat(depth)
+      const name = e.path.split('/').pop() ?? e.path
+      return e.kind === 'dir'
+        ? `${indent}${name}/`
+        : `${indent}${name}${e.size != null ? ` (${e.size}B)` : ''}`
+    })
+    .join('\n')
+}
+
+async function fsReadTool(args: Record<string, unknown>): Promise<string> {
+  const root = String(args.root ?? 'home').trim()
+  const path = String(args.path ?? '').trim()
+  if (!path) return 'Error: missing <path>'
+  const r = resolveRoot(root)
+  if ('error' in r) return `Error: ${r.error}`
+  try {
+    const res = await fsRead(r.absRoot, path)
+    if (res.binary) return `(${path} is a binary file — ${res.bytes} bytes, not shown)`
+    if (res.truncated) {
+      return (
+        res.content +
+        `\n\n[…truncated at ${MAX_FILE_BYTES} bytes of ${res.bytes}. Use fs_search to locate a specific span.]`
+      )
+    }
+    return res.content || '(empty file)'
+  } catch (e) {
+    return `Error reading ${root}:${path} — ${(e as Error).message}`
+  }
+}
+
+async function fsWriteTool(
+  args: Record<string, unknown>,
+  ctx: ToolContext
+): Promise<string> {
+  const root = String(args.root ?? 'home').trim()
+  const path = String(args.path ?? '').trim()
+  const content = typeof args.content === 'string' ? args.content : ''
+  if (!path) return 'Error: missing <path>'
+  const r = resolveRoot(root)
+  if ('error' in r) return `Error: ${r.error}`
+  if (r.mode === 'ro') {
+    return `Error: "${root}" is mounted read-only. Re-mount it read-write to edit.`
+  }
+  if (r.mode === 'rw-confirm') {
+    return `Error: "${root}" is read-write-confirm — per-write confirmation lands in Layer 3. Use Home for now, or re-mount as read-write-free.`
+  }
+  try {
+    await fsWrite(r.absRoot, path, content)
+    ctx.onFileChange?.()
+    const lines = content.split('\n').length
+    return `Wrote ${root}:${path} (${content.length} bytes, ${lines} lines).`
+  } catch (e) {
+    return `Error writing ${root}:${path} — ${(e as Error).message}`
+  }
+}
+
+async function fsListTool(args: Record<string, unknown>): Promise<string> {
+  const root = String(args.root ?? 'home').trim()
+  const path = String(args.path ?? '').trim()
+  const r = resolveRoot(root)
+  if ('error' in r) return `Error: ${r.error}`
+  try {
+    const entries = await fsList(r.absRoot, path)
+    if (entries.length === 0) return `(${root}:${path || '/'} is empty)`
+    return entries
+      .map((e) =>
+        e.kind === 'dir' ? `${e.path}/` : `${e.path}${e.size != null ? ` (${e.size}B)` : ''}`
+      )
+      .join('\n')
+  } catch (e) {
+    return `Error listing ${root}:${path || '/'} — ${(e as Error).message}`
+  }
+}
+
+async function fsTreeTool(args: Record<string, unknown>): Promise<string> {
+  const root = String(args.root ?? 'home').trim()
+  const path = String(args.path ?? '').trim()
+  const depthRaw =
+    typeof args.max_depth === 'number'
+      ? args.max_depth
+      : parseInt(String(args.max_depth ?? ''), 10)
+  const maxDepth = Number.isFinite(depthRaw) && depthRaw > 0 ? depthRaw : 100
+  const r = resolveRoot(root)
+  if ('error' in r) return `Error: ${r.error}`
+  try {
+    const { entries, truncated } = await fsTree(r.absRoot, path, maxDepth)
+    if (entries.length === 0) return `(${root}:${path || '/'} is empty)`
+    const body = formatTree(entries)
+    return truncated
+      ? body + '\n[…tree truncated at node cap. Narrow with <path> or use fs_search.]'
+      : body
+  } catch (e) {
+    return `Error walking ${root}:${path || '/'} — ${(e as Error).message}`
+  }
+}
+
+async function fsMountsTool(): Promise<string> {
+  const mounts = listMounts()
+  const lines = ['ROOTS available to fs_* tools:', '  home → ~/GemmaWorkspace  [read-write, always]']
+  if (mounts.length === 0) {
+    lines.push('  (no external workspaces mounted — Bear mounts one via the workspace bar)')
+  } else {
+    for (const m of mounts) {
+      lines.push(`  ${m.id} → ${m.path}  [${m.mode}${m.indexed ? ', indexed' : ''}]`)
+    }
+  }
+  return lines.join('\n')
 }
 
 export const TOOLS: Record<string, ToolSpec> = {
@@ -713,6 +838,66 @@ export const TOOLS: Record<string, ToolSpec> = {
       const hits = await recall(query, k)
       return formatRecallHits(hits)
     }
+  },
+  // Patch 31 (Layer 1): filesystem — Home + multi-mount registry.
+  fs_mounts: {
+    name: 'fs_mounts',
+    description:
+      'List the filesystem roots you can reach: `home` (your persistent ~/GemmaWorkspace) plus any workspaces Bear has mounted. Call this first when you need to know what `root` values are valid.',
+    params: [],
+    example: '<action name="fs_mounts"></action>',
+    mode: 'both',
+    run: fsMountsTool
+  },
+  fs_tree: {
+    name: 'fs_tree',
+    description:
+      'Show the directory structure of a root (or a subpath of it). Skips .git, node_modules, dotfiles. Unlimited depth by default — pass max_depth to constrain a large tree.',
+    params: [
+      { name: 'root', description: 'root name: `home` or a mounted workspace id (default home)' },
+      { name: 'path', description: 'subpath within the root (optional — omit for the whole root)' },
+      { name: 'max_depth', description: 'max levels deep to walk (optional)' }
+    ],
+    example: '<action name="fs_tree">\n<root>home</root>\n</action>',
+    mode: 'both',
+    run: fsTreeTool
+  },
+  fs_list: {
+    name: 'fs_list',
+    description: 'List the immediate contents of one directory within a root.',
+    params: [
+      { name: 'root', description: 'root name: `home` or a mounted workspace id (default home)' },
+      { name: 'path', description: 'directory within the root (optional — omit for the root itself)' }
+    ],
+    example: '<action name="fs_list">\n<root>home</root>\n<path>notes</path>\n</action>',
+    mode: 'both',
+    run: fsListTool
+  },
+  fs_read: {
+    name: 'fs_read',
+    description:
+      'Read a text file from a root. Files over 256 KB are truncated with a notice; binary files are reported, not dumped.',
+    params: [
+      { name: 'root', description: 'root name: `home` or a mounted workspace id (default home)' },
+      { name: 'path', description: 'file path within the root', required: true }
+    ],
+    example: '<action name="fs_read">\n<root>home</root>\n<path>notes/today.md</path>\n</action>',
+    mode: 'both',
+    run: fsReadTool
+  },
+  fs_write: {
+    name: 'fs_write',
+    description:
+      'Create or overwrite a text file in a root. Home is always writable. Mounted workspaces must be in a read-write mode (read-only mounts and confirm-mode are gated).',
+    params: [
+      { name: 'root', description: 'root name: `home` or a mounted workspace id (default home)' },
+      { name: 'path', description: 'file path within the root', required: true },
+      { name: 'content', description: 'full file text', required: true, multiline: true }
+    ],
+    example:
+      '<action name="fs_write">\n<root>home</root>\n<path>notes/today.md</path>\n<content>\n# Notes\nFirst entry.\n</content>\n</action>',
+    mode: 'both',
+    run: fsWriteTool
   }
 }
 
@@ -846,10 +1031,20 @@ function aiosSubsystem(): string {
     '      `gemma_ingest(path, recursive?)` — index a .md/.txt file or directory into Chunks (voyage-3-large @ 1024 dim, idempotent on sha256). Cost ~$0.18/M tokens.',
     '      `gemma_recall(query, k?)` — semantic recall via vector search. Use this when Bear asks "what did I write about X" or you need to ground in indexed content.',
     '',
+    'FILESYSTEM (Patch 31) — you have real file access via `fs_*` tools:',
+    '- `home` is your own persistent workspace at ~/GemmaWorkspace — always read-write. Your notes, generated files, shared docs live here.',
+    '- Bear can also MOUNT external workspaces (codebases, project folders). Each has a posture mode: read-only, read-write-confirm, or read-write-free.',
+    '- `fs_mounts()` — list every root you can reach and its mode. Call this first if unsure what `root` values are valid.',
+    '- `fs_tree(root, path?, max_depth?)` — directory structure. `fs_list(root, path?)` — one directory.',
+    '- `fs_read(root, path)` — read a text file. `fs_write(root, path, content)` — create/overwrite.',
+    '- Every fs tool takes a `root` argument: `home`, or a mounted workspace id. Defaults to `home`.',
+    '- For codebases larger than your context window: traverse structure with fs_tree/fs_search, read specific files with fs_read — never try to dump a whole tree into one response.',
+    '',
     'HARD BOUNDARIES — do not write to:',
     '- `~/Skills/` (sacrosanct master library)',
     '- The partnership KG (`kg-arch-enterprise` default DB)',
-    '- IPP via Python scripts (files yes, `partnership_state.py` no — that\'s Bear-and-Claude\'s state machine)'
+    '- IPP via Python scripts (files yes, `partnership_state.py` no — that\'s Bear-and-Claude\'s state machine)',
+    '- Any mounted workspace that is read-only — respect each mount\'s posture mode'
   ].join('\n')
 }
 

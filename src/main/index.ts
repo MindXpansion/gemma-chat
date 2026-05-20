@@ -528,6 +528,16 @@ app.whenReady().then(async () => {
 
   await startWorkspaceServer()
 
+  // Patch 31: filesystem access — restore mount registry, ensure Gemma's Home.
+  try {
+    const fs = await import('./gemma-fs')
+    await fs.loadFsState()
+    await fs.ensureGemmaHome()
+    console.log(`[gemma-fs] Home ready, ${fs.listMounts().length} mount(s) restored`)
+  } catch (e) {
+    console.error('[gemma-fs] init failed:', (e as Error).message)
+  }
+
   session.defaultSession.setPermissionRequestHandler((_wc, permission, callback) => {
     if (permission === 'media' || permission === 'mediaKeySystem') {
       callback(true)
