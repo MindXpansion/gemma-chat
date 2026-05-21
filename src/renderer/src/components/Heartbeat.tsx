@@ -1,11 +1,11 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
-import type { HeartbeatState, HeartbeatJournalEntry } from '@shared/types'
+import type { HeartbeatState, HeartbeatJournalEntry, HeartbeatGoal } from '@shared/types'
 
 /**
- * Patch 34 L2 — the Heartbeat panel. A journal-backed view over the
+ * Patch 34 — the Heartbeat panel. A journal-backed view over the
  * autonomous research ticks: enable/disable, cadence, manual run, a live
- * stream while a tick runs, and a reader for the dated journal files in
- * ~/GemmaWorkspace/research/ticks/.
+ * stream while a tick runs, the goal queue (propose / ratify), and a
+ * reader for the dated journal files in ~/GemmaWorkspace/research/ticks/.
  *
  * The journal is rendered as plain preformatted text (React-escaped). It
  * is a markdown research log written partly from model output; rendering
@@ -13,6 +13,7 @@ import type { HeartbeatState, HeartbeatJournalEntry } from '@shared/types'
  */
 export default function Heartbeat() {
   const [state, setState] = useState<HeartbeatState | null>(null)
+  const [goals, setGoals] = useState<HeartbeatGoal[]>([])
   const [entries, setEntries] = useState<HeartbeatJournalEntry[]>([])
   const [selected, setSelected] = useState<string | null>(null)
   const [content, setContent] = useState('')
@@ -36,10 +37,13 @@ export default function Heartbeat() {
       setState(s)
       setCadenceDraft(String(s.cadenceMinutes))
     })
+    window.api.heartbeatGetGoals().then(setGoals)
     void refreshEntries()
     const unsub = window.api.onHeartbeatEvent((ev) => {
       if (ev.type === 'state') {
         setState(ev.state)
+      } else if (ev.type === 'goals') {
+        setGoals(ev.goals)
       } else if (ev.type === 'tick-start') {
         setLive([`Tick #${ev.tick} started — ${ev.objective}`])
       } else if (ev.type === 'tick-tool') {
@@ -92,8 +96,15 @@ export default function Heartbeat() {
     }
   }
 
+  async function ratify(id: string, status: 'queued' | 'skipped'): Promise<void> {
+    setGoals(await window.api.heartbeatSetGoalStatus(id, status))
+  }
+
   const ticking = busy || !!state?.ticking
   const enabled = !!state?.enabled
+  const proposed = goals.filter((g) => g.status === 'proposed')
+  const queued = goals.filter((g) => g.status === 'queued')
+  const done = goals.filter((g) => g.status === 'done')
 
   return (
     <div className="anim-fade-in flex min-w-0 flex-1 flex-col">
@@ -193,6 +204,69 @@ export default function Heartbeat() {
                 {l}
               </div>
             ))}
+          </div>
+        )}
+      </div>
+
+      {/* Goals */}
+      <div className="no-drag shrink-0 border-b border-white/[0.06] px-5 py-3">
+        <div className="mb-2 flex items-center gap-2 text-[10.5px] font-medium uppercase tracking-wider text-ink-400">
+          <span>Goals</span>
+          <span className="text-ink-400/60">
+            {proposed.length} proposed · {queued.length} queued · {done.length} done
+          </span>
+        </div>
+
+        {proposed.length > 0 && (
+          <div className="space-y-1.5">
+            {proposed.map((g) => (
+              <div
+                key={g.id}
+                className="flex items-center gap-2 rounded-lg border border-amber-400/20 bg-amber-400/[0.06] px-3 py-1.5"
+              >
+                <span className="min-w-0 flex-1 truncate text-[12.5px] text-ink-100" title={g.instruction}>
+                  {g.title}
+                </span>
+                <button
+                  onClick={() => ratify(g.id, 'queued')}
+                  className="rounded-md bg-emerald-400/15 px-2 py-0.5 text-[11px] font-medium text-emerald-200 transition hover:bg-emerald-400/25"
+                >
+                  Approve
+                </button>
+                <button
+                  onClick={() => ratify(g.id, 'skipped')}
+                  className="rounded-md px-2 py-0.5 text-[11px] text-ink-400 transition hover:bg-white/10 hover:text-white"
+                >
+                  Skip
+                </button>
+              </div>
+            ))}
+          </div>
+        )}
+
+        {queued.length > 0 && (
+          <div className={`space-y-1 ${proposed.length > 0 ? 'mt-2' : ''}`}>
+            {queued.map((g) => (
+              <div key={g.id} className="flex items-center gap-2 px-1 text-[12px] text-ink-300">
+                <span className="text-emerald-400/70">▸</span>
+                <span className="min-w-0 flex-1 truncate" title={g.instruction}>
+                  {g.title}
+                </span>
+                <button
+                  onClick={() => ratify(g.id, 'skipped')}
+                  className="text-[11px] text-ink-400 transition hover:text-white"
+                >
+                  cancel
+                </button>
+              </div>
+            ))}
+          </div>
+        )}
+
+        {proposed.length === 0 && queued.length === 0 && (
+          <div className="text-[12px] text-ink-400">
+            No goals queued. The next tick will be a planning tick — Gemma proposes goals from
+            her roadmap, then you approve them here.
           </div>
         )}
       </div>

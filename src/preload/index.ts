@@ -8,7 +8,8 @@ import type {
   HeartbeatState,
   HeartbeatEvent,
   HeartbeatTickResult,
-  HeartbeatJournalEntry
+  HeartbeatJournalEntry,
+  HeartbeatGoal
 } from '../shared/types'
 
 const api = {
@@ -142,6 +143,13 @@ const api = {
     ipcRenderer.invoke('heartbeat:journal-list'),
   heartbeatReadJournal: (name: string): Promise<string> =>
     ipcRenderer.invoke('heartbeat:journal-read', name),
+  heartbeatGetGoals: (): Promise<HeartbeatGoal[]> =>
+    ipcRenderer.invoke('heartbeat:goals-get'),
+  heartbeatSetGoalStatus: (
+    id: string,
+    status: 'queued' | 'skipped'
+  ): Promise<HeartbeatGoal[]> =>
+    ipcRenderer.invoke('heartbeat:goal-set-status', { id, status }),
   onHeartbeatEvent: (cb: (ev: HeartbeatEvent) => void): (() => void) => {
     const listener = (_: IpcRendererEvent, ev: HeartbeatEvent): void => cb(ev)
     ipcRenderer.on('heartbeat:event', listener)

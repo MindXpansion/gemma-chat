@@ -9,44 +9,37 @@ import type {
   HeartbeatState,
   HeartbeatEvent,
   HeartbeatTickResult,
-  HeartbeatJournalEntry
+  HeartbeatJournalEntry,
+  HeartbeatGoal
 } from '../shared/types'
 
 /**
- * Patch 34 — Autonomous Heartbeat (Layer 1: the engine).
+ * Patch 34 — Autonomous Heartbeat.
  *
  * A main-process timer fires self-directed research ticks on a cadence.
  *
  * Tick model — ONE PROBE PER TICK. E4B cannot free-chain tools: after a
  * <|tool_response> it reverts to its trained "narrate to the user"
- * behavior and will not emit a second <action> (verified across three
- * test ticks — it either stalls empty or describes the next step in prose
- * without acting). So each tick runs exactly ONE tool, then narrates the
- * result — the tool→narrate→done flow that handleChat is proven to drive
- * reliably. Breadth comes from successive ticks, not from chaining.
+ * behavior and will not emit a second <action>. So each tick runs exactly
+ * ONE tool, then narrates the result — the tool->narrate->done flow that
+ * handleChat is proven to drive. Breadth builds across successive ticks.
  *
- * Each tick:
- *   • builds a FRESH context (no accumulated chat — avoids the E4B
- *     contamination failure mode),
- *   • runs ONE offline-safe, $0 local tool,
- *   • has the model narrate the result,
- *   • appends a dated transcript to ~/GemmaWorkspace/research/ticks/.
+ * L3 — goal queue. Instead of a fixed probe rotation the heartbeat works a
+ * queue of goals. A *planning* tick has Gemma propose probe-sized goals
+ * from her 5-step roadmap; Bear ratifies them (proposed -> queued); a
+ * *work* tick runs the oldest queued goal. If goals are proposed but not
+ * yet ratified, ticks skip — the heartbeat never works un-ratified goals.
  *
  * Hard constraints (Bear's, non-negotiable):
- *   • Offline-safe / $0 — no web, no VoyageAI embeddings, no NotebookLM.
- *     Enforced by HEARTBEAT_TOOLS.
+ *   • Offline-safe / $0 — enforced by HEARTBEAT_TOOLS, not just prompting.
  *   • Codebase mounts stay read-only — requestConfirm auto-denies, so only
  *     Home (rw-free) is writable.
  */
 
 // --- Tunables ---------------------------------------------------------------
 
-/**
- * Chat parity (0.7). A lower temperature was tried (0.4) and caused the
- * model to deterministically emit an immediate stop token after a
- * <|tool_response>, ending the tick after one tool. 0.7 is the value
- * handleChat is proven to narrate reliably at.
- */
+/** Chat parity (0.7). Lower temperatures make the model deterministically
+ *  emit a stop token right after a <|tool_response>, ending a tick early. */
 const HEARTBEAT_TEMP = 0.7
 /** A runaway tick is aborted after this long. */
 const TICK_TIMEOUT_MS = 6 * 60 * 1000
@@ -55,11 +48,8 @@ const MAX_CADENCE_MIN = 720
 const DEFAULT_CADENCE_MIN = 30
 
 /**
- * The offline-safe, $0 tool subset. Every name here resolves to a tool that
- * touches only the local machine — no network, no paid API. Cloud tools
- * (web_search, fetch_url, aios_weather/directions/distance/places, the
- * gemma_ingest/gemma_recall/fs_index embedding tools, every nlm_*) are
- * deliberately absent.
+ * The offline-safe, $0 tool subset. Every name here resolves to a tool
+ * that touches only the local machine — no network, no paid API.
  */
 export const HEARTBEAT_TOOLS = new Set<string>([
   'aios_now',
@@ -78,67 +68,28 @@ export const HEARTBEAT_TOOLS = new Set<string>([
   'fs_write'
 ])
 
-/**
- * A probe = one focused thing a tick investigates. Each tick runs the next
- * probe in rotation. L3 replaces this fixed rotation with a roadmap-driven
- * goal queue; until then the rotation walks Gemma's own proposed first
- * sweep (KG, Home, mounts) one piece at a time.
- *
- * `instruction` is what the model is told to do on the ACTION turn.
- * `tool`/`args` are the runner's fallback — if the model fails to emit a
- * usable action, the runner runs the probe directly so the tick always
- * produces real data.
- */
-interface Probe {
-  id: string
-  label: string
-  tool: string
-  args: Record<string, unknown>
-  instruction: string
-}
+/** Gemma's 5-step self-mastery roadmap — the planning tick's north star. */
+const ROADMAP = [
+  '1. Master your own Neo4j knowledge graph (the gemma-chat-memory database).',
+  '2. Perfect your .md files — your workspace docs and research notes.',
+  '3. Learn your NotebookLM tools and what your notebooks contain.',
+  '4. Master all of your current tools before building new ones.',
+  '5. Identify whether your goals need new tools — and say so.'
+].join('\n')
 
-const PROBES: Probe[] = [
-  {
-    id: 'temporal',
-    label: 'Anchor the current date & time',
-    tool: 'aios_now',
-    args: {},
-    instruction:
-      'Anchor yourself in time. Emit exactly one action: <action name="aios_now"></action>'
-  },
-  {
-    id: 'gemma-kg',
-    label: 'Inspect your own knowledge graph',
-    tool: 'gemma_kg_schema',
-    args: {},
-    instruction:
-      'Inspect your own knowledge graph (the gemma-chat-memory database) — its node labels and relationships. Emit exactly one action: <action name="gemma_kg_schema"></action>'
-  },
-  {
-    id: 'mounts',
-    label: 'Review your mounted workspaces',
-    tool: 'fs_mounts',
-    args: {},
-    instruction:
-      'See which codebases and workspaces are mounted for you. Emit exactly one action: <action name="fs_mounts"></action>'
-  },
-  {
-    id: 'home',
-    label: 'Survey your Home workspace',
-    tool: 'fs_tree',
-    args: { root: 'home' },
-    instruction:
-      'Survey your Home workspace — what files and folders it holds. Emit exactly one action:\n<action name="fs_tree">\n<root>home</root>\n</action>'
-  },
-  {
-    id: 'partner-kg',
-    label: 'Inspect the partnership knowledge graph',
-    tool: 'aios_kg_schema',
-    args: {},
-    instruction:
-      'Inspect the shared partnership knowledge graph (read-only) — its node labels and relationships. Emit exactly one action: <action name="aios_kg_schema"></action>'
-  }
+/**
+ * Fallback goals — seeded as `proposed` if a planning tick yields nothing
+ * parseable. They mirror Gemma's own proposed first diagnostic sweep.
+ */
+const SEED_GOALS = [
+  'Inspect your knowledge graph — call gemma_kg_schema and report its node labels and relationship types.',
+  'Survey your Home workspace — call fs_tree on root "home" and report what files and folders it holds.',
+  'Review your mounted workspaces — call fs_mounts and report which codebases are mounted and their access mode.'
 ]
+
+function rand(): string {
+  return Math.random().toString(36).slice(2, 8)
+}
 
 // --- State ------------------------------------------------------------------
 
@@ -151,6 +102,7 @@ let state: HeartbeatState = {
   tickCount: 0,
   ticking: false
 }
+let goals: HeartbeatGoal[] = []
 
 let timer: NodeJS.Timeout | null = null
 let getModel: () => string | null = () => null
@@ -205,6 +157,69 @@ function emitState(): void {
   emit({ type: 'state', state: snapshot() })
 }
 
+// --- Goals ------------------------------------------------------------------
+
+async function researchDir(): Promise<string> {
+  const dir = join(await ensureGemmaHome(), 'research')
+  await mkdir(dir, { recursive: true })
+  return dir
+}
+
+function isGoal(g: unknown): g is HeartbeatGoal {
+  return (
+    !!g &&
+    typeof g === 'object' &&
+    typeof (g as HeartbeatGoal).id === 'string' &&
+    typeof (g as HeartbeatGoal).instruction === 'string'
+  )
+}
+
+async function loadGoals(): Promise<void> {
+  try {
+    const raw = await readFile(join(await researchDir(), 'goals.json'), 'utf-8')
+    const p = JSON.parse(raw) as { goals?: unknown }
+    if (p && Array.isArray(p.goals)) {
+      goals = p.goals.filter(isGoal)
+    }
+  } catch {
+    // no goals file yet — first run
+  }
+}
+
+async function saveGoals(): Promise<void> {
+  try {
+    await writeFile(
+      join(await researchDir(), 'goals.json'),
+      JSON.stringify({ goals }, null, 2),
+      'utf-8'
+    )
+  } catch {
+    // best-effort
+  }
+}
+
+function emitGoals(): void {
+  emit({ type: 'goals', goals: getGoals() })
+}
+
+export function getGoals(): HeartbeatGoal[] {
+  return goals.map((g) => ({ ...g }))
+}
+
+/** Bear's ratification: a proposed/queued goal can be queued or skipped. */
+export async function setGoalStatus(
+  id: string,
+  status: 'queued' | 'skipped'
+): Promise<HeartbeatGoal[]> {
+  const g = goals.find((x) => x.id === id)
+  if (g && (g.status === 'proposed' || g.status === 'queued')) {
+    g.status = status
+    await saveGoals()
+    emitGoals()
+  }
+  return getGoals()
+}
+
 // --- Timer ------------------------------------------------------------------
 
 function scheduleTimer(): void {
@@ -222,8 +237,7 @@ function scheduleTimer(): void {
 // --- Journal ----------------------------------------------------------------
 
 async function ticksDir(): Promise<string> {
-  const home = await ensureGemmaHome()
-  const dir = join(home, 'research', 'ticks')
+  const dir = join(await researchDir(), 'ticks')
   await mkdir(dir, { recursive: true })
   return dir
 }
@@ -297,7 +311,7 @@ export async function readJournal(name: string): Promise<string> {
   return readFile(join(dir, name), 'utf-8')
 }
 
-// --- Prompt -----------------------------------------------------------------
+// --- Prompts ----------------------------------------------------------------
 
 function toolCatalog(): string {
   const lines: string[] = []
@@ -335,6 +349,28 @@ function heartbeatSystemPrompt(): string {
     '',
     'AVAILABLE TOOLS:',
     toolCatalog()
+  ].join('\n')
+}
+
+function planningSystemPrompt(): string {
+  return [
+    "You are Gemma, an AI assistant running 100% locally on Bear's Mac.",
+    '',
+    'THIS IS A PLANNING TICK. You are deciding what to research next. The autonomous heartbeat will work the goals you propose — ONE tiny goal per tick.',
+    '',
+    'Your 5-step self-mastery roadmap:',
+    ROADMAP,
+    '',
+    'Propose 3 to 6 SMALL goals for upcoming heartbeat ticks. Rules for EVERY goal:',
+    '• It must be achievable with exactly ONE tool call (one tick runs one tool).',
+    `• It must use an offline-safe local tool — one of: ${[...HEARTBEAT_TOOLS].join(', ')}. No web, no NotebookLM (those need Bear online).`,
+    '• Name the tool in the goal so a later tick knows what to call.',
+    '• Favor goals that move you along the roadmap and that you have NOT already done (see your recent notes).',
+    '',
+    'Output ONLY the goals, each on its own line, in exactly this format:',
+    'GOAL: <a clear instruction that names the tool to use>',
+    '',
+    'No preamble, no numbering, no commentary — only GOAL: lines.'
   ].join('\n')
 }
 
@@ -376,6 +412,13 @@ async function collectStream(
 
 // --- The probe (one tool + one narration) -----------------------------------
 
+interface ProbeSpec {
+  label: string
+  instruction: string
+  /** If the model fails to emit an action, the runner falls back to this. */
+  fallbackTool?: string
+}
+
 interface ProbeResult {
   transcript: string
   finalText: string
@@ -391,9 +434,17 @@ function heartbeatCtx(): ToolContext {
   }
 }
 
+/** The first HEARTBEAT_TOOLS name mentioned in a goal instruction, if any. */
+function deriveFallbackTool(text: string): string | undefined {
+  for (const name of HEARTBEAT_TOOLS) {
+    if (new RegExp(`\\b${name}\\b`).test(text)) return name
+  }
+  return undefined
+}
+
 async function runProbe(
   model: string,
-  probe: Probe,
+  probe: ProbeSpec,
   notes: string,
   signal: AbortSignal,
   onTool: (name: string) => void
@@ -417,7 +468,7 @@ async function runProbe(
   // --- ACTION turn: the model emits one tool call ---
   const a = await collectStream(model, messages, signal, true)
 
-  let toolName: string
+  let toolName: string | null
   let toolArgs: Record<string, unknown>
   let assistantContent: string
   let modelActed: boolean
@@ -426,17 +477,37 @@ async function runProbe(
     toolArgs = a.action.args
     assistantContent = a.buffer.slice(0, a.action.end)
     modelActed = true
+  } else if (probe.fallbackTool) {
+    // The model narrated instead of acting — fall back to the tool the
+    // goal named so the tick still produces real data.
+    toolName = probe.fallbackTool
+    toolArgs = {}
+    assistantContent = `<action name="${probe.fallbackTool}"></action>`
+    modelActed = false
   } else {
-    // The model narrated instead of acting (or said nothing) — fall back to
-    // the probe's own tool so the tick still produces real data.
-    toolName = probe.tool
-    toolArgs = probe.args
-    assistantContent = `<action name="${probe.tool}"></action>`
+    toolName = null
+    toolArgs = {}
+    assistantContent = a.buffer.trim()
     modelActed = false
   }
 
+  if (!toolName) {
+    // No action and no fallback — the tick can't gather data this round.
+    return {
+      transcript: [
+        '_The model did not emit a usable action and the goal named no tool to fall back on._',
+        '',
+        '## Findings',
+        '',
+        a.buffer.trim() || '_(no output)_'
+      ].join('\n'),
+      finalText: 'No tool call was made this tick — the model did not emit a usable action.',
+      toolUsed: '(none)'
+    }
+  }
+
   // --- run the tool ---
-  const callId = `hb_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`
+  const callId = `hb_${Date.now()}_${rand()}`
   let result: string
   if (HEARTBEAT_TOOLS.has(toolName)) {
     onTool(toolName)
@@ -466,7 +537,7 @@ async function runProbe(
   const transcript = [
     modelActed
       ? '_The model chose and emitted this action._'
-      : '_The model did not emit a usable action — the runner ran the probe tool directly._',
+      : '_The model did not emit a usable action — the runner ran the goal’s named tool directly._',
     '',
     `**Tool:** \`${toolName}\`  ·  args: \`${JSON.stringify(toolArgs).slice(0, 300)}\``,
     '',
@@ -487,6 +558,39 @@ async function runProbe(
   }
 }
 
+// --- Planning turn ----------------------------------------------------------
+
+interface PlanningResult {
+  rawText: string
+  instructions: string[]
+}
+
+async function runPlanningTurn(
+  model: string,
+  notes: string,
+  signal: AbortSignal
+): Promise<PlanningResult> {
+  const messages: MLXChatMessage[] = [
+    { role: 'system', content: planningSystemPrompt() },
+    {
+      role: 'user',
+      content: [
+        'RECENT RESEARCH NOTES (what you have already looked at):',
+        notes.trim() || '(none yet — this is your first planning tick)',
+        '',
+        'Propose your goals now — only GOAL: lines.'
+      ].join('\n')
+    }
+  ]
+  const out = await collectStream(model, messages, signal, false)
+  const instructions: string[] = []
+  for (const m of out.buffer.matchAll(/^[\s\-*\d.]*GOAL\s*:\s*(.+)$/gim)) {
+    const t = m[1].trim()
+    if (t) instructions.push(t)
+  }
+  return { rawText: out.buffer.trim(), instructions: instructions.slice(0, 8) }
+}
+
 // --- Tick orchestration -----------------------------------------------------
 
 async function runTick(trigger: 'timer' | 'manual'): Promise<HeartbeatTickResult> {
@@ -501,47 +605,114 @@ async function runTick(trigger: 'timer' | 'manual'): Promise<HeartbeatTickResult
     return { status: 'skipped', error: 'a chat is currently streaming — try again shortly' }
   }
 
+  // Decide the tick type. Never work an un-ratified goal: if goals are
+  // proposed but none are queued, skip until Bear ratifies.
+  const queued = goals.filter((g) => g.status === 'queued')
+  const proposed = goals.filter((g) => g.status === 'proposed')
+  if (queued.length === 0 && proposed.length > 0) {
+    return {
+      status: 'skipped',
+      error: `${proposed.length} goal(s) awaiting your ratification — open the Heartbeat panel to approve them`
+    }
+  }
+
   state.ticking = true
   emitState()
 
   const tickNum = state.tickCount + 1
-  const probe = PROBES[state.tickCount % PROBES.length]
+  const goal = queued[0] ?? null
+  const label = goal ? goal.title : 'Plan upcoming goals'
   const started = Date.now()
-  emit({ type: 'tick-start', tick: tickNum, objective: probe.label })
+  emit({ type: 'tick-start', tick: tickNum, objective: label })
 
   const abort = new AbortController()
   const killTimer = setTimeout(() => abort.abort(), TICK_TIMEOUT_MS)
 
   try {
-    const notes = await recentNotes(2)
-    const { transcript, finalText, toolUsed } = await runProbe(
-      model,
-      probe,
-      notes,
-      abort.signal,
-      (name) => emit({ type: 'tick-tool', tick: tickNum, tool: name })
-    )
+    let transcript: string
+    let finalText: string
+    let metaLines: string[]
+
+    if (goal) {
+      // --- WORK TICK ---
+      const notes = await recentNotes(2)
+      const r = await runProbe(
+        model,
+        {
+          label: goal.title,
+          instruction: goal.instruction,
+          fallbackTool: deriveFallbackTool(goal.instruction)
+        },
+        notes,
+        abort.signal,
+        (name) => emit({ type: 'tick-tool', tick: tickNum, tool: name })
+      )
+      transcript = r.transcript
+      finalText = r.finalText
+      metaLines = ['- **Type:** work tick', `- **Goal:** ${goal.title}`, `- **Tool:** ${r.toolUsed}`]
+    } else {
+      // --- PLANNING TICK ---
+      const notes = await recentNotes(3)
+      const plan = await runPlanningTurn(model, notes, abort.signal)
+      const seeded = plan.instructions.length === 0
+      const instructions = seeded ? SEED_GOALS : plan.instructions
+      const now0 = Date.now()
+      const fresh: HeartbeatGoal[] = instructions.map((ins, i) => ({
+        id: `goal_${now0}_${i}_${rand()}`,
+        title: ins.length > 80 ? ins.slice(0, 79) + '…' : ins,
+        instruction: ins,
+        status: 'proposed',
+        createdAt: now0
+      }))
+      goals.push(...fresh)
+      await saveGoals()
+      emitGoals()
+      transcript = [
+        seeded
+          ? '_The model proposed no parseable goals — seeded with the default diagnostic goals._'
+          : '_Gemma proposed these goals. They are awaiting Bear’s ratification._',
+        '',
+        '## Proposed goals',
+        '',
+        ...fresh.map((g, i) => `${i + 1}. ${g.instruction}`),
+        '',
+        '## Planning notes',
+        '',
+        plan.rawText || '_(none)_'
+      ].join('\n')
+      finalText = `Proposed ${fresh.length} goal(s) for Bear to ratify.`
+      metaLines = ['- **Type:** planning tick', `- **Proposed:** ${fresh.length} goal(s)`]
+    }
 
     const now = new Date()
+    const fileStamp = stamp(now)
     const durationS = Math.round((Date.now() - started) / 1000)
     const journal = [
       `# Heartbeat Tick #${tickNum} — ${now.toLocaleString()}`,
       '',
       `- **Trigger:** ${trigger}`,
       `- **Model:** ${model}`,
-      `- **Probe:** ${probe.label}`,
-      `- **Tool:** ${toolUsed}`,
+      ...metaLines,
       `- **Duration:** ${durationS}s`,
       '',
-      '## Probe',
+      `## ${label}`,
       '',
       transcript,
       ''
     ].join('\n')
 
-    const dir = await ticksDir()
-    const journalPath = join(dir, `tick-${stamp(now)}.md`)
+    const journalName = `tick-${fileStamp}.md`
+    const journalPath = join(await ticksDir(), journalName)
     await writeFile(journalPath, journal, 'utf-8')
+
+    if (goal) {
+      goal.status = 'done'
+      goal.completedAt = Date.now()
+      goal.journalFile = journalName
+      goal.summary = finalText
+      await saveGoals()
+      emitGoals()
+    }
 
     state.tickCount = tickNum
     state.lastTickAt = Date.now()
@@ -579,9 +750,10 @@ export async function initHeartbeat(hooks: HeartbeatHooks): Promise<void> {
   getModel = hooks.getModel
   isBusy = hooks.isBusy
   await loadState()
+  await loadGoals()
   scheduleTimer()
   console.log(
-    `[heartbeat] initialized — ${state.enabled ? `enabled, every ${state.cadenceMinutes}min` : 'disabled'}, ${state.tickCount} tick(s) so far`
+    `[heartbeat] initialized — ${state.enabled ? `enabled, every ${state.cadenceMinutes}min` : 'disabled'}, ${state.tickCount} tick(s), ${goals.length} goal(s)`
   )
 }
 

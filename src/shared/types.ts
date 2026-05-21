@@ -162,8 +162,25 @@ export interface HeartbeatJournalEntry {
   size: number
 }
 
+/**
+ * Patch 34 L3: a goal in the heartbeat's queue. Gemma proposes goals on a
+ * planning tick; Bear ratifies them (proposed -> queued / skipped); a work
+ * tick runs the oldest queued goal as a probe.
+ */
+export interface HeartbeatGoal {
+  id: string
+  title: string
+  instruction: string
+  status: 'proposed' | 'queued' | 'done' | 'skipped'
+  createdAt: number
+  completedAt?: number
+  journalFile?: string
+  summary?: string
+}
+
 export type HeartbeatEvent =
   | { type: 'state'; state: HeartbeatState }
+  | { type: 'goals'; goals: HeartbeatGoal[] }
   | { type: 'tick-start'; tick: number; objective: string }
   | { type: 'tick-tool'; tick: number; tool: string }
   | {

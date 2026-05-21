@@ -54,6 +54,8 @@ import {
   runTickNow,
   listJournal,
   readJournal,
+  getGoals,
+  setGoalStatus,
   heartbeatEvents
 } from './heartbeat'
 
@@ -749,6 +751,12 @@ app.whenReady().then(async () => {
   ipcMain.handle('heartbeat:journal-list', async () => listJournal())
   ipcMain.handle('heartbeat:journal-read', async (_e, name: string) =>
     readJournal(name)
+  )
+  ipcMain.handle('heartbeat:goals-get', async () => getGoals())
+  ipcMain.handle(
+    'heartbeat:goal-set-status',
+    async (_e, { id, status }: { id: string; status: 'queued' | 'skipped' }) =>
+      setGoalStatus(id, status)
   )
 
   ipcMain.handle(
