@@ -36,12 +36,21 @@ const api = {
 
   sendChat: async (req: ChatRequest, onChunk: (c: StreamChunk) => void): Promise<void> => {
     const { channel } = (await ipcRenderer.invoke('chat:send', req)) as { channel: string }
-    // Patch 7: client-side dead-man timer. If 90s pass without ANY chunk
-    // from main (token, tool, activity, anything), assume main-side hang
-    // and synthesize an error so the renderer's existing handler unblocks.
-    // Pairs with the abortChat invocation to ensure the main-side
-    // AbortController fires too.
-    const TIMEOUT_MS = 90_000
+    // Patch 7: client-side dead-man timer. If TIMEOUT_MS passes without ANY
+    // chunk from main (token, tool, activity, anything), assume a main-side
+    // hang and synthesize an error so the renderer's handler unblocks.
+    // Pairs with the abortChat invocation so the main-side AbortController
+    // fires too.
+    //
+    // The dense 31B model runs all 31B params per token, so first-token
+    // latency on a large prompt can run into minutes. It gets a 7-minute
+    // budget; the fast E4B / 27B-MoE models keep the 90s budget, where a
+    // long silence genuinely means something is wrong.
+    const TIMEOUT_MS = req.model.includes('31b') ? 420_000 : 90_000
+    const TIMEOUT_LABEL =
+      TIMEOUT_MS >= 120_000
+        ? `${Math.round(TIMEOUT_MS / 60_000)} min`
+        : `${TIMEOUT_MS / 1000}s`
     return new Promise((resolve) => {
       let timer: ReturnType<typeof setTimeout> | null = null
       const armTimer = (): void => {
@@ -51,7 +60,7 @@ const api = {
           ipcRenderer.invoke('chat:abort', req.conversationId).catch(() => { /* best effort */ })
           onChunk({
             type: 'error',
-            error: `No response from model in ${TIMEOUT_MS / 1000}s — the request was aborted. The model server may be hung or out of memory.`
+            error: `No response from model in ${TIMEOUT_LABEL} — the request was aborted. The model server may be hung or out of memory.`
           })
           resolve()
         }, TIMEOUT_MS)
