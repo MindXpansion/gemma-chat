@@ -58,6 +58,14 @@ import {
   setGoalStatus,
   heartbeatEvents
 } from './heartbeat'
+import {
+  initMission,
+  startMission,
+  abortMission,
+  getMissions,
+  isMissionActive,
+  missionEvents
+} from './mission'
 
 // Patch 18: mirror config-file API keys into process.env so spawned Python
 // scripts (temporal-intelligence, google_maps, weather) inherit them even
@@ -577,10 +585,23 @@ app.whenReady().then(async () => {
     heartbeatEvents.on('event', (ev) => send('heartbeat:event', ev))
     await initHeartbeat({
       getModel: () => currentModel,
-      isBusy: () => chatAbortControllers.size > 0
+      // A heartbeat tick must not contend for the single MLX server with
+      // a user chat OR an autonomous mission.
+      isBusy: () => chatAbortControllers.size > 0 || isMissionActive()
     })
   } catch (e) {
     console.error('[heartbeat] init failed:', (e as Error).message)
+  }
+
+  // Patch 35: Mission Mode — restore mission history, recover crashed runs.
+  try {
+    missionEvents.on('event', (ev) => send('mission:event', ev))
+    await initMission({
+      getModel: () => currentModel,
+      isChatBusy: () => chatAbortControllers.size > 0
+    })
+  } catch (e) {
+    console.error('[mission] init failed:', (e as Error).message)
   }
 
   session.defaultSession.setPermissionRequestHandler((_wc, permission, callback) => {
@@ -758,6 +779,13 @@ app.whenReady().then(async () => {
     async (_e, { id, status }: { id: string; status: 'queued' | 'skipped' }) =>
       setGoalStatus(id, status)
   )
+
+  // Patch 35: Mission Mode controls.
+  ipcMain.handle('mission:start', async (_e, objective: string) =>
+    startMission(objective)
+  )
+  ipcMain.handle('mission:abort', async () => abortMission())
+  ipcMain.handle('mission:list', async () => getMissions())
 
   ipcMain.handle(
     'audio:transcribe',

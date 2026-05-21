@@ -9,7 +9,9 @@ import type {
   HeartbeatEvent,
   HeartbeatTickResult,
   HeartbeatJournalEntry,
-  HeartbeatGoal
+  HeartbeatGoal,
+  Mission,
+  MissionEvent
 } from '../shared/types'
 
 const api = {
@@ -154,6 +156,19 @@ const api = {
     const listener = (_: IpcRendererEvent, ev: HeartbeatEvent): void => cb(ev)
     ipcRenderer.on('heartbeat:event', listener)
     return () => ipcRenderer.removeListener('heartbeat:event', listener)
+  },
+
+  // Patch 35: Mission Mode
+  missionStart: (
+    objective: string
+  ): Promise<{ ok: boolean; missionId?: string; error?: string }> =>
+    ipcRenderer.invoke('mission:start', objective),
+  missionAbort: (): Promise<boolean> => ipcRenderer.invoke('mission:abort'),
+  missionList: (): Promise<Mission[]> => ipcRenderer.invoke('mission:list'),
+  onMissionEvent: (cb: (ev: MissionEvent) => void): (() => void) => {
+    const listener = (_: IpcRendererEvent, ev: MissionEvent): void => cb(ev)
+    ipcRenderer.on('mission:event', listener)
+    return () => ipcRenderer.removeListener('mission:event', listener)
   }
 }
 

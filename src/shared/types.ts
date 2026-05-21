@@ -178,6 +178,35 @@ export interface HeartbeatGoal {
   summary?: string
 }
 
+/**
+ * Patch 35 — Mission Mode. A mission is an objective Bear assigns; the
+ * engine decomposes it into probe-sized steps and executes them
+ * back-to-back, unattended, until done or stuck.
+ */
+export interface MissionStep {
+  id: string
+  instruction: string
+  status: 'pending' | 'running' | 'done' | 'failed'
+  journalFile?: string
+  summary?: string
+}
+
+export interface Mission {
+  id: string
+  objective: string
+  status: 'decomposing' | 'running' | 'done' | 'stuck' | 'aborted'
+  steps: MissionStep[]
+  model: string
+  createdAt: number
+  startedAt?: number
+  completedAt?: number
+  error?: string
+}
+
+export type MissionEvent =
+  | { type: 'missions'; missions: Mission[] }
+  | { type: 'mission-tool'; missionId: string; tool: string }
+
 export type HeartbeatEvent =
   | { type: 'state'; state: HeartbeatState }
   | { type: 'goals'; goals: HeartbeatGoal[] }

@@ -159,7 +159,7 @@ function emitState(): void {
 
 // --- Goals ------------------------------------------------------------------
 
-async function researchDir(): Promise<string> {
+export async function researchDir(): Promise<string> {
   const dir = join(await ensureGemmaHome(), 'research')
   await mkdir(dir, { recursive: true })
   return dir
@@ -236,7 +236,7 @@ function scheduleTimer(): void {
 
 // --- Journal ----------------------------------------------------------------
 
-async function ticksDir(): Promise<string> {
+export async function ticksDir(): Promise<string> {
   const dir = join(await researchDir(), 'ticks')
   await mkdir(dir, { recursive: true })
   return dir
@@ -270,7 +270,7 @@ async function recentNotes(n: number): Promise<string> {
   return blocks.join('\n\n')
 }
 
-function stamp(d: Date): string {
+export function stamp(d: Date): string {
   const p = (n: number): string => String(n).padStart(2, '0')
   return `${d.getFullYear()}${p(d.getMonth() + 1)}${p(d.getDate())}-${p(d.getHours())}${p(d.getMinutes())}${p(d.getSeconds())}`
 }
@@ -412,17 +412,20 @@ async function collectStream(
 
 // --- The probe (one tool + one narration) -----------------------------------
 
-interface ProbeSpec {
+export interface ProbeSpec {
   label: string
   instruction: string
-  /** If the model fails to emit an action, the runner falls back to this. */
+  /** If the model fails to emit an action, the runner falls back to this.
+   *  When omitted, runProbe derives it from the instruction text. */
   fallbackTool?: string
 }
 
-interface ProbeResult {
+export interface ProbeResult {
   transcript: string
   finalText: string
   toolUsed: string
+  /** true if the tool ran but returned an error (or no tool ran at all). */
+  toolErrored: boolean
 }
 
 function heartbeatCtx(): ToolContext {
@@ -442,13 +445,14 @@ function deriveFallbackTool(text: string): string | undefined {
   return undefined
 }
 
-async function runProbe(
+export async function runProbe(
   model: string,
   probe: ProbeSpec,
   notes: string,
   signal: AbortSignal,
   onTool: (name: string) => void
 ): Promise<ProbeResult> {
+  const fallback = probe.fallbackTool ?? deriveFallbackTool(probe.instruction)
   const messages: MLXChatMessage[] = [
     { role: 'system', content: heartbeatSystemPrompt() },
     {
@@ -477,12 +481,12 @@ async function runProbe(
     toolArgs = a.action.args
     assistantContent = a.buffer.slice(0, a.action.end)
     modelActed = true
-  } else if (probe.fallbackTool) {
+  } else if (fallback) {
     // The model narrated instead of acting — fall back to the tool the
     // goal named so the tick still produces real data.
-    toolName = probe.fallbackTool
+    toolName = fallback
     toolArgs = {}
-    assistantContent = `<action name="${probe.fallbackTool}"></action>`
+    assistantContent = `<action name="${fallback}"></action>`
     modelActed = false
   } else {
     toolName = null
@@ -502,7 +506,8 @@ async function runProbe(
         a.buffer.trim() || '_(no output)_'
       ].join('\n'),
       finalText: 'No tool call was made this tick — the model did not emit a usable action.',
-      toolUsed: '(none)'
+      toolUsed: '(none)',
+      toolErrored: true
     }
   }
 
@@ -554,7 +559,8 @@ async function runProbe(
   return {
     transcript,
     finalText: narration || '(no narration produced)',
-    toolUsed: toolName
+    toolUsed: toolName,
+    toolErrored: /^Error\b/i.test(result.trim())
   }
 }
 
@@ -638,11 +644,7 @@ async function runTick(trigger: 'timer' | 'manual'): Promise<HeartbeatTickResult
       const notes = await recentNotes(2)
       const r = await runProbe(
         model,
-        {
-          label: goal.title,
-          instruction: goal.instruction,
-          fallbackTool: deriveFallbackTool(goal.instruction)
-        },
+        { label: goal.title, instruction: goal.instruction },
         notes,
         abort.signal,
         (name) => emit({ type: 'tick-tool', tick: tickNum, tool: name })
