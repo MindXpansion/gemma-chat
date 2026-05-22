@@ -1,7 +1,8 @@
 import { app } from 'electron'
 import { spawn, ChildProcess, spawnSync } from 'child_process'
 import { join } from 'path'
-import { existsSync, rmSync } from 'fs'
+import { existsSync, rmSync, readFileSync, writeFileSync } from 'fs'
+import { createServer } from 'net'
 
 const MLX_PORT = 11437
 const MLX_HOST = `127.0.0.1:${MLX_PORT}`
@@ -268,52 +269,88 @@ export interface ServerProgress {
   progress?: number
 }
 
+/** Where the spawned server's PID is recorded, so a later start — even
+ *  after a crash or hard quit — can reliably reap it. */
+function pidFilePath(): string {
+  return join(dataDir(), 'mlx-server.pid')
+}
+
 /**
- * Patch 11: Pre-flight port clear. Before spawning a fresh mlx_vlm.server,
- * SIGKILL any process holding port 11437. This handles orphan MLX processes
- * left over from a hard quit (audit §2.6) or from a previous server that
- * failed to release the port cleanly. Without this, the new spawn errors
- * with EADDRINUSE and waitForHealth gets fooled into reporting the orphan
- * as healthy.
+ * True if `pid` is alive AND is one of our mlx_vlm servers. `ps` is used
+ * (not `lsof`) on purpose: `ps` reads process info and does NOT hang under
+ * macOS Sequoia TCC the way `lsof` does. The mlx_vlm.server match also
+ * guards against PID reuse — we never SIGKILL an unrelated recycled PID.
  */
-function clearMLXPort(): void {
-  // Patch 23: hard 2s timeout on lsof. On macOS Sequoia (Darwin 24+),
-  // spawnSync('lsof', ...) from Electron main can hang indefinitely —
-  // likely TCC prompt for network info access that has no UI to answer.
-  // Without the timeout, the entire setup flow froze silently. If lsof
-  // hangs, we bail and proceed; either the port is free (spawn works)
-  // or we'll get a real EADDRINUSE error to surface.
+function isMlxProcess(pid: number): boolean {
   try {
-    const res = spawnSync('lsof', ['-ti', `:${MLX_PORT}`, '-sTCP:LISTEN'], {
+    const r = spawnSync('ps', ['-p', String(pid), '-o', 'command='], {
       encoding: 'utf-8',
       timeout: 2000
     })
-    if (res.error && (res.error as NodeJS.ErrnoException).code === 'ETIMEDOUT') {
-      console.log('[mlx] Pre-flight: lsof timed out (likely macOS TCC), skipping port clear')
-      return
-    }
-    if (!res.stdout) return
-    const pids = res.stdout
-      .trim()
-      .split('\n')
-      .map((s) => parseInt(s, 10))
-      .filter((n) => Number.isFinite(n) && n > 0)
-    if (pids.length === 0) return
-    console.log(
-      `[mlx] Pre-flight: SIGKILL orphan listeners on :${MLX_PORT}: ${pids.join(', ')}`
-    )
-    for (const pid of pids) {
+    return r.status === 0 && /mlx_vlm\.server/.test(r.stdout || '')
+  } catch {
+    return false
+  }
+}
+
+/** Resolves true if TCP `port` is bindable right now. */
+function isPortFree(port: number): Promise<boolean> {
+  return new Promise((resolve) => {
+    const probe = createServer()
+    probe.once('error', () => resolve(false))
+    probe.once('listening', () => probe.close(() => resolve(true)))
+    probe.listen(port, '0.0.0.0')
+  })
+}
+
+/** Poll until `port` is bindable, up to `timeoutMs`. */
+async function waitPortFree(port: number, timeoutMs: number): Promise<void> {
+  const start = Date.now()
+  while (Date.now() - start < timeoutMs) {
+    if (await isPortFree(port)) return
+    await new Promise((r) => setTimeout(r, 250))
+  }
+  console.log(`[mlx] port ${port} still busy after ${timeoutMs}ms — proceeding anyway`)
+}
+
+/**
+ * Pre-flight port clear. Before spawning a fresh mlx_vlm.server, make sure
+ * port 11437 is actually free.
+ *
+ * This replaces the old `lsof -ti :PORT` clear, which hung indefinitely
+ * under macOS Sequoia TCC — so the 2s-timeout guard simply skipped the
+ * clear, letting orphan servers pile up and every new spawn die with
+ * `EADDRINUSE`. No lsof now:
+ *   1. SIGKILL the PID in the pid-file — that's the last server we
+ *      spawned, which covers BOTH a still-running model switch and an
+ *      orphan left by a crash/hard-quit. `ps`-verified so a reused PID is
+ *      never touched.
+ *   2. Wait for the port to actually become bindable — this also defeats
+ *      the SIGKILL/socket-release race, so the spawn never races a
+ *      not-yet-freed port.
+ */
+async function clearMLXPort(): Promise<void> {
+  try {
+    if (existsSync(pidFilePath())) {
+      const pid = parseInt(readFileSync(pidFilePath(), 'utf-8').trim(), 10)
+      if (Number.isFinite(pid) && pid > 0 && isMlxProcess(pid)) {
+        console.log(`[mlx] Pre-flight: SIGKILL prior mlx server PID ${pid}`)
+        try {
+          process.kill(pid, 'SIGKILL')
+        } catch {
+          // already gone
+        }
+      }
       try {
-        process.kill(pid, 'SIGKILL')
+        rmSync(pidFilePath(), { force: true })
       } catch {
-        // already dead, or not our process — either way, continue
+        // ok
       }
     }
-    // Give the kernel a beat to release the port (also bounded by timeout)
-    spawnSync('sleep', ['0.3'], { timeout: 1000 })
   } catch (e) {
-    console.log('[mlx] Pre-flight port clear failed (proceeding):', (e as Error).message)
+    console.log('[mlx] Pre-flight pid-file clear failed (proceeding):', (e as Error).message)
   }
+  await waitPortFree(MLX_PORT, 15_000)
 }
 
 export async function startServer(
@@ -326,11 +363,9 @@ export async function startServer(
   // Kill existing server if running with different model
   stopServer()
 
-  // Patch 11: kill any orphan listener on the port before spawning. Defends
-  // against the §2.6 fire-and-forget shutdown bug AND against any case where
-  // a previous server (ours or someone else's) is still holding 11437.
-  // Patch 23: bounded with a hard timeout — lsof can hang under macOS TCC.
-  clearMLXPort()
+  // Reap any prior/orphan server and wait for port 11437 to be free
+  // before spawning — lsof-free, so it survives macOS TCC (see clearMLXPort).
+  await clearMLXPort()
 
   const env = {
     ...process.env,
@@ -368,6 +403,14 @@ export async function startServer(
     }
   )
   currentModel = model
+
+  // Record the PID so a later start — including one after a crash or hard
+  // quit — can reliably SIGKILL this server (see clearMLXPort).
+  try {
+    writeFileSync(pidFilePath(), String(serverProc.pid ?? ''), 'utf-8')
+  } catch {
+    // best-effort
+  }
 
   serverProc.stdout?.on('data', (d) => console.log('[mlx]', d.toString().trim()))
   serverProc.stderr?.on('data', (d) => {
@@ -417,7 +460,10 @@ export async function startServer(
 export function stopServer(): void {
   if (serverProc && !serverProc.killed) {
     console.log('[mlx] Stopping server')
-    serverProc.kill('SIGTERM')
+    // SIGKILL, not SIGTERM: uvicorn's graceful SIGTERM shutdown holds port
+    // 11437 for a beat, which raced the next spawn into EADDRINUSE. A hard
+    // kill releases the socket immediately.
+    serverProc.kill('SIGKILL')
     serverProc = null
     currentModel = null
   }
