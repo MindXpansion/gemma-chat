@@ -1,4 +1,4 @@
-import { app } from 'electron'
+import { app, net } from 'electron'
 import { spawn, ChildProcess, spawnSync } from 'child_process'
 import { join } from 'path'
 import { existsSync, rmSync, readFileSync, writeFileSync } from 'fs'
@@ -590,7 +590,15 @@ export interface MLXChatOptions {
 export async function* chatStream(
   opts: MLXChatOptions
 ): AsyncGenerator<{ content?: string; done?: boolean }> {
-  const res = await fetch(`${MLX_URL}/v1/chat/completions`, {
+  // Patch 38: stream over Electron's net stack, NOT Node's global fetch.
+  // Node's fetch (undici) imposes a 300s headersTimeout/bodyTimeout. The dense
+  // 31B model's first token on a long conversation can take longer than that,
+  // so undici aborted the socket mid-request and the renderer saw `terminated`
+  // — even though the server was alive and still working. Patch 36 raised the
+  // *renderer's* dead-man timer to 7 min but couldn't see undici's 5-min wall.
+  // net.fetch has no such idle timeout; the caller's AbortSignal (renderer
+  // dead-man timer / heartbeat + mission kill-timers) is now the sole timeout.
+  const res = await net.fetch(`${MLX_URL}/v1/chat/completions`, {
     method: 'POST',
     headers: { 'content-type': 'application/json' },
     body: JSON.stringify({
