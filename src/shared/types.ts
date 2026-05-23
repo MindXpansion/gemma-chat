@@ -151,6 +151,11 @@ export interface HeartbeatState {
   primaryGoalLedger?: Array<{ id: string; promotedAt: number }>
   /** Patch 40: ticks since the last review (synthesis) tick. */
   ticksSinceReview?: number
+  /** Patch 43 (adaptive cadence): MINIMUM delay between ticks when work is
+   *  pending (in-progress goal, queued follow-up, or queued primary with
+   *  ledger room). cadenceMinutes now acts as the MAX (idle) delay; this
+   *  is the floor when she's actively researching. */
+  minCadenceSeconds?: number
 }
 
 export interface HeartbeatTickResult {

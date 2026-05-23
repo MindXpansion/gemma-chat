@@ -49,6 +49,11 @@ const MIN_CADENCE_MIN = 5
 const MAX_CADENCE_MIN = 720
 const DEFAULT_CADENCE_MIN = 30
 
+// Patch 43 — adaptive cadence floors/defaults.
+const MIN_CADENCE_SECONDS_DEFAULT = 30
+const MIN_CADENCE_SECONDS_FLOOR = 10
+const MIN_CADENCE_SECONDS_CEIL = 300
+
 // --- Patch 40 tunables (heartbeat learning loop) ---------------------------
 
 /** Rolling-60min cap on primary goals promoted from queued → in_progress. */
@@ -132,7 +137,8 @@ let state: HeartbeatState = {
   tickCount: 0,
   ticking: false,
   primaryGoalLedger: [],
-  ticksSinceReview: 0
+  ticksSinceReview: 0,
+  minCadenceSeconds: MIN_CADENCE_SECONDS_DEFAULT
 }
 let goals: HeartbeatGoal[] = []
 
@@ -157,7 +163,8 @@ async function loadState(): Promise<void> {
       lastError: p.lastError,
       ticking: false,
       primaryGoalLedger: Array.isArray(p.primaryGoalLedger) ? p.primaryGoalLedger : [],
-      ticksSinceReview: typeof p.ticksSinceReview === 'number' ? p.ticksSinceReview : 0
+      ticksSinceReview: typeof p.ticksSinceReview === 'number' ? p.ticksSinceReview : 0,
+      minCadenceSeconds: clampMinCadence(p.minCadenceSeconds ?? MIN_CADENCE_SECONDS_DEFAULT)
     }
   } catch {
     // no state file yet — first run, defaults stand
@@ -177,6 +184,11 @@ async function saveState(): Promise<void> {
 function clampCadence(min: number): number {
   if (!Number.isFinite(min)) return DEFAULT_CADENCE_MIN
   return Math.max(MIN_CADENCE_MIN, Math.min(MAX_CADENCE_MIN, Math.round(min)))
+}
+
+function clampMinCadence(sec: number): number {
+  if (!Number.isFinite(sec)) return MIN_CADENCE_SECONDS_DEFAULT
+  return Math.max(MIN_CADENCE_SECONDS_FLOOR, Math.min(MIN_CADENCE_SECONDS_CEIL, Math.round(sec)))
 }
 
 function snapshot(): HeartbeatState {
@@ -256,16 +268,76 @@ export async function setGoalStatus(
 
 // --- Timer ------------------------------------------------------------------
 
-function scheduleTimer(): void {
+/**
+ * Patch 43 — adaptive cadence scheduler. Replaces the fixed setInterval
+ * with a self-re-arming setTimeout whose delay depends on queue state:
+ *
+ * - In-progress goal with phase != null  → MIN cadence (fire ASAP).
+ * - Queued follow-up exists              → MIN cadence (follow-ups are
+ *                                          rate-cap-free, advance fast).
+ * - Queued primary AND ledger has room   → MIN cadence (start the dedupe-
+ *                                          probe-consolidate sequence).
+ * - Queued primary AND ledger is full    → wait until oldest ledger entry
+ *                                          would evict (clamped to [MIN, MAX]).
+ * - Idle (no work, planning needed)      → MAX cadence (cadenceMinutes).
+ *
+ * The reason: at fixed 5-min cadence a primary takes 15 wall-clock min
+ * (3 phases) and the 7/hour cap never engages. Adaptive cadence lets the
+ * 7/4 ledger actually be the binding rate cap while staying idle when
+ * there's nothing to do.
+ */
+function computeNextDelayMs(): number {
+  const minMs = (state.minCadenceSeconds ?? MIN_CADENCE_SECONDS_DEFAULT) * 1000
+  const maxMs = state.cadenceMinutes * 60_000
+
+  const inProgress = goals.some((g) => g.status === 'in_progress' && g.phase)
+  if (inProgress) return minMs
+
+  const queuedFollowUps = goals.some((g) => g.status === 'queued' && g.kind === 'follow_up')
+  if (queuedFollowUps) return minMs
+
+  const queuedPrimaries = goals.filter(
+    (g) => g.status === 'queued' && (g.kind === 'primary' || !g.kind)
+  )
+  if (queuedPrimaries.length > 0 && canPromotePrimary()) return minMs
+
+  // Queued primaries but ledger full → wait for ledger to evict.
+  if (queuedPrimaries.length > 0 && !canPromotePrimary()) {
+    const ledger = state.primaryGoalLedger ?? []
+    if (ledger.length > 0) {
+      const oldestPromotedAt = Math.min(...ledger.map((e) => e.promotedAt))
+      const expireAt = oldestPromotedAt + 60 * 60_000
+      const waitMs = expireAt - Date.now()
+      return Math.max(minMs, Math.min(maxMs, waitMs + 1000))
+    }
+  }
+
+  return maxMs
+}
+
+function scheduleNextTick(): void {
   if (timer) {
-    clearInterval(timer)
+    clearTimeout(timer)
     timer = null
   }
-  if (state.enabled) {
-    timer = setInterval(() => {
-      void runTick('timer')
-    }, state.cadenceMinutes * 60_000)
-  }
+  if (!state.enabled) return
+  const delay = computeNextDelayMs()
+  timer = setTimeout(() => {
+    void (async () => {
+      try {
+        await runTick('timer')
+      } catch (e) {
+        console.error('[heartbeat] tick threw unexpectedly:', (e as Error).message)
+      } finally {
+        scheduleNextTick()
+      }
+    })()
+  }, delay)
+}
+
+/** Back-compat alias — old callers used scheduleTimer(). */
+function scheduleTimer(): void {
+  scheduleNextTick()
 }
 
 // --- Journal ----------------------------------------------------------------
@@ -1563,7 +1635,16 @@ export async function setHeartbeatEnabled(on: boolean): Promise<HeartbeatState> 
 export async function setHeartbeatCadence(minutes: number): Promise<HeartbeatState> {
   state.cadenceMinutes = clampCadence(minutes)
   await saveState()
-  scheduleTimer()
+  scheduleNextTick()
+  emitState()
+  return snapshot()
+}
+
+/** Patch 43 — set the adaptive-cadence FLOOR (min delay during active work). */
+export async function setHeartbeatMinCadence(seconds: number): Promise<HeartbeatState> {
+  state.minCadenceSeconds = clampMinCadence(seconds)
+  await saveState()
+  scheduleNextTick()
   emitState()
   return snapshot()
 }
