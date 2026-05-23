@@ -147,6 +147,10 @@ export interface HeartbeatState {
   lastError?: string
   /** true while a tick is currently running */
   ticking: boolean
+  /** Patch 40: rolling-60min ledger of auto-promoted primary goals (rate cap). */
+  primaryGoalLedger?: Array<{ id: string; promotedAt: number }>
+  /** Patch 40: ticks since the last review (synthesis) tick. */
+  ticksSinceReview?: number
 }
 
 export interface HeartbeatTickResult {
@@ -171,11 +175,30 @@ export interface HeartbeatGoal {
   id: string
   title: string
   instruction: string
-  status: 'proposed' | 'queued' | 'done' | 'skipped'
+  status: 'proposed' | 'queued' | 'in_progress' | 'done' | 'skipped'
   createdAt: number
   completedAt?: number
   journalFile?: string
   summary?: string
+  /** Patch 40 — optional, backward compatible with pre-Patch-40 persisted goals. */
+  /** primary = from plan-tick; follow_up = emitted by a consolidate-tick. */
+  kind?: 'primary' | 'follow_up'
+  /** For follow-ups: id of the primary that spawned this. */
+  parentId?: string
+  /** For primaries: how many follow-ups spawned so far (cap = 4). */
+  followUpCount?: number
+  /** Sub-stage when status='in_progress'. */
+  phase?: 'dedupe' | 'probe' | 'consolidate'
+  /** Cached dedupe-check classification, set during the dedupe phase. */
+  dedupe?: {
+    classification: 'COVERED' | 'ADJACENT' | 'NOVEL' | 'SPARSE'
+    topScore: number
+    topUuid?: string
+    topText?: string
+    topTopic?: string
+  }
+  /** Set after the consolidate phase writes the :HeartbeatObservation. */
+  observationUuid?: string
 }
 
 /**

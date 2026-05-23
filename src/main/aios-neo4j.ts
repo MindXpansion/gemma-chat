@@ -267,6 +267,72 @@ export async function getSchemaSummary(target: GraphTarget): Promise<string> {
   }
 }
 
+/**
+ * Patch 40: structured-results variant of runCypher. Returns each Neo4j
+ * record as a plain object keyed by RETURN aliases, with Integer normalized
+ * to JS number, Node/Relationship to a tagged-property object, arrays
+ * preserved. Use when the caller needs to consume values programmatically
+ * (e.g., vector-search scores) rather than display them.
+ *
+ * Result rows are NOT capped here — that's runCypher's display concern.
+ * Callers must include LIMIT in the query if they want one.
+ */
+export async function runCypherRaw(
+  target: GraphTarget,
+  cypher: string,
+  params: Record<string, unknown> = {}
+): Promise<Array<Record<string, unknown>>> {
+  const trimmed = cypher.trim()
+  if (!trimmed) throw new Error('cypher query is empty')
+
+  const sessOrErr = sessionFor(target)
+  if ('error' in sessOrErr) throw new Error(sessOrErr.error)
+  const session = sessOrErr
+  try {
+    const result = await session.run(trimmed, params)
+    const out: Array<Record<string, unknown>> = []
+    for (const rec of result.records) {
+      const obj: Record<string, unknown> = {}
+      for (const key of rec.keys) {
+        obj[String(key)] = normalizeNeoValue(rec.get(key))
+      }
+      out.push(obj)
+    }
+    return out
+  } finally {
+    await session.close()
+  }
+}
+
+function normalizeNeoValue(v: unknown): unknown {
+  if (v === null || v === undefined) return v
+  if (typeof v === 'string' || typeof v === 'number' || typeof v === 'boolean') return v
+  if (neo4j.isInt(v)) {
+    const n = (v as { toNumber: () => number }).toNumber()
+    return Number.isFinite(n) ? n : (v as { toString: () => string }).toString()
+  }
+  if (Array.isArray(v)) return v.map(normalizeNeoValue)
+  if (typeof v === 'object') {
+    const obj = v as Record<string, unknown> & {
+      labels?: string[]
+      type?: string
+      properties?: Record<string, unknown>
+    }
+    if (obj.labels && obj.properties) {
+      return { __kind: 'node', labels: obj.labels, ...obj.properties }
+    }
+    if (obj.type && obj.properties) {
+      return { __kind: 'rel', type: obj.type, ...obj.properties }
+    }
+    const out: Record<string, unknown> = {}
+    for (const [k, vv] of Object.entries(v as Record<string, unknown>)) {
+      out[k] = normalizeNeoValue(vv)
+    }
+    return out
+  }
+  return v
+}
+
 export async function closeNeo4j(): Promise<void> {
   for (const target of Object.keys(driverCache) as GraphTarget[]) {
     const d = driverCache[target]

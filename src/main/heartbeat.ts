@@ -5,6 +5,8 @@ import { join } from 'path'
 import { chatStream, type MLXChatMessage } from './mlx'
 import { TOOLS, findNextAction, runTool, type ToolContext, type ParsedAction } from './tools'
 import { ensureGemmaHome } from './gemma-fs'
+import { embedTexts } from './aios-voyage'
+import { runCypher, runCypherRaw } from './aios-neo4j'
 import type {
   HeartbeatState,
   HeartbeatEvent,
@@ -47,9 +49,37 @@ const MIN_CADENCE_MIN = 5
 const MAX_CADENCE_MIN = 720
 const DEFAULT_CADENCE_MIN = 30
 
+// --- Patch 40 tunables (heartbeat learning loop) ---------------------------
+
+/** Rolling-60min cap on primary goals promoted from queued → in_progress. */
+const MAX_PRIMARIES_PER_HOUR = 7
+/** Hard cap on follow-ups any single primary goal can spawn. */
+const MAX_FOLLOWUPS_PER_PRIMARY = 4
+/** Every Nth tick, attempt a review (synthesis of recent observations). */
+const REVIEW_EVERY_N_TICKS = 20
+/** Top-K vector neighbors retrieved during a dedupe-check. */
+const DEDUPE_TOP_K = 5
+/** Cosine score above which a topic is COVERED (with topic match). */
+const DEDUPE_COVERED_THRESHOLD = 0.92
+/** Cosine score above which a topic is ADJACENT (reshape, don't skip). */
+const DEDUPE_ADJACENT_THRESHOLD = 0.85
+/** Observations older than this fall out of the dedupe window. */
+const DEDUPE_WINDOW_DAYS = 14
+/** Skip dedupe entirely until at least this many in-window observations exist. */
+const DEDUPE_CORPUS_FLOOR = 10
+/** Single :Workspace anchor for autonomous-heartbeat observations. */
+const HEARTBEAT_WORKSPACE_ID = 'gemma-home'
+
 /**
  * The offline-safe, $0 tool subset. Every name here resolves to a tool
  * that touches only the local machine — no network, no paid API.
+ *
+ * NOTE on Patch 40: voyage-3-large embeddings (used by the consolidate-tick
+ * to write :HeartbeatObservation nodes) ARE a network call, but the same
+ * key Gemma's existing gemma_ingest uses, and the per-observation cost is
+ * fractions of a cent. Counted as part of the learning-loop compounding
+ * budget (~$0.15/day at the 7-primary cap; see research-06 §8.1), not as
+ * a forbidden cloud tool.
  */
 export const HEARTBEAT_TOOLS = new Set<string>([
   'aios_now',
@@ -100,7 +130,9 @@ let state: HeartbeatState = {
   enabled: false,
   cadenceMinutes: DEFAULT_CADENCE_MIN,
   tickCount: 0,
-  ticking: false
+  ticking: false,
+  primaryGoalLedger: [],
+  ticksSinceReview: 0
 }
 let goals: HeartbeatGoal[] = []
 
@@ -123,7 +155,9 @@ async function loadState(): Promise<void> {
       lastTickAt: p.lastTickAt,
       lastTickStatus: p.lastTickStatus,
       lastError: p.lastError,
-      ticking: false
+      ticking: false,
+      primaryGoalLedger: Array.isArray(p.primaryGoalLedger) ? p.primaryGoalLedger : [],
+      ticksSinceReview: typeof p.ticksSinceReview === 'number' ? p.ticksSinceReview : 0
     }
   } catch {
     // no state file yet — first run, defaults stand
@@ -597,8 +631,606 @@ async function runPlanningTurn(
   return { rawText: out.buffer.trim(), instructions: instructions.slice(0, 8) }
 }
 
+// --- Patch 40: rate limiter (rolling-60min primary ledger) -----------------
+
+function evictLedger(): void {
+  const cutoff = Date.now() - 60 * 60 * 1000
+  state.primaryGoalLedger = (state.primaryGoalLedger ?? []).filter(
+    (e) => e.promotedAt >= cutoff
+  )
+}
+
+function rollingPrimaryCount(): number {
+  evictLedger()
+  return (state.primaryGoalLedger ?? []).length
+}
+
+function canPromotePrimary(): boolean {
+  return rollingPrimaryCount() < MAX_PRIMARIES_PER_HOUR
+}
+
+/**
+ * Promote queued goals into in_progress (phase='dedupe'), subject to the
+ * 60-min cap on primaries. Follow-ups are NOT rate-limited here — they
+ * are bounded by their parent's followUpCount cap, applied at enqueue.
+ */
+async function autoPromote(): Promise<HeartbeatGoal[]> {
+  const promoted: HeartbeatGoal[] = []
+  for (const g of goals) {
+    if (g.status === 'queued' && g.kind === 'follow_up' && !g.phase) {
+      g.status = 'in_progress'
+      g.phase = 'dedupe'
+      promoted.push(g)
+    }
+  }
+  for (const g of goals) {
+    if (
+      g.status === 'queued' &&
+      (g.kind === 'primary' || !g.kind) &&
+      !g.phase
+    ) {
+      if (!canPromotePrimary()) break
+      g.status = 'in_progress'
+      g.phase = 'dedupe'
+      ;(state.primaryGoalLedger ??= []).push({ id: g.id, promotedAt: Date.now() })
+      promoted.push(g)
+    }
+  }
+  if (promoted.length > 0) {
+    await saveGoals()
+    await saveState()
+    emitGoals()
+    emitState()
+  }
+  return promoted
+}
+
+// --- Patch 40: KG helpers (workspace anchor + parent lookup + topic norm) --
+
+let workspaceEnsured = false
+async function ensureWorkspaceNode(): Promise<void> {
+  if (workspaceEnsured) return
+  try {
+    await runCypher(
+      'gemma',
+      `MERGE (w:Workspace {id: $id})
+         ON CREATE SET w.created_at = datetime(), w.label = $label`,
+      { id: HEARTBEAT_WORKSPACE_ID, label: 'Gemma autonomous heartbeat workspace' }
+    )
+    workspaceEnsured = true
+  } catch (e) {
+    console.warn('[heartbeat] ensureWorkspaceNode failed:', (e as Error).message)
+  }
+}
+
+function parentObservationUuid(goal: HeartbeatGoal): string | null {
+  if (!goal.parentId) return null
+  const p = goals.find((g) => g.id === goal.parentId)
+  return p?.observationUuid ?? null
+}
+
+function normalizeTopic(s: string): string {
+  return s
+    .toLowerCase()
+    .replace(/[`"'*_~]/g, '')
+    .replace(/\s+/g, ' ')
+    .trim()
+    .slice(0, 80)
+}
+
+// --- Patch 40: dedupe-check (NO LLM, read-only on KG) ----------------------
+
+type DedupeClass = 'COVERED' | 'ADJACENT' | 'NOVEL' | 'SPARSE'
+
+interface DedupeOutcome {
+  classification: DedupeClass
+  topScore: number
+  topUuid?: string
+  topText?: string
+  topTopic?: string
+}
+
+async function runDedupeCheck(goal: HeartbeatGoal): Promise<DedupeOutcome> {
+  // Corpus floor — until enough in-window observations exist, dedupe is noise.
+  try {
+    const cntRows = await runCypherRaw(
+      'gemma',
+      `MATCH (o:HeartbeatObservation)
+       WHERE o.created_at > datetime() - duration($win)
+       RETURN count(o) AS cnt`,
+      { win: `P${DEDUPE_WINDOW_DAYS}D` }
+    )
+    const cnt = Number(cntRows[0]?.cnt ?? 0)
+    if (cnt < DEDUPE_CORPUS_FLOOR) {
+      return { classification: 'SPARSE', topScore: 0 }
+    }
+  } catch {
+    return { classification: 'SPARSE', topScore: 0 }
+  }
+
+  const topic = normalizeTopic(goal.title)
+  const queryText = `${topic} :: ${goal.instruction}`.slice(0, 2000)
+  const embRes = await embedTexts([queryText], { inputType: 'query' })
+  const vec = embRes.vectors?.[0]
+  if (!vec) return { classification: 'SPARSE', topScore: 0 }
+
+  const rows = await runCypherRaw(
+    'gemma',
+    `CALL db.index.vector.queryNodes('observation_embedding', $k, $vec)
+     YIELD node, score
+     WHERE node:HeartbeatObservation
+       AND node.created_at > datetime() - duration($win)
+       AND score >= $minScore
+       AND (node.confidence IS NULL OR node.confidence >= 0.4)
+     RETURN node.uuid AS uuid, node.text AS text, node.topic AS topic, score
+     ORDER BY score DESC LIMIT $k`,
+    {
+      k: DEDUPE_TOP_K,
+      vec,
+      minScore: DEDUPE_ADJACENT_THRESHOLD,
+      win: `P${DEDUPE_WINDOW_DAYS}D`
+    }
+  )
+  if (rows.length === 0) return { classification: 'NOVEL', topScore: 0 }
+  const top = rows[0]
+  const score = Number(top.score)
+  const topUuid = top.uuid != null ? String(top.uuid) : undefined
+  const topText = top.text != null ? String(top.text) : undefined
+  const topTopic = top.topic != null ? String(top.topic) : undefined
+
+  if (
+    score >= DEDUPE_COVERED_THRESHOLD &&
+    topTopic &&
+    topTopic.toLowerCase() === topic
+  ) {
+    return { classification: 'COVERED', topScore: score, topUuid, topText, topTopic }
+  }
+  return { classification: 'ADJACENT', topScore: score, topUuid, topText, topTopic }
+}
+
+// --- Patch 40: consolidate (LLM extract + KG write + follow-ups) -----------
+
+function consolidateSystemPrompt(remainingFollowUpBudget: number): string {
+  const lines = [
+    "You are Gemma, an AI assistant running 100% locally on Bear's Mac.",
+    '',
+    'THIS IS A CONSOLIDATE TICK. A probe just ran. Your job: produce a durable observation summary that future ticks can learn from, plus any concrete follow-up questions worth investigating.',
+    '',
+    'OUTPUT FORMAT (exact, no preamble):',
+    '',
+    'OBSERVATION:',
+    '<1-3 sentences. The durable, evidence-grounded finding. Quote real values/labels/paths from the result. Hypothesis-first language; no overclaim like "always", "never", or "once and for all".>',
+    '',
+    'CONFIDENCE: <0.0 - 1.0 — how confident the observation is correct>'
+  ]
+  if (remainingFollowUpBudget > 0) {
+    lines.push(
+      '',
+      `Then, if AND ONLY IF the result surfaces a specific concrete sub-question that would meaningfully extend this finding, append up to ${remainingFollowUpBudget} lines of the form:`,
+      'FOLLOW_UP: <one-tool instruction>',
+      '',
+      'Each follow-up must (a) be specific (not "investigate further"), (b) name a HEARTBEAT_TOOL it would use, (c) be answerable in one tool call.',
+      `Available tools: ${[...HEARTBEAT_TOOLS].join(', ')}.`,
+      '',
+      'If no worthy follow-up exists, output none.'
+    )
+  } else {
+    lines.push(
+      '',
+      'No follow-ups allowed for this consolidate (budget exhausted or this is a follow-up goal itself).'
+    )
+  }
+  lines.push(
+    '',
+    'No commentary, no greeting — just OBSERVATION:, CONFIDENCE:, and optional FOLLOW_UP: lines.'
+  )
+  return lines.join('\n')
+}
+
+interface ConsolidateParsed {
+  observationText: string
+  confidence?: number
+  followUps: string[]
+}
+
+function parseConsolidateOutput(raw: string, maxFollowUps: number): ConsolidateParsed {
+  const lines = raw.split('\n')
+  const obsLines: string[] = []
+  let confidence: number | undefined
+  const followUps: string[] = []
+  let mode: 'none' | 'observation' = 'none'
+  for (const line of lines) {
+    const trimmed = line.trim()
+    if (/^OBSERVATION\s*:/i.test(trimmed)) {
+      mode = 'observation'
+      const rest = trimmed.replace(/^OBSERVATION\s*:/i, '').trim()
+      if (rest) obsLines.push(rest)
+      continue
+    }
+    const cm = trimmed.match(/^CONFIDENCE\s*:\s*([\d.]+)/i)
+    if (cm) {
+      mode = 'none'
+      const v = parseFloat(cm[1])
+      if (Number.isFinite(v) && v >= 0 && v <= 1) confidence = v
+      continue
+    }
+    const fm = trimmed.match(/^FOLLOW_UP\s*:\s*(.+)$/i)
+    if (fm) {
+      mode = 'none'
+      if (followUps.length < maxFollowUps) followUps.push(fm[1].trim())
+      continue
+    }
+    if (mode === 'observation' && trimmed) obsLines.push(trimmed)
+  }
+  return {
+    observationText: obsLines.join(' ').trim(),
+    confidence,
+    followUps: followUps.slice(0, maxFollowUps)
+  }
+}
+
+interface ConsolidateOutcome {
+  observationUuid: string
+  followUpInstructions: string[]
+  confidence?: number
+}
+
+async function runConsolidate(
+  goal: HeartbeatGoal,
+  probeJournalBody: string,
+  model: string,
+  signal: AbortSignal,
+  tickNum: number
+): Promise<ConsolidateOutcome> {
+  const followUpBudget =
+    goal.kind === 'follow_up'
+      ? 0
+      : Math.max(0, MAX_FOLLOWUPS_PER_PRIMARY - (goal.followUpCount ?? 0))
+
+  const messages: MLXChatMessage[] = [
+    { role: 'system', content: consolidateSystemPrompt(followUpBudget) },
+    {
+      role: 'user',
+      content: [
+        'PROBE GOAL:',
+        goal.instruction,
+        '',
+        'PROBE NARRATION (already produced):',
+        (goal.summary ?? '').slice(0, 2000),
+        '',
+        'PROBE TRANSCRIPT (excerpt):',
+        probeJournalBody.slice(0, 2000),
+        '',
+        followUpBudget > 0
+          ? `Remaining follow-up budget for this primary goal: ${followUpBudget}.`
+          : 'No follow-ups allowed for this consolidate.',
+        '',
+        'Produce OBSERVATION:, CONFIDENCE:, and any FOLLOW_UP: lines now.'
+      ].join('\n')
+    }
+  ]
+  const out = await collectStream(model, messages, signal, false)
+  const parsed = parseConsolidateOutput(out.buffer, followUpBudget)
+  if (!parsed.observationText) {
+    throw new Error('Consolidate produced no parseable OBSERVATION text.')
+  }
+
+  const observationUuid = `obs_${Date.now()}_${rand()}`
+  const tickUuid = `htick_${Date.now()}_${rand()}`
+  const topicLc = normalizeTopic(goal.title)
+  const toolArgsJson = JSON.stringify({ instruction: goal.instruction }).slice(0, 4000)
+  const excerpt = probeJournalBody.slice(0, 2000)
+
+  const embRes = await embedTexts([parsed.observationText], { inputType: 'document' })
+  const embedding = embRes.vectors?.[0]
+  if (!embedding) throw new Error('embedding failed for observation')
+
+  await ensureWorkspaceNode()
+  const parentObs = parentObservationUuid(goal)
+
+  await runCypher(
+    'gemma',
+    `MERGE (t:HeartbeatTick {uuid: $tickUuid})
+       ON CREATE SET t.created_at = datetime(), t.tick_num = $tickNum, t.kind = 'consolidate'
+     MERGE (w:Workspace {id: $wid})
+     CREATE (o:Observation:HeartbeatObservation {
+       uuid: $uuid,
+       created_at: datetime(),
+       text: $text,
+       topic: $topic,
+       instruction: $instruction,
+       tool_name: $toolName,
+       tool_args_json: $toolArgsJson,
+       tool_result_excerpt: $excerpt,
+       journal_path: $journalPath,
+       model: $model,
+       tick_id: $tickUuid,
+       embedding: $embedding,
+       confidence: $confidence,
+       goal_id: $goalId
+     })
+     MERGE (t)-[:PRODUCED]->(o)
+     MERGE (o)-[:ABOUT]->(w)
+     WITH o
+     OPTIONAL MATCH (p:Observation {uuid: $parentObs})
+     FOREACH (_ IN CASE WHEN $parentObs IS NOT NULL AND p IS NOT NULL THEN [1] ELSE [] END |
+       MERGE (o)-[:SPAWNED_FROM]->(p)
+     )
+     RETURN o.uuid AS uuid`,
+    {
+      tickUuid,
+      tickNum,
+      wid: HEARTBEAT_WORKSPACE_ID,
+      uuid: observationUuid,
+      text: parsed.observationText,
+      topic: topicLc,
+      instruction: goal.instruction,
+      toolName: '(prior probe)',
+      toolArgsJson,
+      excerpt,
+      journalPath: goal.journalFile ?? '',
+      model,
+      embedding,
+      confidence: parsed.confidence ?? null,
+      goalId: goal.id,
+      parentObs
+    }
+  )
+
+  return {
+    observationUuid,
+    followUpInstructions: parsed.followUps,
+    confidence: parsed.confidence
+  }
+}
+
+async function enqueueFollowUps(
+  parent: HeartbeatGoal,
+  instructions: string[]
+): Promise<HeartbeatGoal[]> {
+  if (instructions.length === 0) return []
+  const remaining = MAX_FOLLOWUPS_PER_PRIMARY - (parent.followUpCount ?? 0)
+  const accept = instructions.slice(0, Math.max(0, remaining))
+  if (accept.length === 0) return []
+  const now = Date.now()
+  const created: HeartbeatGoal[] = accept.map((ins, i) => ({
+    id: `goal_${now}_fu${i}_${rand()}`,
+    title: ins.length > 80 ? ins.slice(0, 79) + '…' : ins,
+    instruction: ins,
+    status: 'queued',
+    createdAt: now,
+    kind: 'follow_up',
+    parentId: parent.id
+  }))
+  goals.push(...created)
+  parent.followUpCount = (parent.followUpCount ?? 0) + created.length
+  await saveGoals()
+  emitGoals()
+  return created
+}
+
+// --- Patch 40: review-tick (cluster surfacing + Pattern synthesis) ---------
+
+interface SynthesisCandidate {
+  seedUuid: string
+  seedTopic: string
+  supportingUuids: string[]
+  distinctTopics: string[]
+}
+
+async function findSynthesisCandidates(): Promise<SynthesisCandidate[]> {
+  try {
+    const rows = await runCypherRaw(
+      'gemma',
+      `MATCH (o:HeartbeatObservation)
+       WHERE o.created_at > datetime() - duration($win)
+         AND o.embedding IS NOT NULL
+       CALL (o) {
+         WITH o
+         CALL db.index.vector.queryNodes('observation_embedding', 6, o.embedding)
+         YIELD node AS n, score
+         WHERE n:HeartbeatObservation
+           AND n.uuid <> o.uuid
+           AND score >= 0.88
+         RETURN collect(DISTINCT n) AS neighbors, collect(DISTINCT n.topic) AS topics
+       }
+       WITH o, neighbors, topics
+       WHERE size(neighbors) >= 3
+         AND size(topics) >= 2
+         AND duration.between(
+               reduce(mn = o.created_at, x IN neighbors |
+                 CASE WHEN x.created_at < mn THEN x.created_at ELSE mn END),
+               datetime()
+             ).hours >= 48
+       CALL (o) {
+         WITH o
+         OPTIONAL CALL db.index.vector.queryNodes('pattern_embedding', 1, o.embedding)
+         YIELD node AS p, score AS pscore
+         RETURN pscore
+       }
+       WITH o, neighbors, topics, pscore
+       WHERE pscore IS NULL OR pscore < 0.90
+       RETURN o.uuid AS seedUuid, o.topic AS seedTopic,
+              [n IN neighbors | n.uuid] AS supportingUuids,
+              topics AS distinctTopics
+       ORDER BY size(supportingUuids) DESC
+       LIMIT 5`,
+      { win: `P${DEDUPE_WINDOW_DAYS}D` }
+    )
+    return rows.map((r) => ({
+      seedUuid: String(r.seedUuid),
+      seedTopic: String(r.seedTopic),
+      supportingUuids: Array.isArray(r.supportingUuids)
+        ? (r.supportingUuids as unknown[]).map((x) => String(x))
+        : [],
+      distinctTopics: Array.isArray(r.distinctTopics)
+        ? (r.distinctTopics as unknown[]).map((x) => String(x))
+        : []
+    }))
+  } catch (e) {
+    console.warn('[heartbeat] findSynthesisCandidates failed:', (e as Error).message)
+    return []
+  }
+}
+
+function reviewSystemPrompt(): string {
+  return [
+    "You are Gemma, an AI assistant running 100% locally on Bear's Mac.",
+    '',
+    'THIS IS A REVIEW TICK. Several recent observations cluster together. Your job: propose ONE :Pattern that synthesizes what they share.',
+    '',
+    'OUTPUT FORMAT (no preamble):',
+    '',
+    'PATTERN:',
+    '<1-3 hypothesis-first sentences. Begin with "Across these observations, the apparent regularity is…" or similar. NEVER claim finality.>',
+    '',
+    'CONFIDENCE: <0.0 - 1.0>'
+  ].join('\n')
+}
+
+function parseReviewOutput(raw: string): { patternText: string; confidence?: number } {
+  const lines = raw.split('\n')
+  const ptn: string[] = []
+  let confidence: number | undefined
+  let mode: 'none' | 'pattern' = 'none'
+  for (const line of lines) {
+    const trimmed = line.trim()
+    if (/^PATTERN\s*:/i.test(trimmed)) {
+      mode = 'pattern'
+      const rest = trimmed.replace(/^PATTERN\s*:/i, '').trim()
+      if (rest) ptn.push(rest)
+      continue
+    }
+    const cm = trimmed.match(/^CONFIDENCE\s*:\s*([\d.]+)/i)
+    if (cm) {
+      mode = 'none'
+      const v = parseFloat(cm[1])
+      if (Number.isFinite(v) && v >= 0 && v <= 1) confidence = v
+      continue
+    }
+    if (mode === 'pattern' && trimmed) ptn.push(trimmed)
+  }
+  return { patternText: ptn.join(' ').trim(), confidence }
+}
+
+async function fetchObservationsForReview(
+  uuids: string[]
+): Promise<Array<{ uuid: string; text: string; topic: string }>> {
+  if (uuids.length === 0) return []
+  const rows = await runCypherRaw(
+    'gemma',
+    `MATCH (o:Observation) WHERE o.uuid IN $uuids
+     RETURN o.uuid AS uuid, o.text AS text, o.topic AS topic`,
+    { uuids }
+  )
+  return rows.map((r) => ({
+    uuid: String(r.uuid),
+    text: String(r.text ?? ''),
+    topic: String(r.topic ?? '')
+  }))
+}
+
+async function runReview(
+  model: string,
+  signal: AbortSignal,
+  tickNum: number
+): Promise<{ status: 'ok' | 'skipped' | 'error'; summary: string }> {
+  const candidates = await findSynthesisCandidates()
+  if (candidates.length === 0) {
+    return { status: 'skipped', summary: 'No synthesis candidates found this review.' }
+  }
+  const winner = candidates[0]
+  const all = await fetchObservationsForReview([winner.seedUuid, ...winner.supportingUuids])
+  if (all.length < 3) {
+    return { status: 'skipped', summary: 'Selected cluster shrank below 3 observations.' }
+  }
+  const messages: MLXChatMessage[] = [
+    { role: 'system', content: reviewSystemPrompt() },
+    {
+      role: 'user',
+      content: [
+        `Cluster of ${all.length} observations across topics [${winner.distinctTopics.join(', ')}]:`,
+        '',
+        ...all.map((o, i) => `(${i + 1}) [topic=${o.topic}] ${o.text}`),
+        '',
+        'Synthesize ONE :Pattern that captures what these observations share.'
+      ].join('\n')
+    }
+  ]
+  const out = await collectStream(model, messages, signal, false)
+  const parsed = parseReviewOutput(out.buffer)
+  if (!parsed.patternText) {
+    return { status: 'error', summary: 'Review tick produced no parseable PATTERN.' }
+  }
+  const embRes = await embedTexts([parsed.patternText], { inputType: 'document' })
+  const embedding = embRes.vectors?.[0]
+  if (!embedding) return { status: 'error', summary: 'embedding failed for pattern' }
+
+  const patternUuid = `ptn_${Date.now()}_${rand()}`
+  const tickUuid = `htick_${Date.now()}_${rand()}`
+  const supportingUuids = all.map((o) => o.uuid)
+
+  try {
+    await runCypher(
+      'gemma',
+      `MERGE (t:HeartbeatTick {uuid: $tickUuid})
+         ON CREATE SET t.created_at = datetime(), t.tick_num = $tickNum, t.kind = 'review'
+       CREATE (p:Pattern {
+         uuid: $uuid,
+         created_at: datetime(),
+         text: $text,
+         embedding: $embedding,
+         confidence: $confidence,
+         evidence_count: $evidenceCount,
+         source: 'heartbeat-review'
+       })
+       MERGE (t)-[:PRODUCED]->(p)
+       WITH p
+       UNWIND $uuids AS u
+       MATCH (o:Observation {uuid: u})
+       MERGE (o)-[:SUPPORTS]->(p)`,
+      {
+        tickUuid,
+        tickNum,
+        uuid: patternUuid,
+        text: parsed.patternText,
+        embedding,
+        confidence: parsed.confidence ?? null,
+        evidenceCount: supportingUuids.length,
+        uuids: supportingUuids
+      }
+    )
+  } catch (e) {
+    return { status: 'error', summary: `Pattern write failed: ${(e as Error).message}` }
+  }
+  return {
+    status: 'ok',
+    summary: `Wrote :Pattern ${patternUuid} from cluster of ${supportingUuids.length} observations.`
+  }
+}
+
 // --- Tick orchestration -----------------------------------------------------
 
+/**
+ * Patch 40: state-machine runTick.
+ *
+ * Each call advances at most ONE step:
+ *   1. Auto-promote queued goals (rate-limited for primaries).
+ *   2. If any goal is in_progress, run its next phase
+ *      (dedupe → probe → consolidate).
+ *   3. Else if review-tick is due, synthesize a :Pattern from recent
+ *      observation clusters.
+ *   4. Else if no queued primaries and there's hourly budget, run a
+ *      plan-tick (which proposes more primaries).
+ *   5. Else idle.
+ *
+ * Hard invariants:
+ *   • dedupe-check is read-only on the KG (no writes; pure embed+cypher).
+ *   • consolidate awaits the voyage embed AND the KG write before
+ *     returning, so the next plan/dedupe sees the just-written observation.
+ *   • follow-up goals don't count against the 7/hour primary cap;
+ *     they're bounded by their parent's 4-cap, applied at enqueue.
+ */
 async function runTick(trigger: 'timer' | 'manual'): Promise<HeartbeatTickResult> {
   if (state.ticking) {
     return { status: 'skipped', error: 'a tick is already running' }
@@ -611,119 +1243,54 @@ async function runTick(trigger: 'timer' | 'manual'): Promise<HeartbeatTickResult
     return { status: 'skipped', error: 'a chat is currently streaming — try again shortly' }
   }
 
-  // Decide the tick type. Never work an un-ratified goal: if goals are
-  // proposed but none are queued, skip until Bear ratifies.
-  const queued = goals.filter((g) => g.status === 'queued')
-  const proposed = goals.filter((g) => g.status === 'proposed')
-  if (queued.length === 0 && proposed.length > 0) {
-    return {
-      status: 'skipped',
-      error: `${proposed.length} goal(s) awaiting your ratification — open the Heartbeat panel to approve them`
-    }
-  }
-
   state.ticking = true
   emitState()
-
   const tickNum = state.tickCount + 1
-  const goal = queued[0] ?? null
-  const label = goal ? goal.title : 'Plan upcoming goals'
   const started = Date.now()
-  emit({ type: 'tick-start', tick: tickNum, objective: label })
-
   const abort = new AbortController()
   const killTimer = setTimeout(() => abort.abort(), TICK_TIMEOUT_MS)
 
   try {
-    let transcript: string
-    let finalText: string
-    let metaLines: string[]
+    await autoPromote()
 
-    if (goal) {
-      // --- WORK TICK ---
-      const notes = await recentNotes(2)
-      const r = await runProbe(
-        model,
-        { label: goal.title, instruction: goal.instruction },
-        notes,
-        abort.signal,
-        (name) => emit({ type: 'tick-tool', tick: tickNum, tool: name })
+    // Prefer to advance an in-progress goal before starting new work.
+    // Follow-ups get priority — they tighten threads, primaries broaden them.
+    const followUpActive = goals.find(
+      (g) => g.status === 'in_progress' && g.phase && g.kind === 'follow_up'
+    )
+    const primaryActive = goals.find(
+      (g) => g.status === 'in_progress' && g.phase && g.kind !== 'follow_up'
+    )
+    const active = followUpActive ?? primaryActive
+
+    if (active) {
+      return await runGoalPhase(active, model, abort.signal, tickNum, trigger, started)
+    }
+
+    const queuedPrimaries = goals.filter(
+      (g) => g.status === 'queued' && (g.kind === 'primary' || !g.kind)
+    )
+    const reviewDue = (state.ticksSinceReview ?? 0) >= REVIEW_EVERY_N_TICKS
+
+    if (reviewDue) {
+      const r = await runReview(model, abort.signal, tickNum)
+      state.ticksSinceReview = 0
+      return await finalizeTick(tickNum, r.status, r.summary)
+    }
+
+    if (queuedPrimaries.length === 0 && canPromotePrimary()) {
+      return await runPlanTick(model, abort.signal, tickNum, trigger, started)
+    }
+
+    if (!canPromotePrimary() && queuedPrimaries.length > 0) {
+      return await finalizeTick(
+        tickNum,
+        'skipped',
+        `Primary budget full (${rollingPrimaryCount()}/${MAX_PRIMARIES_PER_HOUR} this hour) — waiting for ledger to evict.`
       )
-      transcript = r.transcript
-      finalText = r.finalText
-      metaLines = ['- **Type:** work tick', `- **Goal:** ${goal.title}`, `- **Tool:** ${r.toolUsed}`]
-    } else {
-      // --- PLANNING TICK ---
-      const notes = await recentNotes(3)
-      const plan = await runPlanningTurn(model, notes, abort.signal)
-      const seeded = plan.instructions.length === 0
-      const instructions = seeded ? SEED_GOALS : plan.instructions
-      const now0 = Date.now()
-      const fresh: HeartbeatGoal[] = instructions.map((ins, i) => ({
-        id: `goal_${now0}_${i}_${rand()}`,
-        title: ins.length > 80 ? ins.slice(0, 79) + '…' : ins,
-        instruction: ins,
-        status: 'proposed',
-        createdAt: now0
-      }))
-      goals.push(...fresh)
-      await saveGoals()
-      emitGoals()
-      transcript = [
-        seeded
-          ? '_The model proposed no parseable goals — seeded with the default diagnostic goals._'
-          : '_Gemma proposed these goals. They are awaiting Bear’s ratification._',
-        '',
-        '## Proposed goals',
-        '',
-        ...fresh.map((g, i) => `${i + 1}. ${g.instruction}`),
-        '',
-        '## Planning notes',
-        '',
-        plan.rawText || '_(none)_'
-      ].join('\n')
-      finalText = `Proposed ${fresh.length} goal(s) for Bear to ratify.`
-      metaLines = ['- **Type:** planning tick', `- **Proposed:** ${fresh.length} goal(s)`]
     }
 
-    const now = new Date()
-    const fileStamp = stamp(now)
-    const durationS = Math.round((Date.now() - started) / 1000)
-    const journal = [
-      `# Heartbeat Tick #${tickNum} — ${now.toLocaleString()}`,
-      '',
-      `- **Trigger:** ${trigger}`,
-      `- **Model:** ${model}`,
-      ...metaLines,
-      `- **Duration:** ${durationS}s`,
-      '',
-      `## ${label}`,
-      '',
-      transcript,
-      ''
-    ].join('\n')
-
-    const journalName = `tick-${fileStamp}.md`
-    const journalPath = join(await ticksDir(), journalName)
-    await writeFile(journalPath, journal, 'utf-8')
-
-    if (goal) {
-      goal.status = 'done'
-      goal.completedAt = Date.now()
-      goal.journalFile = journalName
-      goal.summary = finalText
-      await saveGoals()
-      emitGoals()
-    }
-
-    state.tickCount = tickNum
-    state.lastTickAt = Date.now()
-    state.lastTickStatus = 'ok'
-    state.lastError = undefined
-    await saveState()
-
-    emit({ type: 'tick-end', tick: tickNum, status: 'ok', journalPath, summary: finalText })
-    return { status: 'ok', journalPath, summary: finalText }
+    return await finalizeTick(tickNum, 'skipped', 'No actionable work this tick.')
   } catch (e) {
     const error = abort.signal.aborted
       ? `tick aborted after ${TICK_TIMEOUT_MS / 1000}s timeout`
@@ -739,6 +1306,224 @@ async function runTick(trigger: 'timer' | 'manual'): Promise<HeartbeatTickResult
     state.ticking = false
     emitState()
   }
+}
+
+// --- Patch 40: per-phase runners --------------------------------------------
+
+async function runGoalPhase(
+  goal: HeartbeatGoal,
+  model: string,
+  signal: AbortSignal,
+  tickNum: number,
+  trigger: 'timer' | 'manual',
+  started: number
+): Promise<HeartbeatTickResult> {
+  const label = `${goal.title} — ${goal.phase}`
+  emit({ type: 'tick-start', tick: tickNum, objective: label })
+
+  if (goal.phase === 'dedupe') {
+    let outcome: DedupeOutcome
+    try {
+      outcome = await runDedupeCheck(goal)
+    } catch {
+      outcome = { classification: 'SPARSE', topScore: 0 }
+    }
+    goal.dedupe = outcome
+    if (outcome.classification === 'COVERED' && outcome.topText) {
+      goal.instruction = `${goal.instruction}\n\n[Prior knowledge — you already wrote: "${outcome.topText.slice(0, 300)}"\nInvestigate an OPEN SUB-QUESTION that goes deeper than what you already know. If nothing remains, briefly say so and do not repeat the prior finding.]`
+    } else if (outcome.classification === 'ADJACENT' && outcome.topText) {
+      goal.instruction = `${goal.instruction}\n\n[Related prior observation: "${outcome.topText.slice(0, 300)}"\nUse this as context but focus on what is NOT yet covered.]`
+    }
+    goal.phase = 'probe'
+    await saveGoals()
+    emitGoals()
+    return await finalizeTick(
+      tickNum,
+      'ok',
+      `Dedupe ${outcome.classification} (top score ${outcome.topScore.toFixed(3)})`
+    )
+  }
+
+  if (goal.phase === 'probe') {
+    const notes = await recentNotes(2)
+    const r = await runProbe(
+      model,
+      { label: goal.title, instruction: goal.instruction },
+      notes,
+      signal,
+      (name) => emit({ type: 'tick-tool', tick: tickNum, tool: name })
+    )
+    const now = new Date()
+    const fileStamp = stamp(now)
+    const durationS = Math.round((Date.now() - started) / 1000)
+    const journal = [
+      `# Heartbeat Tick #${tickNum} — ${now.toLocaleString()}`,
+      '',
+      `- **Trigger:** ${trigger}`,
+      `- **Model:** ${model}`,
+      `- **Type:** probe tick (Patch 40)`,
+      `- **Goal:** ${goal.title} ${goal.kind === 'follow_up' ? '(follow-up)' : ''}`,
+      `- **Tool:** ${r.toolUsed}`,
+      `- **Duration:** ${durationS}s`,
+      '',
+      `## ${goal.title}`,
+      '',
+      r.transcript,
+      ''
+    ].join('\n')
+    const journalName = `tick-${fileStamp}.md`
+    const journalPath = join(await ticksDir(), journalName)
+    await writeFile(journalPath, journal, 'utf-8')
+
+    goal.journalFile = journalName
+    goal.summary = r.finalText
+    if (r.toolErrored) {
+      goal.status = 'done'
+      goal.completedAt = Date.now()
+      goal.phase = undefined
+      await saveGoals()
+      emitGoals()
+      state.ticksSinceReview = (state.ticksSinceReview ?? 0) + 1
+      await saveState()
+      return await finalizeTick(tickNum, 'error', `Probe errored: ${r.finalText}`, journalPath)
+    }
+    goal.phase = 'consolidate'
+    await saveGoals()
+    emitGoals()
+    return await finalizeTick(tickNum, 'ok', r.finalText, journalPath)
+  }
+
+  if (goal.phase === 'consolidate') {
+    let probeBody = ''
+    if (goal.journalFile) {
+      try {
+        probeBody = await readFile(join(await ticksDir(), goal.journalFile), 'utf-8')
+      } catch {
+        probeBody = ''
+      }
+    }
+    let outcome: ConsolidateOutcome
+    try {
+      outcome = await runConsolidate(goal, probeBody, model, signal, tickNum)
+    } catch (e) {
+      goal.status = 'done'
+      goal.completedAt = Date.now()
+      goal.phase = undefined
+      await saveGoals()
+      emitGoals()
+      state.ticksSinceReview = (state.ticksSinceReview ?? 0) + 1
+      await saveState()
+      return await finalizeTick(
+        tickNum,
+        'error',
+        `Consolidate failed: ${(e as Error).message}`
+      )
+    }
+    goal.observationUuid = outcome.observationUuid
+    goal.status = 'done'
+    goal.completedAt = Date.now()
+    goal.phase = undefined
+    await saveGoals()
+    emitGoals()
+
+    let followUpNote = ''
+    if (goal.kind !== 'follow_up' && outcome.followUpInstructions.length > 0) {
+      const created = await enqueueFollowUps(goal, outcome.followUpInstructions)
+      followUpNote = `; enqueued ${created.length} follow-up(s)`
+    }
+    state.ticksSinceReview = (state.ticksSinceReview ?? 0) + 1
+    await saveState()
+    return await finalizeTick(
+      tickNum,
+      'ok',
+      `Wrote observation ${outcome.observationUuid}${followUpNote}.`
+    )
+  }
+
+  return await finalizeTick(tickNum, 'skipped', 'Goal had no phase set.')
+}
+
+async function runPlanTick(
+  model: string,
+  signal: AbortSignal,
+  tickNum: number,
+  trigger: 'timer' | 'manual',
+  started: number
+): Promise<HeartbeatTickResult> {
+  emit({ type: 'tick-start', tick: tickNum, objective: 'Plan upcoming goals' })
+  const notes = await recentNotes(3)
+  const plan = await runPlanningTurn(model, notes, signal)
+  const seeded = plan.instructions.length === 0
+  const instructions = seeded ? SEED_GOALS : plan.instructions
+  const now0 = Date.now()
+  // Patch 40: NEW primaries enter `queued` directly. Auto-promoter handles
+  // the 7/hour cap; no manual ratification step.
+  const fresh: HeartbeatGoal[] = instructions.map((ins, i) => ({
+    id: `goal_${now0}_${i}_${rand()}`,
+    title: ins.length > 80 ? ins.slice(0, 79) + '…' : ins,
+    instruction: ins,
+    status: 'queued',
+    createdAt: now0,
+    kind: 'primary'
+  }))
+  goals.push(...fresh)
+  await saveGoals()
+  emitGoals()
+
+  const now = new Date()
+  const fileStamp = stamp(now)
+  const durationS = Math.round((Date.now() - started) / 1000)
+  const journal = [
+    `# Heartbeat Tick #${tickNum} — ${now.toLocaleString()}`,
+    '',
+    `- **Trigger:** ${trigger}`,
+    `- **Model:** ${model}`,
+    `- **Type:** plan tick (Patch 40)`,
+    `- **Proposed:** ${fresh.length} primary goal(s) (auto-promote at up to ${MAX_PRIMARIES_PER_HOUR}/hour)`,
+    `- **Duration:** ${durationS}s`,
+    '',
+    '## Plan tick',
+    '',
+    seeded
+      ? '_Model produced no parseable goals — seeded with defaults._'
+      : '_Gemma proposed these goals; they auto-promote within the rolling-hour cap._',
+    '',
+    ...fresh.map((g, i) => `${i + 1}. ${g.instruction}`),
+    '',
+    '## Planning notes',
+    '',
+    plan.rawText || '_(none)_',
+    ''
+  ].join('\n')
+  const journalName = `tick-${fileStamp}.md`
+  const journalPath = join(await ticksDir(), journalName)
+  await writeFile(journalPath, journal, 'utf-8')
+
+  state.ticksSinceReview = (state.ticksSinceReview ?? 0) + 1
+  await saveState()
+  return await finalizeTick(tickNum, 'ok', `Proposed ${fresh.length} goal(s).`, journalPath)
+}
+
+async function finalizeTick(
+  tickNum: number,
+  status: 'ok' | 'skipped' | 'error',
+  summary: string,
+  journalPath?: string
+): Promise<HeartbeatTickResult> {
+  state.tickCount = tickNum
+  state.lastTickAt = Date.now()
+  state.lastTickStatus = status
+  state.lastError = status === 'error' ? summary : undefined
+  await saveState()
+  emit({
+    type: 'tick-end',
+    tick: tickNum,
+    status,
+    journalPath,
+    summary,
+    error: status === 'error' ? summary : undefined
+  })
+  return { status, journalPath, summary, error: status === 'error' ? summary : undefined }
 }
 
 // --- Public API -------------------------------------------------------------
