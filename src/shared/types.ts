@@ -189,6 +189,10 @@ export interface HeartbeatGoal {
   followUpCount?: number
   /** Sub-stage when status='in_progress'. */
   phase?: 'dedupe' | 'probe' | 'consolidate'
+  /** Patch 41: tool that ran in the probe phase, preserved for the
+   *  consolidate phase to write the real tool_name on the :HeartbeatObservation
+   *  (previously hardcoded "(prior probe)"). */
+  lastToolUsed?: string
   /** Cached dedupe-check classification, set during the dedupe phase. */
   dedupe?: {
     classification: 'COVERED' | 'ADJACENT' | 'NOVEL' | 'SPARSE'

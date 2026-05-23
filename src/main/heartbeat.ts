@@ -710,9 +710,12 @@ function parentObservationUuid(goal: HeartbeatGoal): string | null {
 }
 
 function normalizeTopic(s: string): string {
+  // Patch 41: keep underscores — tool names like `gemma_kg_schema` are the
+  // common topic-key shape, and stripping them produces unreadable strings
+  // ("gemmakgschema") that no longer match the original tool ids.
   return s
     .toLowerCase()
-    .replace(/[`"'*_~]/g, '')
+    .replace(/[`"'*~]/g, '')
     .replace(/\s+/g, ' ')
     .trim()
     .slice(0, 80)
@@ -965,7 +968,7 @@ async function runConsolidate(
       text: parsed.observationText,
       topic: topicLc,
       instruction: goal.instruction,
-      toolName: '(prior probe)',
+      toolName: goal.lastToolUsed ?? '(unknown)',
       toolArgsJson,
       excerpt,
       journalPath: goal.journalFile ?? '',
@@ -1377,6 +1380,7 @@ async function runGoalPhase(
 
     goal.journalFile = journalName
     goal.summary = r.finalText
+    goal.lastToolUsed = r.toolUsed
     if (r.toolErrored) {
       goal.status = 'done'
       goal.completedAt = Date.now()
