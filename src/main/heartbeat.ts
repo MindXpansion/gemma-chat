@@ -1120,11 +1120,11 @@ async function findSynthesisCandidates(): Promise<SynthesisCandidate[]> {
        WITH o, neighbors, topics
        WHERE size(neighbors) >= 3
          AND size(topics) >= 2
-         AND duration.between(
+         AND duration.inSeconds(
                reduce(mn = o.created_at, x IN neighbors |
                  CASE WHEN x.created_at < mn THEN x.created_at ELSE mn END),
                datetime()
-             ).hours >= $gateHours
+             ).seconds >= $gateHours * 3600
        CALL (o) {
          WITH o
          OPTIONAL CALL db.index.vector.queryNodes('pattern_embedding', 1, o.embedding)
@@ -1173,7 +1173,7 @@ async function reviewDiagnostics(): Promise<{
        WHERE o.created_at > datetime() - duration($win)
        RETURN count(o) AS inWindowObs,
               CASE WHEN count(o) > 0
-                   THEN duration.between(min(o.created_at), datetime()).hours
+                   THEN duration.inSeconds(min(o.created_at), datetime()).seconds / 3600
                    ELSE null END AS oldestAgeHours`,
       { win: `P${DEDUPE_WINDOW_DAYS}D` }
     )
