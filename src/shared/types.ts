@@ -156,6 +156,14 @@ export interface HeartbeatState {
    *  ledger room). cadenceMinutes now acts as the MAX (idle) delay; this
    *  is the floor when she's actively researching. */
   minCadenceSeconds?: number
+  /** Patch 45 (Tier 1.4): ms timestamp of the last SUPERSEDES write. */
+  lastSupersedeAt?: number
+  /** Patch 45: rolling-24h count of SUPERSEDES edges written. Computed
+   *  from supersedeLedger on the fly. */
+  supersedesLast24h?: number
+  /** Patch 45: ring buffer (last 24h) of supersede writes.
+   *  Pattern matches primaryGoalLedger from Patch 40. */
+  supersedeLedger?: Array<{ at: number; newUuid: string; oldUuid: string; kind: string }>
   /** Patch 44: outcome of the last review-tick attempt. Populated on every
    *  call to runReview — including skips (e.g. cluster too young for the
    *  age gate, no parseable pattern). Lets the UI surface "review attempted

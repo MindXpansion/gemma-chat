@@ -127,6 +127,12 @@ export default function Heartbeat() {
 
   const lra = state?.lastReviewAttempt
 
+  // Patch 45 (Tier 1.4): rolling-24h supersede count, refresh-cheap.
+  const supersedes24h = (state?.supersedeLedger ?? []).filter(
+    (e) => now - e.at < 24 * 60 * 60 * 1000
+  ).length
+  const lastSupersedeAt = state?.lastSupersedeAt
+
   return (
     <div className="anim-fade-in flex min-w-0 flex-1 flex-col">
       {/* Title bar */}
@@ -211,6 +217,28 @@ export default function Heartbeat() {
               {rollingPrimaries}/{HOUR_CAP}
             </span>
             <span className="text-ink-400">primaries</span>
+          </div>
+
+          {/* Patch 45 (Tier 1.4): revisions gauge — SUPERSEDES writes in last 24h. */}
+          <div
+            className="flex items-center gap-2 rounded-lg border border-white/10 bg-white/[0.04] px-2.5 py-1 text-[11.5px] text-ink-300"
+            title="Contradictions Gemma flagged in her own observations in the last 24h — auto-SUPERSEDES edges"
+          >
+            <span className="text-ink-400">revisions 24h</span>
+            <span
+              className={`font-mono ${supersedes24h > 0 ? 'text-violet-300' : 'text-ink-400/70'}`}
+            >
+              {supersedes24h}
+            </span>
+            {lastSupersedeAt && (
+              <span className="text-ink-400/70">
+                · last{' '}
+                {new Date(lastSupersedeAt).toLocaleTimeString([], {
+                  hour: '2-digit',
+                  minute: '2-digit'
+                })}
+              </span>
+            )}
           </div>
 
           <div className="ml-auto text-right text-[11.5px] leading-tight text-ink-400">

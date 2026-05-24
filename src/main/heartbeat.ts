@@ -82,6 +82,19 @@ const DEDUPE_CORPUS_FLOOR = 10
 /** Single :Workspace anchor for autonomous-heartbeat observations. */
 const HEARTBEAT_WORKSPACE_ID = 'gemma-home'
 
+// --- Patch 45 tunables (Tier 1.4: contradiction-SUPERSEDES) ---------------
+
+/** Cosine similarity floor for contradiction candidates (top-K prefilter). */
+const SUPERSEDE_CANDIDATE_COSINE = 0.88
+/** Top-K vector neighbors fed to the Gemma judge. */
+const SUPERSEDE_TOP_K = 5
+/** Minimum age gap between new and candidate (avoids same-burst self-supersede). */
+const SUPERSEDE_MIN_AGE_GAP_HOURS = 1
+/** judge_confidence floor required to actually write the SUPERSEDES edge. */
+const SUPERSEDE_JUDGE_CONFIDENCE_FLOOR = 0.6
+/** Hard wall-clock budget for the entire contradiction-check helper. */
+const SUPERSEDE_TIMEOUT_MS = 30_000
+
 /**
  * The offline-safe, $0 tool subset. Every name here resolves to a tool
  * that touches only the local machine — no network, no paid API.
@@ -145,7 +158,9 @@ let state: HeartbeatState = {
   ticking: false,
   primaryGoalLedger: [],
   ticksSinceReview: 0,
-  minCadenceSeconds: MIN_CADENCE_SECONDS_DEFAULT
+  minCadenceSeconds: MIN_CADENCE_SECONDS_DEFAULT,
+  supersedeLedger: [],
+  supersedesLast24h: 0
 }
 let goals: HeartbeatGoal[] = []
 
@@ -172,7 +187,10 @@ async function loadState(): Promise<void> {
       primaryGoalLedger: Array.isArray(p.primaryGoalLedger) ? p.primaryGoalLedger : [],
       ticksSinceReview: typeof p.ticksSinceReview === 'number' ? p.ticksSinceReview : 0,
       minCadenceSeconds: clampMinCadence(p.minCadenceSeconds ?? MIN_CADENCE_SECONDS_DEFAULT),
-      lastReviewAttempt: p.lastReviewAttempt
+      lastReviewAttempt: p.lastReviewAttempt,
+      lastSupersedeAt: p.lastSupersedeAt,
+      supersedeLedger: Array.isArray(p.supersedeLedger) ? p.supersedeLedger : [],
+      supersedesLast24h: typeof p.supersedesLast24h === 'number' ? p.supersedesLast24h : 0
     }
   } catch {
     // no state file yet — first run, defaults stand
@@ -958,6 +976,218 @@ interface ConsolidateOutcome {
   confidence?: number
 }
 
+// --- Patch 45 (Tier 1.4) — contradiction-SUPERSEDES + calibration ----------
+
+/**
+ * Helper invoked at the end of runConsolidate, after the new Observation
+ * has been written. Best-effort: any failure here is swallowed; it must
+ * never fail the parent consolidate that produced a valid Observation.
+ *
+ * Design: research-07-tier1.4-calibration-supersedes.md
+ *
+ * Pre-flight finding (2026-05-24, Bear ratified): the architect's
+ * proposed `topic = N.topic` prefilter is too strict for our live
+ * topic vocabulary (essentially unique-per-observation strings). We
+ * drop it and rely on the cosine ≥ 0.88 floor + age gap + supersede
+ * guard for the candidate set; the judge_confidence ≥ 0.6 fire-gate
+ * is the last line of defense against false positives.
+ */
+async function runContradictionCheck(
+  newUuid: string,
+  newText: string,
+  newEmbedding: number[],
+  tickUuid: string,
+  model: string,
+  signal: AbortSignal
+): Promise<void> {
+  const t0 = Date.now()
+  const timeout = setTimeout(() => {
+    // best-effort; signal abort if the parent allows
+  }, SUPERSEDE_TIMEOUT_MS)
+  try {
+    // 1. Vector prefilter — top-K neighbors, exclude self, exclude already-
+    //    superseded, enforce minimum age gap.
+    const candidates = await runCypherRaw(
+      'gemma',
+      `CALL db.index.vector.queryNodes('observation_embedding', $k, $embedding)
+       YIELD node AS n, score
+       WHERE n:HeartbeatObservation
+         AND n.uuid <> $newUuid
+         AND n.superseded_at IS NULL
+         AND n.created_at < datetime() - duration({hours: $minGapH})
+         AND score >= $minScore
+       RETURN n.uuid AS uuid, n.text AS text, score
+       ORDER BY score DESC
+       LIMIT 3`,
+      {
+        k: SUPERSEDE_TOP_K,
+        embedding: newEmbedding,
+        newUuid,
+        minGapH: SUPERSEDE_MIN_AGE_GAP_HOURS,
+        minScore: SUPERSEDE_CANDIDATE_COSINE
+      }
+    )
+    if (candidates.length === 0) {
+      console.log(
+        `[heartbeat][supersede] tick=${tickUuid} candidates=0 verdict=NONE judge_conf=- fired=false`
+      )
+      return
+    }
+
+    // 2. LLM judgment — single call to the warm Gemma model.
+    const judgePrompt = [
+      'You wrote a new observation. You are now reviewing whether it disagrees',
+      'with one of your earlier observations on the same topic.',
+      '',
+      'NEW OBSERVATION:',
+      `  ${newText}`,
+      '',
+      'EARLIER OBSERVATIONS (most similar first):',
+      ...candidates.map(
+        (c, i) =>
+          `  [${i + 1}] uuid=${c.uuid} (cos=${(c.score as number).toFixed(3)}): ${c.text}`
+      ),
+      '',
+      'If the NEW observation materially disagrees with, refines, or invalidates',
+      'exactly ONE of the earlier ones, respond:',
+      '',
+      '  VERDICT: <CONTRADICTS|REFINES|INVALIDATES>:<uuid-of-that-one>',
+      '  CONFIDENCE: <your confidence 0.0–1.0 that this is a real disagreement>',
+      '  REASON: <one sentence explaining what changed>',
+      '',
+      'If none of them disagree (they are merely related, or they say the same',
+      'thing in different words), respond:',
+      '',
+      '  VERDICT: NONE',
+      '  CONFIDENCE: 1.0',
+      '  REASON: <one sentence; e.g. "Same finding, paraphrased.">',
+      '',
+      'Output nothing else.'
+    ].join('\n')
+    const judgeOut = await collectStream(
+      model,
+      [
+        { role: 'system', content: 'You are a careful judge of whether two observations disagree.' },
+        { role: 'user', content: judgePrompt }
+      ],
+      signal,
+      false
+    )
+    const parsed = parseJudgeOutput(judgeOut.buffer)
+
+    if (parsed.verdict === 'NONE' || !parsed.targetUuid) {
+      console.log(
+        `[heartbeat][supersede] tick=${tickUuid} candidates=${candidates.length} verdict=NONE judge_conf=${parsed.confidence?.toFixed(2) ?? '-'} fired=false`
+      )
+      return
+    }
+
+    if ((parsed.confidence ?? 0) < SUPERSEDE_JUDGE_CONFIDENCE_FLOOR) {
+      console.log(
+        `[heartbeat][supersede] tick=${tickUuid} candidates=${candidates.length} verdict=${parsed.verdict} judge_conf=${parsed.confidence?.toFixed(2)} fired=false (below floor ${SUPERSEDE_JUDGE_CONFIDENCE_FLOOR})`
+      )
+      return
+    }
+
+    // Sanity: target uuid must be one of the candidates we offered.
+    if (!candidates.some((c) => c.uuid === parsed.targetUuid)) {
+      console.warn(
+        `[heartbeat][supersede] tick=${tickUuid} verdict=${parsed.verdict} but uuid ${parsed.targetUuid} not in candidate set — skipping`
+      )
+      return
+    }
+
+    // 3. Write the edge + denormalized markers, idempotent + guarded.
+    await runCypher(
+      'gemma',
+      `MATCH (newO:Observation {uuid: $newUuid})
+       MATCH (oldO:Observation {uuid: $oldUuid})
+       WHERE oldO.superseded_at IS NULL
+       MERGE (newO)-[r:SUPERSEDES]->(oldO)
+       ON CREATE SET
+         r.created_at = datetime(),
+         r.reason = $reason,
+         r.detection_method = 'vector+llm',
+         r.judge_confidence = $judgeConfidence,
+         r.supersede_kind = $kind,
+         r.tick_id = $tickId
+       SET oldO.superseded_at = datetime(),
+           oldO.supersede_count = coalesce(oldO.supersede_count, 0) + 1`,
+      {
+        newUuid,
+        oldUuid: parsed.targetUuid,
+        reason: (parsed.reason ?? '').slice(0, 500),
+        judgeConfidence: parsed.confidence ?? 0,
+        kind: parsed.verdict.toLowerCase(),
+        tickId: tickUuid
+      }
+    )
+
+    // 4. Update in-memory ledger + state. Best-effort persist; runTick's
+    //    finalize will saveState shortly anyway.
+    const now = Date.now()
+    state.lastSupersedeAt = now
+    const ledger = state.supersedeLedger ?? []
+    ledger.push({
+      at: now,
+      newUuid,
+      oldUuid: parsed.targetUuid,
+      kind: parsed.verdict.toLowerCase()
+    })
+    const cutoff = now - 24 * 60 * 60 * 1000
+    state.supersedeLedger = ledger.filter((e) => e.at >= cutoff)
+    state.supersedesLast24h = state.supersedeLedger.length
+
+    const wallMs = Date.now() - t0
+    console.log(
+      `[heartbeat][supersede] tick=${tickUuid} candidates=${candidates.length} verdict=${parsed.verdict} judge_conf=${parsed.confidence?.toFixed(2)} fired=true wall=${wallMs}ms`
+    )
+  } catch (e) {
+    console.warn(`[heartbeat][supersede] check skipped: ${(e as Error).message}`)
+  } finally {
+    clearTimeout(timeout)
+  }
+}
+
+interface JudgeOutput {
+  verdict: 'NONE' | 'CONTRADICTS' | 'REFINES' | 'INVALIDATES'
+  targetUuid?: string
+  confidence?: number
+  reason?: string
+}
+
+function parseJudgeOutput(raw: string): JudgeOutput {
+  // Fail-safe: any parse failure → VERDICT: NONE. Never fire a SUPERSEDES
+  // from garbled output.
+  const out: JudgeOutput = { verdict: 'NONE' }
+  for (const rawLine of raw.split('\n')) {
+    const line = rawLine.trim()
+    const vm = line.match(/^VERDICT\s*:\s*(NONE|CONTRADICTS|REFINES|INVALIDATES)(?::(\S+))?/i)
+    if (vm) {
+      const verb = vm[1].toUpperCase() as JudgeOutput['verdict']
+      out.verdict = verb
+      if (verb !== 'NONE' && vm[2]) out.targetUuid = vm[2]
+      continue
+    }
+    const cm = line.match(/^CONFIDENCE\s*:\s*([\d.]+)/i)
+    if (cm) {
+      const v = parseFloat(cm[1])
+      if (Number.isFinite(v) && v >= 0 && v <= 1) out.confidence = v
+      continue
+    }
+    const rm = line.match(/^REASON\s*:\s*(.+)$/i)
+    if (rm) {
+      out.reason = rm[1].trim()
+      continue
+    }
+  }
+  // If the model returned a non-NONE verdict but no target uuid, fail-safe.
+  if (out.verdict !== 'NONE' && !out.targetUuid) {
+    return { verdict: 'NONE' }
+  }
+  return out
+}
+
 async function runConsolidate(
   goal: HeartbeatGoal,
   probeJournalBody: string,
@@ -1059,6 +1289,10 @@ async function runConsolidate(
       parentObs
     }
   )
+
+  // Patch 45 (Tier 1.4): contradiction-check inline. Best-effort — wrapped
+  // and swallowed; must NEVER fail this consolidate.
+  await runContradictionCheck(observationUuid, parsed.observationText, embedding, tickUuid, model, signal)
 
   return {
     observationUuid,
