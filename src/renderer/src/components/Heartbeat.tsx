@@ -104,7 +104,28 @@ export default function Heartbeat() {
   const enabled = !!state?.enabled
   const proposed = goals.filter((g) => g.status === 'proposed')
   const queued = goals.filter((g) => g.status === 'queued')
+  const inProgress = goals.filter((g) => g.status === 'in_progress')
   const done = goals.filter((g) => g.status === 'done')
+
+  // Patch 44: rolling-60min count of promoted primaries (must match
+  // MAX_PRIMARIES_PER_HOUR in heartbeat.ts).
+  const HOUR_CAP = 7
+  const now = Date.now()
+  const rollingPrimaries = (state?.primaryGoalLedger ?? []).filter(
+    (e) => now - e.promotedAt < 60 * 60 * 1000
+  ).length
+
+  // Group follow-ups under their primary parent for tree rendering.
+  const followUpsByParent = new Map<string, HeartbeatGoal[]>()
+  for (const g of goals) {
+    if (g.kind === 'follow_up' && g.parentId) {
+      const arr = followUpsByParent.get(g.parentId) ?? []
+      arr.push(g)
+      followUpsByParent.set(g.parentId, arr)
+    }
+  }
+
+  const lra = state?.lastReviewAttempt
 
   return (
     <div className="anim-fade-in flex min-w-0 flex-1 flex-col">
@@ -178,6 +199,20 @@ export default function Heartbeat() {
             {ticking ? 'Tick running…' : 'Run a tick now'}
           </button>
 
+          {/* Patch 44: rolling-hour gauge — primaries promoted in the last 60min. */}
+          <div
+            className="flex items-center gap-2 rounded-lg border border-white/10 bg-white/[0.04] px-2.5 py-1 text-[11.5px] text-ink-300"
+            title="Primaries promoted in the last 60 minutes (cap enforces $0/offline-safe pacing)"
+          >
+            <span className="text-ink-400">hour</span>
+            <span
+              className={`font-mono ${rollingPrimaries >= HOUR_CAP ? 'text-amber-300' : 'text-emerald-300'}`}
+            >
+              {rollingPrimaries}/{HOUR_CAP}
+            </span>
+            <span className="text-ink-400">primaries</span>
+          </div>
+
           <div className="ml-auto text-right text-[11.5px] leading-tight text-ink-400">
             <div>
               {state ? `${state.tickCount} tick${state.tickCount === 1 ? '' : 's'} run` : '…'}
@@ -197,6 +232,30 @@ export default function Heartbeat() {
           <div className="mt-2 text-[11.5px] text-amber-300/80">last error: {state.lastError}</div>
         )}
 
+        {/* Patch 44: last review-tick attempt — including silent skips. */}
+        {lra && (
+          <div className="mt-2 text-[11.5px] leading-snug text-ink-400">
+            <span className="text-ink-400/80">last review:</span>{' '}
+            <span
+              className={
+                lra.status === 'ok'
+                  ? 'text-emerald-300/90'
+                  : lra.status === 'error'
+                    ? 'text-amber-300/80'
+                    : 'text-ink-300/80'
+              }
+            >
+              {lra.status}
+            </span>{' '}
+            <span>
+              at {new Date(lra.at).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })} ·{' '}
+              {lra.candidates} candidate{lra.candidates === 1 ? '' : 's'} · in-window {lra.inWindowObs} obs,
+              oldest {lra.oldestAgeHours === null ? '—' : `${lra.oldestAgeHours}h`} (gate {lra.gateHours}h)
+            </span>
+            {lra.reason && <span className="text-ink-400/70"> — {lra.reason}</span>}
+          </div>
+        )}
+
         {live.length > 0 && (
           <div className="mt-3 rounded-lg border border-white/[0.06] bg-black/30 px-3 py-2 font-mono text-[11.5px] text-ink-300">
             {live.map((l, i) => (
@@ -213,9 +272,48 @@ export default function Heartbeat() {
         <div className="mb-2 flex items-center gap-2 text-[10.5px] font-medium uppercase tracking-wider text-ink-400">
           <span>Goals</span>
           <span className="text-ink-400/60">
-            {proposed.length} proposed · {queued.length} queued · {done.length} done
+            {proposed.length > 0 ? `${proposed.length} proposed · ` : ''}
+            {inProgress.length} in-progress · {queued.length} queued · {done.length} done
           </span>
         </div>
+
+        {/* In-progress goals (Patch 40 phase-machine surface). */}
+        {inProgress.length > 0 && (
+          <div className="mb-2 space-y-1">
+            {inProgress.map((g) => {
+              const fups = followUpsByParent.get(g.id) ?? []
+              return (
+                <div key={g.id}>
+                  <div className="flex items-center gap-2 px-1 text-[12px] text-ink-100">
+                    <span className="text-sky-400/90 shimmer-text">●</span>
+                    <span
+                      className="min-w-0 flex-1 truncate"
+                      title={g.instruction}
+                    >
+                      {g.title}
+                    </span>
+                    {g.phase && (
+                      <span className="shrink-0 rounded-md bg-sky-400/15 px-1.5 py-0.5 text-[10.5px] font-medium text-sky-200">
+                        {g.phase}
+                      </span>
+                    )}
+                  </div>
+                  {fups.map((f) => (
+                    <div
+                      key={f.id}
+                      className="ml-5 flex items-center gap-2 px-1 text-[11.5px] text-ink-400"
+                      title={f.instruction}
+                    >
+                      <span className="text-ink-400/60">└─</span>
+                      <span className="min-w-0 flex-1 truncate">{f.title}</span>
+                      <span className="text-[10.5px] text-ink-400/70">{f.status}</span>
+                    </div>
+                  ))}
+                </div>
+              )
+            })}
+          </div>
+        )}
 
         {proposed.length > 0 && (
           <div className="space-y-1.5">
@@ -246,24 +344,56 @@ export default function Heartbeat() {
 
         {queued.length > 0 && (
           <div className={`space-y-1 ${proposed.length > 0 ? 'mt-2' : ''}`}>
-            {queued.map((g) => (
-              <div key={g.id} className="flex items-center gap-2 px-1 text-[12px] text-ink-300">
-                <span className="text-emerald-400/70">▸</span>
-                <span className="min-w-0 flex-1 truncate" title={g.instruction}>
-                  {g.title}
-                </span>
-                <button
-                  onClick={() => ratify(g.id, 'skipped')}
-                  className="text-[11px] text-ink-400 transition hover:text-white"
+            {queued
+              .filter((g) => g.kind !== 'follow_up')
+              .map((g) => {
+                const fups = (followUpsByParent.get(g.id) ?? []).filter(
+                  (f) => f.status === 'queued'
+                )
+                return (
+                  <div key={g.id}>
+                    <div className="flex items-center gap-2 px-1 text-[12px] text-ink-300">
+                      <span className="text-emerald-400/70">▸</span>
+                      <span className="min-w-0 flex-1 truncate" title={g.instruction}>
+                        {g.title}
+                      </span>
+                      <button
+                        onClick={() => ratify(g.id, 'skipped')}
+                        className="text-[11px] text-ink-400 transition hover:text-white"
+                      >
+                        cancel
+                      </button>
+                    </div>
+                    {fups.map((f) => (
+                      <div
+                        key={f.id}
+                        className="ml-5 flex items-center gap-2 px-1 text-[11.5px] text-ink-400"
+                        title={f.instruction}
+                      >
+                        <span className="text-ink-400/60">└─</span>
+                        <span className="min-w-0 flex-1 truncate">{f.title}</span>
+                      </div>
+                    ))}
+                  </div>
+                )
+              })}
+            {/* Orphan queued follow-ups (parent already done) */}
+            {queued
+              .filter((g) => g.kind === 'follow_up' && !goals.some((p) => p.id === g.parentId))
+              .map((g) => (
+                <div
+                  key={g.id}
+                  className="ml-5 flex items-center gap-2 px-1 text-[11.5px] text-ink-400"
+                  title={g.instruction}
                 >
-                  cancel
-                </button>
-              </div>
-            ))}
+                  <span className="text-ink-400/60">└─</span>
+                  <span className="min-w-0 flex-1 truncate">{g.title}</span>
+                </div>
+              ))}
           </div>
         )}
 
-        {proposed.length === 0 && queued.length === 0 && (
+        {proposed.length === 0 && queued.length === 0 && inProgress.length === 0 && (
           <div className="text-[12px] text-ink-400">
             No goals queued. The next tick will be a planning tick — Gemma proposes goals from
             her roadmap, then you approve them here.

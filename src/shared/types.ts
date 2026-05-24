@@ -156,6 +156,20 @@ export interface HeartbeatState {
    *  ledger room). cadenceMinutes now acts as the MAX (idle) delay; this
    *  is the floor when she's actively researching. */
   minCadenceSeconds?: number
+  /** Patch 44: outcome of the last review-tick attempt. Populated on every
+   *  call to runReview — including skips (e.g. cluster too young for the
+   *  age gate, no parseable pattern). Lets the UI surface "review attempted
+   *  but no eligible cluster" instead of silently doing nothing. */
+  lastReviewAttempt?: {
+    at: number
+    status: 'ok' | 'skipped' | 'error'
+    candidates: number
+    inWindowObs: number
+    oldestAgeHours: number | null
+    gateHours: number
+    reason?: string
+    patternUuid?: string
+  }
 }
 
 export interface HeartbeatTickResult {

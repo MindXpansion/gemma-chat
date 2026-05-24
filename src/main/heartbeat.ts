@@ -62,6 +62,13 @@ const MAX_PRIMARIES_PER_HOUR = 7
 const MAX_FOLLOWUPS_PER_PRIMARY = 4
 /** Every Nth tick, attempt a review (synthesis of recent observations). */
 const REVIEW_EVERY_N_TICKS = 20
+/** Patch 44: minimum age (hours) of the oldest observation in a synthesis
+ *  cluster for a review to be eligible. Was 48 (architect's conservative
+ *  default); 12 better matches Gemma's actual tick cadence — at ~2 obs/hour
+ *  she has ample evidence-breadth in 12h, and the OTHER gates (≥3 neighbors
+ *  at ≥0.88 cosine, ≥2 distinct topics) carry the real anti-noise weight.
+ *  Premature patterns are self-corrected by Tier 1.4 auto-SUPERSEDES. */
+const REVIEW_MIN_CLUSTER_AGE_HOURS = 12
 /** Top-K vector neighbors retrieved during a dedupe-check. */
 const DEDUPE_TOP_K = 5
 /** Cosine score above which a topic is COVERED (with topic match). */
@@ -164,7 +171,8 @@ async function loadState(): Promise<void> {
       ticking: false,
       primaryGoalLedger: Array.isArray(p.primaryGoalLedger) ? p.primaryGoalLedger : [],
       ticksSinceReview: typeof p.ticksSinceReview === 'number' ? p.ticksSinceReview : 0,
-      minCadenceSeconds: clampMinCadence(p.minCadenceSeconds ?? MIN_CADENCE_SECONDS_DEFAULT)
+      minCadenceSeconds: clampMinCadence(p.minCadenceSeconds ?? MIN_CADENCE_SECONDS_DEFAULT),
+      lastReviewAttempt: p.lastReviewAttempt
     }
   } catch {
     // no state file yet — first run, defaults stand
@@ -1116,7 +1124,7 @@ async function findSynthesisCandidates(): Promise<SynthesisCandidate[]> {
                reduce(mn = o.created_at, x IN neighbors |
                  CASE WHEN x.created_at < mn THEN x.created_at ELSE mn END),
                datetime()
-             ).hours >= 48
+             ).hours >= $gateHours
        CALL (o) {
          WITH o
          OPTIONAL CALL db.index.vector.queryNodes('pattern_embedding', 1, o.embedding)
@@ -1130,7 +1138,7 @@ async function findSynthesisCandidates(): Promise<SynthesisCandidate[]> {
               topics AS distinctTopics
        ORDER BY size(supportingUuids) DESC
        LIMIT 5`,
-      { win: `P${DEDUPE_WINDOW_DAYS}D` }
+      { win: `P${DEDUPE_WINDOW_DAYS}D`, gateHours: REVIEW_MIN_CLUSTER_AGE_HOURS }
     )
     return rows.map((r) => ({
       seedUuid: String(r.seedUuid),
@@ -1145,6 +1153,40 @@ async function findSynthesisCandidates(): Promise<SynthesisCandidate[]> {
   } catch (e) {
     console.warn('[heartbeat] findSynthesisCandidates failed:', (e as Error).message)
     return []
+  }
+}
+
+/**
+ * Patch 44 — diagnostic probe for the operator surface. Returns the in-window
+ * observation count and the oldest age, independent of the synthesis gates.
+ * Lets the UI explain WHY a review skipped (cluster too young, no obs at all,
+ * etc.) instead of leaving the operator to grep code.
+ */
+async function reviewDiagnostics(): Promise<{
+  inWindowObs: number
+  oldestAgeHours: number | null
+}> {
+  try {
+    const rows = await runCypherRaw(
+      'gemma',
+      `MATCH (o:HeartbeatObservation)
+       WHERE o.created_at > datetime() - duration($win)
+       RETURN count(o) AS inWindowObs,
+              CASE WHEN count(o) > 0
+                   THEN duration.between(min(o.created_at), datetime()).hours
+                   ELSE null END AS oldestAgeHours`,
+      { win: `P${DEDUPE_WINDOW_DAYS}D` }
+    )
+    if (!rows[0]) return { inWindowObs: 0, oldestAgeHours: null }
+    return {
+      inWindowObs: Number(rows[0].inWindowObs) || 0,
+      oldestAgeHours:
+        rows[0].oldestAgeHours === null || rows[0].oldestAgeHours === undefined
+          ? null
+          : Number(rows[0].oldestAgeHours)
+    }
+  } catch {
+    return { inWindowObs: 0, oldestAgeHours: null }
   }
 }
 
@@ -1210,14 +1252,41 @@ async function runReview(
   signal: AbortSignal,
   tickNum: number
 ): Promise<{ status: 'ok' | 'skipped' | 'error'; summary: string }> {
+  const diag = await reviewDiagnostics()
+  const recordAttempt = (
+    status: 'ok' | 'skipped' | 'error',
+    candidates: number,
+    reason?: string,
+    patternUuid?: string
+  ): void => {
+    state.lastReviewAttempt = {
+      at: Date.now(),
+      status,
+      candidates,
+      inWindowObs: diag.inWindowObs,
+      oldestAgeHours: diag.oldestAgeHours,
+      gateHours: REVIEW_MIN_CLUSTER_AGE_HOURS,
+      reason,
+      patternUuid
+    }
+  }
   const candidates = await findSynthesisCandidates()
   if (candidates.length === 0) {
-    return { status: 'skipped', summary: 'No synthesis candidates found this review.' }
+    const reason =
+      diag.inWindowObs === 0
+        ? 'No observations in dedupe window yet.'
+        : diag.oldestAgeHours !== null && diag.oldestAgeHours < REVIEW_MIN_CLUSTER_AGE_HOURS
+          ? `Oldest in-window observation is ${diag.oldestAgeHours}h < ${REVIEW_MIN_CLUSTER_AGE_HOURS}h gate (need cluster maturity).`
+          : `No cluster of ≥3 neighbors at cosine ≥0.88 across ≥2 topics (in-window obs=${diag.inWindowObs}).`
+    recordAttempt('skipped', 0, reason)
+    return { status: 'skipped', summary: reason }
   }
   const winner = candidates[0]
   const all = await fetchObservationsForReview([winner.seedUuid, ...winner.supportingUuids])
   if (all.length < 3) {
-    return { status: 'skipped', summary: 'Selected cluster shrank below 3 observations.' }
+    const reason = 'Selected cluster shrank below 3 observations between match and fetch.'
+    recordAttempt('skipped', candidates.length, reason)
+    return { status: 'skipped', summary: reason }
   }
   const messages: MLXChatMessage[] = [
     { role: 'system', content: reviewSystemPrompt() },
@@ -1235,11 +1304,17 @@ async function runReview(
   const out = await collectStream(model, messages, signal, false)
   const parsed = parseReviewOutput(out.buffer)
   if (!parsed.patternText) {
-    return { status: 'error', summary: 'Review tick produced no parseable PATTERN.' }
+    const reason = 'Review tick produced no parseable PATTERN.'
+    recordAttempt('error', candidates.length, reason)
+    return { status: 'error', summary: reason }
   }
   const embRes = await embedTexts([parsed.patternText], { inputType: 'document' })
   const embedding = embRes.vectors?.[0]
-  if (!embedding) return { status: 'error', summary: 'embedding failed for pattern' }
+  if (!embedding) {
+    const reason = 'embedding failed for pattern'
+    recordAttempt('error', candidates.length, reason)
+    return { status: 'error', summary: reason }
+  }
 
   const patternUuid = `ptn_${Date.now()}_${rand()}`
   const tickUuid = `htick_${Date.now()}_${rand()}`
@@ -1276,12 +1351,13 @@ async function runReview(
       }
     )
   } catch (e) {
-    return { status: 'error', summary: `Pattern write failed: ${(e as Error).message}` }
+    const reason = `Pattern write failed: ${(e as Error).message}`
+    recordAttempt('error', candidates.length, reason)
+    return { status: 'error', summary: reason }
   }
-  return {
-    status: 'ok',
-    summary: `Wrote :Pattern ${patternUuid} from cluster of ${supportingUuids.length} observations.`
-  }
+  const summary = `Wrote :Pattern ${patternUuid} from cluster of ${supportingUuids.length} observations.`
+  recordAttempt('ok', candidates.length, summary, patternUuid)
+  return { status: 'ok', summary }
 }
 
 // --- Tick orchestration -----------------------------------------------------
