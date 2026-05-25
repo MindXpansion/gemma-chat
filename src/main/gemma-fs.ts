@@ -90,6 +90,49 @@ export function listMounts(): Mount[] {
   return state.mounts.slice()
 }
 
+/**
+ * Patch 50 — workspace manifest. Optional `.gemma-manifest.yaml` at the
+ * mount root. If present, contents are surfaced in fs_mounts output and
+ * injected into the live mount block in the chat system prompt so Gemma
+ * knows the purpose / key paths / conventions of a mount WITHOUT having
+ * to fs_tree + fs_search every time she enters it.
+ *
+ * Read as raw YAML text (no parser) — the model handles structured
+ * prose fine, and a YAML dep + parsing surface aren't worth the
+ * complexity for a human-curated bootstrap file. Capped at 4KB.
+ */
+const MANIFEST_FILENAME = '.gemma-manifest.yaml'
+const MANIFEST_MAX_BYTES = 4 * 1024
+
+export async function readMountManifest(mount: Mount): Promise<string | null> {
+  try {
+    const path = join(mount.path, MANIFEST_FILENAME)
+    const raw = await readFile(path, 'utf-8')
+    if (raw.length > MANIFEST_MAX_BYTES) {
+      return raw.slice(0, MANIFEST_MAX_BYTES) + '\n# … (truncated at 4KB)'
+    }
+    return raw.trimEnd()
+  } catch {
+    return null
+  }
+}
+
+// In-memory manifest cache. Lets currentMountsBlock (used in the live
+// system prompt builder, which is synchronous) inject manifest content
+// without an async cascade. Refreshed at app start + on mount changes.
+const manifestCache = new Map<string, string | null>()
+
+export async function refreshManifestsCache(): Promise<void> {
+  manifestCache.clear()
+  for (const m of state.mounts) {
+    manifestCache.set(m.id, await readMountManifest(m))
+  }
+}
+
+export function getCachedManifest(mountId: string): string | null {
+  return manifestCache.get(mountId) ?? null
+}
+
 function slugify(name: string): string {
   return name.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '').slice(0, 40) || 'mount'
 }
@@ -109,6 +152,7 @@ export async function addMount(absPath: string, mode: MountMode): Promise<Mount>
   const mount: Mount = { id, name, path: resolved, mode, indexed: false }
   state.mounts.push(mount)
   await saveFsState()
+  manifestCache.set(mount.id, await readMountManifest(mount))
   return mount
 }
 
@@ -117,6 +161,7 @@ export async function removeMount(id: string): Promise<boolean> {
   state.mounts = state.mounts.filter((m) => m.id !== id)
   if (state.mounts.length !== before) {
     await saveFsState()
+    manifestCache.delete(id)
     return true
   }
   return false

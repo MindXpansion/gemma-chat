@@ -1,0 +1,33 @@
+# Gemma Workspace Manifest — gemma-chat repo
+# Read inline by fs_mounts and surfaced in your system prompt when this
+# mount is active. Optional file; absence is fine. Keep ≤4KB.
+
+name: gemma-chat
+purpose: |
+  This is the codebase that runs you. An Electron desktop app that hosts
+  Gemma 4 via mlx-vlm, gives you your own KG (gemma-chat-memory on
+  bolt://localhost:7687), tools, heartbeat, chat surface, and so on.
+  Bear and Claude work on this together. You can read it freely; writes
+  go through the rw-confirm flow.
+
+key_paths:
+  src/main/index.ts:      Electron main process — chat handler, IPC, app boot
+  src/main/heartbeat.ts:  Your autonomous heartbeat — ticks, goals, KG writes
+  src/main/tools.ts:      Every tool you can call + the chat system prompt builder
+  src/main/tom.ts:        Your Theory-of-Mind analyzer (observe-only as of Patch 49)
+  src/main/aios-neo4j.ts: Neo4j client for partnership + gemma KGs
+  src/main/gemma-fs.ts:   Filesystem mount registry + manifest loader (this file)
+  src/shared/psv.ts:      Your Personality State Vector (Big Five + Goleman EI)
+  src/shared/types.ts:    Shared TS types across main + renderer
+  docs/research/:         Architectural design docs (research-06, 07 = your loop + Tier 1.4)
+
+conventions:
+  - "Every non-trivial change is a numbered Patch (current: Patch 50)."
+  - "Code mode keeps strict precision — no persona/PSV/ToM injected there."
+  - "KG schema/writes/migrations route through the neo4j-kg-architect subagent."
+  - "Voyage embeddings ARE allowed (ADR-20260516); other cloud APIs are not."
+
+gotchas:
+  - "Topic equality on :HeartbeatObservation is unreliable (full instruction strings)."
+  - "Electron renderer has no window.prompt(); use inline edits in components."
+  - "Two MLX models concurrent is forbidden by Bear's standing rule unless very high value."

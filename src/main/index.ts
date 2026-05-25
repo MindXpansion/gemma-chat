@@ -593,6 +593,7 @@ app.whenReady().then(async () => {
     const fs = await import('./gemma-fs')
     await fs.loadFsState()
     await fs.ensureGemmaHome()
+    await fs.refreshManifestsCache()
     console.log(`[gemma-fs] Home ready, ${fs.listMounts().length} mount(s) restored`)
   } catch (e) {
     console.error('[gemma-fs] init failed:', (e as Error).message)

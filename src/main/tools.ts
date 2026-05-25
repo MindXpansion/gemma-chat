@@ -38,6 +38,8 @@ import {
   fsDelete,
   fsBash,
   listMounts,
+  readMountManifest,
+  getCachedManifest,
   setMountIndexed,
   MAX_FILE_BYTES,
   type FsTreeEntry
@@ -759,6 +761,13 @@ async function fsMountsTool(): Promise<string> {
   } else {
     for (const m of mounts) {
       lines.push(`  ${m.id} → ${m.path}  [${m.mode}${m.indexed ? ', indexed' : ''}]`)
+      // Patch 50: inline manifest if the mount has one.
+      const manifest = await readMountManifest(m)
+      if (manifest) {
+        lines.push(`    --- ${m.id}/.gemma-manifest.yaml ---`)
+        for (const ml of manifest.split('\n')) lines.push(`    ${ml}`)
+        lines.push('    --- end manifest ---')
+      }
     }
   }
   return lines.join('\n')
@@ -1562,6 +1571,15 @@ function currentMountsBlock(): string {
   } else {
     for (const m of mounts) {
       lines.push(`- id:${m.id}  →  ${m.path}  [${m.mode}${m.indexed ? ', indexed' : ''}]`)
+      // Patch 50: if the mount has a .gemma-manifest.yaml, surface its
+      // body inline so Gemma has the project's purpose / key paths /
+      // conventions without needing fs_tree + fs_search rounds.
+      const manifest = getCachedManifest(m.id)
+      if (manifest) {
+        lines.push(`  --- ${m.id} manifest ---`)
+        for (const ml of manifest.split('\n')) lines.push(`  ${ml}`)
+        lines.push(`  --- end ${m.id} manifest ---`)
+      }
     }
     lines.push(
       'The `root` argument is the short id on the LEFT (e.g. `' +
