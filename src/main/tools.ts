@@ -43,6 +43,7 @@ import {
   type FsTreeEntry
 } from './gemma-fs'
 import type { ConfirmPayload } from '../shared/types'
+import { personaBlock } from '../shared/psv'
 import {
   runNotebookLM,
   nlmErrorText,
@@ -1674,6 +1675,9 @@ export function chatSystemPrompt(enableTools: boolean): string {
     // teach. Temporal + grounding + partner context still apply.
     return [
       "You are Gemma, an AI assistant running 100% locally on the user's Mac.",
+      '',
+      personaBlock(),
+      '',
       temporalBlock(),
       '',
       groundingPrinciples(),
@@ -1689,6 +1693,9 @@ export function chatSystemPrompt(enableTools: boolean): string {
   }
   return [
     "You are Gemma, an AI assistant running 100% locally on the user's Mac.",
+    '',
+    personaBlock(),
+    '',
     temporalBlock(),
     '',
     groundingPrinciples(),
