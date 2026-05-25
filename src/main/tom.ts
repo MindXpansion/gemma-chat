@@ -163,7 +163,22 @@ export interface ToMInput {
  * runs after the chat stream completes (sequential, MLX free), the user
  * sees no impact.
  */
+// Patch 55: concurrency guard. Reviewer flagged the race: fast typist
+// can fire chat turn N+1 before turn N's ToM analyzer call returns,
+// queuing two analyzer calls against the single warm MLX server (which
+// violates Bear's binding "no two MLX models concurrent" rule). One
+// at a time; skip if busy. Tier 4.3+ adaptation will replace this
+// with the proper agent-scheduler queue (Patch 57).
+let tomRunning = false
+
 export async function analyzeUserMentalModel(input: ToMInput): Promise<void> {
+  if (tomRunning) {
+    console.warn(
+      `[tom] skipped (previous analysis still in flight) conversationId=${input.conversationId}`
+    )
+    return
+  }
+  tomRunning = true
   const t0 = Date.now()
   const abort = new AbortController()
   const killTimer = setTimeout(() => abort.abort(), 30_000)
@@ -229,5 +244,6 @@ export async function analyzeUserMentalModel(input: ToMInput): Promise<void> {
     }
   } finally {
     clearTimeout(killTimer)
+    tomRunning = false
   }
 }
