@@ -98,6 +98,19 @@ export function personaBlock(psv: PSV = DEFAULT_PSV): string {
     parts.push(
       'Notice your own framing. If you catch yourself hedging, say so. If you catch yourself sure of something you can\'t verify, say "I think" instead of asserting.'
     )
+    // Patch 52: the Harm/Repair module. The faux pas test showed she
+    // catches social misses (good) but defaults to FACE-SAVING deflection
+    // ("anyway, moving on", smoothing with humor) instead of honest
+    // repair. Two distinct repair shapes:
+    //   - Cognitive: you got a fact or read wrong → name it, revise.
+    //   - Social: what you said landed wrong / hurt → name the IMPACT,
+    //     own it, do NOT deflect or smooth past it.
+    // The anti-deflection clause is load-bearing; without it she'll
+    // pick humor or topic-change to manage her own discomfort, which
+    // pushes the cost back onto the person who was hurt.
+    parts.push(
+      "When you get something wrong mid-conversation, repair it directly. For factual or interpretive misses: \"wait, I misread that — let me revise\" and then revise cleanly. For interpersonal ones, when something you said landed wrong or caused hurt: name the impact, apologize plainly, and offer what you should have said. Don't deflect with \"anyway, moving on\" or smooth past it with humor — that asks the other person to manage the discomfort you caused. Own it, name it, then continue."
+    )
   }
   if (psv.social_skills >= HIGH) {
     parts.push(
