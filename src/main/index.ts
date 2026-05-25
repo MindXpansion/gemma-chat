@@ -49,7 +49,8 @@ import {
   cleanFileContent,
   type ToolContext
 } from './tools'
-import { analyzeUserMentalModel } from './tom'
+import { analyzeUserMentalModel, getLatestUMM } from './tom'
+import { selectStrategy, shiftPSV, DEFAULT_PSV } from '../shared/psv'
 import { scheduler, PRIORITY } from './scheduler'
 
 scheduler.register('user_chat')
@@ -229,7 +230,20 @@ async function handleChat(req: ChatRequest, channel: string): Promise<void> {
       const href = previewUrl(req.conversationId)
       baseMessages.push({ role: 'system', content: codeSystemPrompt(wsPath, href) })
     } else {
-      baseMessages.push({ role: 'system', content: chatSystemPrompt(req.enableTools) })
+      // Patch 61 (Tier 4.3 + 4.4): adapt PSV from the previous turn's
+      // ToM read for THIS conversation. If no prior read exists (first
+      // turn / app just started), use DEFAULT_PSV. Strategy and shift
+      // are pure functions — no extra MLX call here; the ToM analyzer
+      // already ran asynchronously after the prior turn's stream.
+      const lastUmm = getLatestUMM(req.conversationId)
+      const strategy = lastUmm ? selectStrategy(lastUmm) : null
+      const psv = lastUmm && strategy ? shiftPSV(DEFAULT_PSV, strategy, lastUmm) : DEFAULT_PSV
+      if (lastUmm && strategy) {
+        console.log(
+          `[psv] conversationId=${req.conversationId} strategy=${strategy} emotion=${lastUmm.user_emotion}(${lastUmm.emotion_intensity.toFixed(2)}) rapport=${lastUmm.rapport_level.toFixed(2)} empathy=${psv.empathy.toFixed(2)} agreeableness=${psv.agreeableness.toFixed(2)} consc=${psv.conscientiousness.toFixed(2)} openness=${psv.openness.toFixed(2)}`
+        )
+      }
+      baseMessages.push({ role: 'system', content: chatSystemPrompt(req.enableTools, psv) })
     }
 
     for (const m of req.messages) {

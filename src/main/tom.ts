@@ -181,6 +181,17 @@ export interface ToMInput {
 // with the proper agent-scheduler queue (Patch 57).
 let tomRunning = false
 
+// Patch 61 (Tier 4.3): in-memory cache of the LATEST UserMentalModel
+// per conversation. handleChat reads this at the start of turn N+1 to
+// adapt the PSV for that turn's response generation. Cleared on app
+// restart (acceptable — adaptation starts fresh each session); future
+// Tier 4.5 will persist this to the KG.
+const latestUMMByConversation = new Map<string, UserMentalModel>()
+
+export function getLatestUMM(conversationId: string): UserMentalModel | undefined {
+  return latestUMMByConversation.get(conversationId)
+}
+
 export async function analyzeUserMentalModel(input: ToMInput): Promise<void> {
   if (tomRunning) {
     console.warn(
@@ -220,6 +231,9 @@ export async function analyzeUserMentalModel(input: ToMInput): Promise<void> {
       )
       return
     }
+
+    // Patch 61 (Tier 4.3): cache for next turn's PSV adaptation.
+    latestUMMByConversation.set(input.conversationId, parsed)
 
     // Console summary — one line for quick scanning.
     console.log(

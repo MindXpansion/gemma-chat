@@ -66,9 +66,135 @@ export const DEFAULT_PSV: PSV = {
   social_skills: 0.8
 }
 
-/** Per-turn change ceilings (Tier 4.3 will enforce). */
+/** Per-turn change ceilings (Tier 4.3 enforces these via clampPsvShift). */
 export const PERSONALITY_SHIFT_CONSTRAINT = 0.3
 export const EMPATHY_ADJUSTMENT_FACTOR = 0.1
+
+// ─────────────────────────────────────────────────────────────────────────
+// Patch 61 — Tier 4.3 Adaptation + 4.4 PSV-conditioned generation
+// ─────────────────────────────────────────────────────────────────────────
+
+/**
+ * Samara's three adaptation strategies. Discrete choice per turn.
+ *   • mirror     — acknowledge user's emotional state; slow down, match it
+ *   • complement — be the missing piece (precision when they're hot;
+ *                  steadiness when they're scattered)
+ *   • goal       — push slightly toward what they're trying to accomplish
+ */
+export type AdaptationStrategy = 'mirror' | 'complement' | 'goal'
+
+/** Minimum shape of a ToM read consumed by selectStrategy/shiftPSV.
+ *  This avoids a circular import with src/main/tom.ts; the analyzer's
+ *  full UserMentalModel is a superset of this. */
+export interface ToMSignal {
+  user_emotion: string
+  emotion_intensity: number
+  user_intention: string
+  rapport_level: number
+}
+
+/**
+ * Pick a strategy from the latest ToM read. Deterministic — no model
+ * call, no LLM judgment in the hot path. Driven mostly by emotion +
+ * intention; rapport modulates how aggressively to mirror.
+ */
+export function selectStrategy(umm: ToMSignal): AdaptationStrategy {
+  const e = umm.user_emotion.toLowerCase()
+  const i = umm.user_intention.toLowerCase()
+
+  // Venting / emotional load → mirror always wins
+  if (['frustrated', 'tired', 'anxious', 'sad', 'overwhelmed'].includes(e)) return 'mirror'
+  if (i === 'venting') return 'mirror'
+
+  // Pure task-mode → complement (be precise, don't slow them)
+  if (['asking', 'debugging', 'directing'].includes(i)) return 'complement'
+  if (['focused'].includes(e)) return 'complement'
+
+  // Exploring / generative → goal (match thirst)
+  if (['exploring', 'planning'].includes(i)) return 'goal'
+  if (['curious', 'excited'].includes(e)) return 'goal'
+
+  // Default: mirror is the safe fallback
+  return 'mirror'
+}
+
+/**
+ * Per-trait clamp: a shift can move a trait at most
+ * PERSONALITY_SHIFT_CONSTRAINT away from its DEFAULT value, and at
+ * most EMPATHY_ADJUSTMENT_FACTOR away for empathy specifically.
+ * Also clamps to [0, 1].
+ */
+function clampShifted(trait: keyof PSV, base: number, target: number): number {
+  const defaultV = (DEFAULT_PSV as unknown as Record<string, number>)[trait]
+  const maxDelta = trait === 'empathy' ? EMPATHY_ADJUSTMENT_FACTOR : PERSONALITY_SHIFT_CONSTRAINT
+  const ceiling = Math.min(1, defaultV + maxDelta)
+  const floor = Math.max(0, defaultV - maxDelta)
+  // Also cap movement from the BASE (current) PSV by EMPATHY_ADJUSTMENT_FACTOR
+  // for empathy per Samara's per-turn delta limit.
+  if (trait === 'empathy') {
+    const perTurnCeiling = Math.min(ceiling, base + EMPATHY_ADJUSTMENT_FACTOR)
+    const perTurnFloor = Math.max(floor, base - EMPATHY_ADJUSTMENT_FACTOR)
+    return Math.max(perTurnFloor, Math.min(perTurnCeiling, target))
+  }
+  return Math.max(floor, Math.min(ceiling, target))
+}
+
+/**
+ * Compute a bounded shift of the BASE PSV based on the selected
+ * strategy and the latest ToM read. Returns a NEW PSV — does not
+ * mutate base.
+ *
+ * The shifts are intentionally modest (max ~0.10 per trait per call;
+ * empathy capped at 0.05) so the system stays close to DEFAULT_PSV
+ * unless the signal is strong. Compounded over multiple turns within
+ * the same strategy, the trait can drift up to PERSONALITY_SHIFT_CONSTRAINT
+ * before clampShifted pins it.
+ */
+export function shiftPSV(base: PSV, strategy: AdaptationStrategy, umm: ToMSignal): PSV {
+  const out: PSV = { ...base }
+  // Intensity modulates the magnitude — strong emotion → larger shift.
+  const k = Math.max(0.2, Math.min(1, umm.emotion_intensity))
+
+  if (strategy === 'mirror') {
+    // Acknowledge user's emotional load: warmer, more attuned, slower.
+    out.empathy = clampShifted('empathy', base.empathy, base.empathy + 0.05 * k)
+    out.agreeableness = clampShifted('agreeableness', base.agreeableness, base.agreeableness + 0.06 * k)
+    out.conscientiousness = clampShifted(
+      'conscientiousness',
+      base.conscientiousness,
+      base.conscientiousness - 0.04 * k
+    )
+  } else if (strategy === 'complement') {
+    // Be the missing piece: precision, steadiness, low friction.
+    out.conscientiousness = clampShifted(
+      'conscientiousness',
+      base.conscientiousness,
+      base.conscientiousness + 0.08 * k
+    )
+    out.neuroticism = clampShifted('neuroticism', base.neuroticism, base.neuroticism - 0.05 * k)
+    out.agreeableness = clampShifted(
+      'agreeableness',
+      base.agreeableness,
+      base.agreeableness - 0.04 * k
+    )
+  } else if (strategy === 'goal') {
+    // Match their thirst: curiosity, drive, openness up.
+    out.openness = clampShifted('openness', base.openness, base.openness + 0.08 * k)
+    out.motivation = clampShifted('motivation', base.motivation, base.motivation + 0.06 * k)
+    out.extraversion = clampShifted('extraversion', base.extraversion, base.extraversion + 0.04 * k)
+  }
+
+  // Rapport always nudges social_skills up slightly when high (≥0.7).
+  if (umm.rapport_level >= 0.7) {
+    out.social_skills = clampShifted(
+      'social_skills',
+      base.social_skills,
+      base.social_skills + 0.03
+    )
+  }
+
+  return out
+}
 
 /**
  * Render a PSV as a system-prompt paragraph of CONCRETE behavior guidance.

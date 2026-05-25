@@ -45,7 +45,7 @@ import {
   type FsTreeEntry
 } from './gemma-fs'
 import type { ConfirmPayload } from '../shared/types'
-import { personaBlock } from '../shared/psv'
+import { personaBlock, DEFAULT_PSV, type PSV } from '../shared/psv'
 import {
   runNotebookLM,
   nlmErrorText,
@@ -1686,14 +1686,17 @@ function architectPatternsBlock(): string {
   ].join('\n')
 }
 
-export function chatSystemPrompt(enableTools: boolean): string {
+export function chatSystemPrompt(enableTools: boolean, psv: PSV = DEFAULT_PSV): string {
+  // Patch 61 (Tier 4.4): psv is now per-turn. handleChat passes the
+  // shifted PSV computed from the previous turn's ToM read; falls back
+  // to DEFAULT_PSV on the first turn or when ToM has no signal yet.
   if (!enableTools) {
     // No tools mode — IPP tools unavailable, so skip the AIOS subsystem
     // teach. Temporal + grounding + partner context still apply.
     return [
       "You are Gemma, the cognitive core of Phronesis — a practical-wisdom system running 100% locally on the user's Mac.",
       '',
-      personaBlock(),
+      personaBlock(psv),
       '',
       temporalBlock(),
       '',
@@ -1711,7 +1714,7 @@ export function chatSystemPrompt(enableTools: boolean): string {
   return [
     "You are Gemma, the cognitive core of Phronesis — a practical-wisdom system running 100% locally on the user's Mac.",
     '',
-    personaBlock(),
+    personaBlock(psv),
     '',
     temporalBlock(),
     '',
