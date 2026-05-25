@@ -3,6 +3,7 @@ import { EventEmitter } from 'events'
 import { mkdir, readFile, writeFile, readdir, stat } from 'fs/promises'
 import { join } from 'path'
 import { chatStream, type MLXChatMessage } from './mlx'
+import { scheduler, PRIORITY } from './scheduler'
 import { TOOLS, findNextAction, runTool, type ToolContext, type ParsedAction } from './tools'
 import { ensureGemmaHome } from './gemma-fs'
 import { embedTexts } from './aios-voyage'
@@ -519,27 +520,39 @@ interface StreamOutcome {
 /**
  * Run one streamed model turn. With `untilAction`, returns as soon as a
  * complete <action> appears in the buffer; otherwise drains the whole turn.
+ *
+ * Patch 57: gated through the agent scheduler. `callerId` should describe
+ * which heartbeat sub-phase this is (e.g. 'heartbeat_probe',
+ * 'heartbeat_consolidate', 'heartbeat_review', 'heartbeat_contradiction').
+ * Always priority HEARTBEAT (3) — user_chat (1) and mission (2) beat us.
  */
 async function collectStream(
+  callerId: string,
   model: string,
   messages: MLXChatMessage[],
   signal: AbortSignal,
   untilAction: boolean
 ): Promise<StreamOutcome> {
+  scheduler.register(callerId)
   let buffer = ''
-  for await (const chunk of chatStream({ model, messages, signal, temperature: HEARTBEAT_TEMP })) {
-    if (chunk.content) {
-      buffer += chunk.content
-      if (untilAction) {
-        const found = findNextAction(buffer, 0)
-        if (found && found !== 'incomplete') {
-          return { buffer, action: found }
+  await scheduler.acquire(callerId, PRIORITY.HEARTBEAT)
+  try {
+    for await (const chunk of chatStream({ model, messages, signal, temperature: HEARTBEAT_TEMP })) {
+      if (chunk.content) {
+        buffer += chunk.content
+        if (untilAction) {
+          const found = findNextAction(buffer, 0)
+          if (found && found !== 'incomplete') {
+            return { buffer, action: found }
+          }
         }
       }
+      if (chunk.done) break
     }
-    if (chunk.done) break
+    return { buffer, action: null }
+  } finally {
+    scheduler.release(callerId)
   }
-  return { buffer, action: null }
 }
 
 // --- The probe (one tool + one narration) -----------------------------------
@@ -602,7 +615,7 @@ export async function runProbe(
   ]
 
   // --- ACTION turn: the model emits one tool call ---
-  const a = await collectStream(model, messages, signal, true)
+  const a = await collectStream('heartbeat_probe_action', model, messages, signal, true)
 
   let toolName: string | null
   let toolArgs: Record<string, unknown>
@@ -668,7 +681,7 @@ export async function runProbe(
   messages.push({ role: 'tool', tool_call_id: callId, content: result })
   messages.push({ role: 'user', content: NARRATE_NUDGE })
 
-  const n = await collectStream(model, messages, signal, false)
+  const n = await collectStream('heartbeat_probe_narrate', model, messages, signal, false)
   const narration = n.buffer.trim()
 
   const transcript = [
@@ -720,7 +733,7 @@ async function runPlanningTurn(
       ].join('\n')
     }
   ]
-  const out = await collectStream(model, messages, signal, false)
+  const out = await collectStream('heartbeat_plan', model, messages, signal, false)
   const instructions: string[] = []
   for (const m of out.buffer.matchAll(/^[\s\-*\d.]*GOAL\s*:\s*(.+)$/gim)) {
     const t = m[1].trim()
@@ -1065,6 +1078,7 @@ async function runContradictionCheck(
       'Output nothing else.'
     ].join('\n')
     const judgeOut = await collectStream(
+      'heartbeat_contradiction_judge',
       model,
       [
         { role: 'system', content: 'You are a careful judge of whether two observations disagree.' },
@@ -1222,7 +1236,7 @@ async function runConsolidate(
       ].join('\n')
     }
   ]
-  const out = await collectStream(model, messages, signal, false)
+  const out = await collectStream('heartbeat_consolidate', model, messages, signal, false)
   const parsed = parseConsolidateOutput(out.buffer, followUpBudget)
   if (!parsed.observationText) {
     throw new Error('Consolidate produced no parseable OBSERVATION text.')
@@ -1535,7 +1549,7 @@ async function runReview(
       ].join('\n')
     }
   ]
-  const out = await collectStream(model, messages, signal, false)
+  const out = await collectStream('heartbeat_review', model, messages, signal, false)
   const parsed = parseReviewOutput(out.buffer)
   if (!parsed.patternText) {
     const reason = 'Review tick produced no parseable PATTERN.'

@@ -2,6 +2,9 @@ import { mkdir, writeFile } from 'fs/promises'
 import { join } from 'path'
 import { ensureGemmaHome } from './gemma-fs'
 import { chatStream, type MLXChatMessage } from './mlx'
+import { scheduler, PRIORITY } from './scheduler'
+
+scheduler.register('tom_analyzer')
 
 /**
  * Tier 4.2 (Patch 49) — Theory of Mind analyzer, OBSERVE-ONLY.
@@ -138,10 +141,17 @@ async function collect(
   messages: MLXChatMessage[],
   signal: AbortSignal
 ): Promise<string> {
+  // Patch 57: gate via scheduler (TOM priority = 4 — lowest active).
+  // Queues behind user_chat / mission / heartbeat naturally.
   let buf = ''
-  for await (const chunk of chatStream({ model, messages, signal })) {
-    if (chunk.content) buf += chunk.content
-    if (chunk.done) break
+  await scheduler.acquire('tom_analyzer', PRIORITY.TOM)
+  try {
+    for await (const chunk of chatStream({ model, messages, signal })) {
+      if (chunk.content) buf += chunk.content
+      if (chunk.done) break
+    }
+  } finally {
+    scheduler.release('tom_analyzer')
   }
   return buf
 }

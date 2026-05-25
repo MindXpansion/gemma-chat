@@ -34,6 +34,9 @@ import {
   type ToolContext
 } from './tools'
 import { analyzeUserMentalModel } from './tom'
+import { scheduler, PRIORITY } from './scheduler'
+
+scheduler.register('user_chat')
 import {
   ensureWorkspace,
   startWorkspaceServer,
@@ -317,6 +320,11 @@ async function handleChat(req: ChatRequest, channel: string): Promise<void> {
         }
       }
 
+      // Patch 57: gate MLX access via the scheduler. USER_CHAT is priority 1
+      // (highest); per-round acquire/release lets heartbeat/ToM slip between
+      // tool rounds rather than waiting for the whole multi-round conversation.
+      await scheduler.acquire('user_chat', PRIORITY.USER_CHAT)
+      try {
       streamLoop: for await (const chunk of chatStream({
         model: req.model,
         messages: baseMessages,
@@ -507,6 +515,9 @@ async function handleChat(req: ChatRequest, channel: string): Promise<void> {
         if (chunk.done) {
           break streamLoop
         }
+      }
+      } finally {
+        scheduler.release('user_chat')
       }
 
       if (!executedAction) {

@@ -4,6 +4,9 @@ import { join } from 'path'
 import { chatStream, type MLXChatMessage } from './mlx'
 import { HEARTBEAT_TOOLS, runProbe, ticksDir, stamp, researchDir } from './heartbeat'
 import type { Mission, MissionStep, MissionEvent } from '../shared/types'
+import { scheduler, PRIORITY } from './scheduler'
+
+scheduler.register('mission_decompose')
 
 /**
  * Patch 35 — Mission Mode (Layer 1: the engine).
@@ -133,10 +136,16 @@ async function decompose(
       content: `MISSION OBJECTIVE:\n${objective}\n\nBreak it into steps now — only STEP: lines.`
     }
   ]
+  // Patch 57: gate via scheduler (MISSION priority = 2).
   let buffer = ''
-  for await (const chunk of chatStream({ model, messages, signal, temperature: DECOMPOSE_TEMP })) {
-    if (chunk.content) buffer += chunk.content
-    if (chunk.done) break
+  await scheduler.acquire('mission_decompose', PRIORITY.MISSION)
+  try {
+    for await (const chunk of chatStream({ model, messages, signal, temperature: DECOMPOSE_TEMP })) {
+      if (chunk.content) buffer += chunk.content
+      if (chunk.done) break
+    }
+  } finally {
+    scheduler.release('mission_decompose')
   }
   const steps: string[] = []
   for (const m of buffer.matchAll(/^[\s\-*\d.]*STEP\s*:\s*(.+)$/gim)) {
