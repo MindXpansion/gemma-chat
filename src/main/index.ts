@@ -11,6 +11,22 @@ process.stderr.on('error', (err: NodeJS.ErrnoException) => {
   throw err
 })
 
+// Patch 58.1: set name as early as possible — before app.whenReady, before
+// any other initialization — so macOS menu / dock / About dialog all see
+// "Phronesis". In packaged builds the .app's Info.plist (CFBundleName from
+// electron-builder.yml productName) governs the leftmost menu item; in dev
+// mode (running unpackaged Electron.app) that bundle says "Electron" and
+// the JS-side override has limited effect on the leftmost menu LABEL —
+// but role:about/hide/quit items still get "Phronesis" correctly.
+//
+// ORDER MATTERS: cache the userData path BEFORE setName, then re-pin it
+// via setPath in whenReady. Otherwise userData would resolve to ~/Library/
+// Application Support/Phronesis/ (the new name) and all existing data
+// (heartbeat state, FS mounts, conversations) would be invisible.
+const __preservedUserDataPath = app.getPath('userData')
+process.title = 'Phronesis'
+app.setName('Phronesis')
+
 import { join } from 'path'
 import { electronApp, optimizer, is } from '@electron-toolkit/utils'
 import { AVAILABLE_MODELS } from '@shared/types'
@@ -584,16 +600,11 @@ const chatAbortControllers = new Map<string, AbortController>()
 const pendingConfirms = new Map<string, (approved: boolean) => void>()
 
 app.whenReady().then(async () => {
-  // Patch 58: Phronesis branding. Display rename ONLY — preserve the
-  // userData path so heartbeat-state.json, gemma-fs-state.json,
-  // conversations, etc. all keep working from the same on-disk location
-  // (~/Library/Application Support/gemma-chat on macOS).
-  // ORDER MATTERS: capture the default userData path BEFORE setName,
-  // then re-pin it after — otherwise Electron would resolve userData
-  // against the new name and the existing data would be invisible.
-  const preservedUserData = app.getPath('userData')
-  app.setName('Phronesis')
-  app.setPath('userData', preservedUserData)
+  // Patch 58.1: setName + process.title now run at module load (see top
+  // of file). Here we just re-pin userData to the path captured BEFORE
+  // setName so existing app data (~/Library/Application Support/gemma-chat
+  // on macOS) keeps working.
+  app.setPath('userData', __preservedUserDataPath)
 
   // Custom macOS application menu — role:'about'/'hide'/'quit' read
   // app.name(), so after setName('Phronesis') they automatically say
