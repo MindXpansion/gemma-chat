@@ -303,3 +303,70 @@ textarea,
 .anim-stagger > *:nth-child(4) { animation-delay: 120ms; }
 .anim-stagger > *:nth-child(5) { animation-delay: 160ms; }
 .anim-stagger > *:nth-child(6) { animation-delay: 200ms; }
+
+/* ─────────────────────────────────────────────────────────────────────────
+ * Patch 59 — Neon crimson chasing glow.
+ *
+ * Active on the composer (.phron-glow) while Phronesis is thinking/
+ * generating/tool-calling. Two layers:
+ *   1. A soft outer halo (box-shadow) signals "she's working" at a glance.
+ *   2. A pseudo-element drawn at the same border-radius, painted with a
+ *      conic-gradient that has crimson concentrated at one angular wedge.
+ *      Rotating the gradient → the wedge appears to chase itself around
+ *      the perimeter.
+ * The mask carves out the interior so only the rim is visible. The whole
+ * effect is invisible when .phron-glow-active is not set.
+ * ───────────────────────────────────────────────────────────────────────── */
+
+@property --phron-glow-angle {
+  syntax: '<angle>';
+  initial-value: 0deg;
+  inherits: false;
+}
+
+@keyframes phron-glow-chase {
+  to {
+    --phron-glow-angle: 360deg;
+  }
+}
+
+.phron-glow {
+  position: relative;
+  transition: box-shadow 280ms ease-out;
+}
+
+.phron-glow::before {
+  content: '';
+  position: absolute;
+  inset: 0;
+  border-radius: inherit;
+  padding: 1.5px;                  /* effective border thickness */
+  background: conic-gradient(
+    from var(--phron-glow-angle),
+    transparent 0deg,
+    transparent 280deg,
+    rgba(220, 38, 38, 0.85) 320deg,
+    rgba(255, 60, 60, 1) 340deg,
+    rgba(220, 38, 38, 0.85) 360deg
+  );
+  /* Mask the interior so only the ring shows */
+  -webkit-mask: linear-gradient(#000 0 0) content-box, linear-gradient(#000 0 0);
+  -webkit-mask-composite: xor;
+          mask: linear-gradient(#000 0 0) content-box, linear-gradient(#000 0 0);
+          mask-composite: exclude;
+  opacity: 0;
+  transition: opacity 280ms ease-out;
+  pointer-events: none;
+}
+
+.phron-glow-active {
+  box-shadow:
+    0 0 0 1px rgba(220, 38, 38, 0.22),
+    0 0 24px rgba(220, 38, 38, 0.20),
+    0 0 56px rgba(220, 38, 38, 0.10);
+}
+
+.phron-glow-active::before {
+  opacity: 1;
+  animation: phron-glow-chase 2.4s linear infinite;
+}

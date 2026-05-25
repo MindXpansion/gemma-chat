@@ -236,11 +236,11 @@ export default function Composer({
           </div>
         )}
         <div
-          className={`flex items-end gap-2 rounded-2xl border bg-white/[0.03] p-2 shadow-lg shadow-black/40 transition ${
+          className={`phron-glow flex items-end gap-2 rounded-2xl border bg-white/[0.03] p-2 shadow-lg shadow-black/40 transition ${
             isDragging
               ? 'border-white/40 bg-white/[0.06]'
               : 'border-white/10 focus-within:border-white/20'
-          }`}
+          } ${streaming ? 'phron-glow-active' : ''}`}
         >
           <MicButton
             state={recState}
