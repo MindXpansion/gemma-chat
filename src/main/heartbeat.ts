@@ -45,14 +45,14 @@ import type {
 const HEARTBEAT_TEMP = 0.7
 /** A runaway tick is aborted after this long. */
 const TICK_TIMEOUT_MS = 6 * 60 * 1000
-const MIN_CADENCE_MIN = 5
-const MAX_CADENCE_MIN = 720
-const DEFAULT_CADENCE_MIN = 30
+const MIN_CADENCE_MINUTES = 5
+const MAX_CADENCE_MINUTES = 720
+const DEFAULT_CADENCE_MINUTES = 30
 
 // Patch 43 — adaptive cadence floors/defaults.
-const MIN_CADENCE_SECONDS_DEFAULT = 30
-const MIN_CADENCE_SECONDS_FLOOR = 10
-const MIN_CADENCE_SECONDS_CEIL = 300
+const MIN_CADENCE_BETWEEN_TICKS_SECONDS = 30
+const MIN_CADENCE_BETWEEN_TICKS_FLOOR_SECONDS = 10
+const MIN_CADENCE_BETWEEN_TICKS_CEIL_SECONDS = 300
 
 // --- Patch 40 tunables (heartbeat learning loop) ---------------------------
 
@@ -153,12 +153,12 @@ export { heartbeatEvents }
 
 let state: HeartbeatState = {
   enabled: false,
-  cadenceMinutes: DEFAULT_CADENCE_MIN,
+  cadenceMinutes: DEFAULT_CADENCE_MINUTES,
   tickCount: 0,
   ticking: false,
   primaryGoalLedger: [],
   ticksSinceReview: 0,
-  minCadenceSeconds: MIN_CADENCE_SECONDS_DEFAULT,
+  minCadenceSeconds: MIN_CADENCE_BETWEEN_TICKS_SECONDS,
   supersedeLedger: [],
   supersedesLast24h: 0
 }
@@ -178,7 +178,7 @@ async function loadState(): Promise<void> {
     const p = JSON.parse(raw) as Partial<HeartbeatState>
     state = {
       enabled: !!p.enabled,
-      cadenceMinutes: clampCadence(p.cadenceMinutes ?? DEFAULT_CADENCE_MIN),
+      cadenceMinutes: clampCadence(p.cadenceMinutes ?? DEFAULT_CADENCE_MINUTES),
       tickCount: typeof p.tickCount === 'number' ? p.tickCount : 0,
       lastTickAt: p.lastTickAt,
       lastTickStatus: p.lastTickStatus,
@@ -186,7 +186,7 @@ async function loadState(): Promise<void> {
       ticking: false,
       primaryGoalLedger: Array.isArray(p.primaryGoalLedger) ? p.primaryGoalLedger : [],
       ticksSinceReview: typeof p.ticksSinceReview === 'number' ? p.ticksSinceReview : 0,
-      minCadenceSeconds: clampMinCadence(p.minCadenceSeconds ?? MIN_CADENCE_SECONDS_DEFAULT),
+      minCadenceSeconds: clampMinCadence(p.minCadenceSeconds ?? MIN_CADENCE_BETWEEN_TICKS_SECONDS),
       lastReviewAttempt: p.lastReviewAttempt,
       lastSupersedeAt: p.lastSupersedeAt,
       supersedeLedger: Array.isArray(p.supersedeLedger) ? p.supersedeLedger : [],
@@ -208,13 +208,13 @@ async function saveState(): Promise<void> {
 }
 
 function clampCadence(min: number): number {
-  if (!Number.isFinite(min)) return DEFAULT_CADENCE_MIN
-  return Math.max(MIN_CADENCE_MIN, Math.min(MAX_CADENCE_MIN, Math.round(min)))
+  if (!Number.isFinite(min)) return DEFAULT_CADENCE_MINUTES
+  return Math.max(MIN_CADENCE_MINUTES, Math.min(MAX_CADENCE_MINUTES, Math.round(min)))
 }
 
 function clampMinCadence(sec: number): number {
-  if (!Number.isFinite(sec)) return MIN_CADENCE_SECONDS_DEFAULT
-  return Math.max(MIN_CADENCE_SECONDS_FLOOR, Math.min(MIN_CADENCE_SECONDS_CEIL, Math.round(sec)))
+  if (!Number.isFinite(sec)) return MIN_CADENCE_BETWEEN_TICKS_SECONDS
+  return Math.max(MIN_CADENCE_BETWEEN_TICKS_FLOOR_SECONDS, Math.min(MIN_CADENCE_BETWEEN_TICKS_CEIL_SECONDS, Math.round(sec)))
 }
 
 function snapshot(): HeartbeatState {
@@ -313,7 +313,7 @@ export async function setGoalStatus(
  * there's nothing to do.
  */
 function computeNextDelayMs(): number {
-  const minMs = (state.minCadenceSeconds ?? MIN_CADENCE_SECONDS_DEFAULT) * 1000
+  const minMs = (state.minCadenceSeconds ?? MIN_CADENCE_BETWEEN_TICKS_SECONDS) * 1000
   const maxMs = state.cadenceMinutes * 60_000
 
   const inProgress = goals.some((g) => g.status === 'in_progress' && g.phase)
