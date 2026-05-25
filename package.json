@@ -1,7 +1,8 @@
 {
   "name": "gemma-chat",
+  "productName": "Phronesis",
   "version": "0.1.0",
-  "description": "Local AI chat on your Mac, powered by Gemma 3",
+  "description": "Phronesis — local practical-wisdom system powered by Gemma 4 on your Mac",
   "main": "./out/main/index.js",
   "author": "Ammaar",
   "license": "MIT",

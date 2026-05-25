@@ -1691,7 +1691,7 @@ export function chatSystemPrompt(enableTools: boolean): string {
     // No tools mode — IPP tools unavailable, so skip the AIOS subsystem
     // teach. Temporal + grounding + partner context still apply.
     return [
-      "You are Gemma, an AI assistant running 100% locally on the user's Mac.",
+      "You are Gemma, the cognitive core of Phronesis — a practical-wisdom system running 100% locally on the user's Mac.",
       '',
       personaBlock(),
       '',
@@ -1709,7 +1709,7 @@ export function chatSystemPrompt(enableTools: boolean): string {
     ].join('\n')
   }
   return [
-    "You are Gemma, an AI assistant running 100% locally on the user's Mac.",
+    "You are Gemma, the cognitive core of Phronesis — a practical-wisdom system running 100% locally on the user's Mac.",
     '',
     personaBlock(),
     '',

@@ -1,4 +1,4 @@
-import { app, shell, BrowserWindow, ipcMain, nativeTheme, session, nativeImage, dialog } from 'electron'
+import { app, shell, BrowserWindow, ipcMain, nativeTheme, session, nativeImage, dialog, Menu } from 'electron'
 // EPIPE guard — Electron main can lose stdout to a closed pipe at startup,
 // which turns the first console.log into an uncaught exception that crashes the app.
 // See locateMLX() in ./mlx for the first call that surfaces this.
@@ -584,6 +584,43 @@ const chatAbortControllers = new Map<string, AbortController>()
 const pendingConfirms = new Map<string, (approved: boolean) => void>()
 
 app.whenReady().then(async () => {
+  // Patch 58: Phronesis branding. Display rename ONLY — preserve the
+  // userData path so heartbeat-state.json, gemma-fs-state.json,
+  // conversations, etc. all keep working from the same on-disk location
+  // (~/Library/Application Support/gemma-chat on macOS).
+  // ORDER MATTERS: capture the default userData path BEFORE setName,
+  // then re-pin it after — otherwise Electron would resolve userData
+  // against the new name and the existing data would be invisible.
+  const preservedUserData = app.getPath('userData')
+  app.setName('Phronesis')
+  app.setPath('userData', preservedUserData)
+
+  // Custom macOS application menu — role:'about'/'hide'/'quit' read
+  // app.name(), so after setName('Phronesis') they automatically say
+  // "About Phronesis", "Hide Phronesis", "Quit Phronesis".
+  if (process.platform === 'darwin') {
+    const template: Electron.MenuItemConstructorOptions[] = [
+      {
+        label: 'Phronesis',
+        submenu: [
+          { role: 'about' },
+          { type: 'separator' },
+          { role: 'services' },
+          { type: 'separator' },
+          { role: 'hide' },
+          { role: 'hideOthers' },
+          { role: 'unhide' },
+          { type: 'separator' },
+          { role: 'quit' }
+        ]
+      },
+      { role: 'editMenu' },
+      { role: 'viewMenu' },
+      { role: 'windowMenu' }
+    ]
+    Menu.setApplicationMenu(Menu.buildFromTemplate(template))
+  }
+
   electronApp.setAppUserModelId('com.ammaar.gemmachat')
   nativeTheme.themeSource = 'dark'
 

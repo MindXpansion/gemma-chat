@@ -349,7 +349,7 @@ export default function Chat({ model, onSwitchModel }: Props) {
             placeholder={
               activeConversation.mode === 'code'
                 ? 'Describe what to build — a webpage, component, or script…'
-                : 'Message Gemma…'
+                : 'Message Phronesis…'
             }
           />
         </div>

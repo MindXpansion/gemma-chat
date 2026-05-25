@@ -264,7 +264,7 @@ export default function Composer({
                 ? 'Listening…'
                 : recState === 'transcribing'
                   ? 'Transcribing…'
-                  : (placeholder ?? 'Message Gemma…')
+                  : (placeholder ?? 'Message Phronesis…')
             }
             rows={1}
             disabled={disabled || recState !== 'idle'}

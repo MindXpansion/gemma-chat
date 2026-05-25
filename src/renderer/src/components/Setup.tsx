@@ -106,7 +106,7 @@ export default function Setup({ status, model, onModelChange, onStart }: Props) 
               <div className="font-medium">Download appears stuck</div>
               <div className="mt-1 text-red-300/80">
                 No progress signal in over 90 seconds. The HuggingFace download or MLX
-                runtime is most likely hung. Quit Gemma Chat (⌘Q) and reopen — your
+                runtime is most likely hung. Quit Phronesis (⌘Q) and reopen — your
                 progress so far is saved.
               </div>
             </div>
@@ -147,9 +147,9 @@ function WelcomeScreen({
         <div className="no-drag w-full max-w-md">
           <div className="anim-fade-up mb-8 text-center">
             <GemmaLogo className="mx-auto mb-5 h-24 w-24" />
-            <h1 className="text-[26px] font-semibold tracking-tight">Welcome to Gemma Chat</h1>
+            <h1 className="text-[26px] font-semibold tracking-tight">Welcome to Phronesis</h1>
             <p className="mt-2 text-[13.5px] leading-relaxed text-ink-400">
-              A local AI assistant, powered by Google's Gemma 4.
+              A local AI assistant — Gemma 4 inside Phronesis, the practical-wisdom system.
               <br />
               Runs 100% on your Mac. No account, no cloud.
             </p>
