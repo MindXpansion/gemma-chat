@@ -33,6 +33,7 @@ import {
   cleanFileContent,
   type ToolContext
 } from './tools'
+import { analyzeUserMentalModel } from './tom'
 import {
   ensureWorkspace,
   startWorkspaceServer,
@@ -544,6 +545,25 @@ async function handleChat(req: ChatRequest, channel: string): Promise<void> {
     }
   } finally {
     chatAbortControllers.delete(req.conversationId)
+    // Patch 49 (Tier 4.2): fire ToM analysis on the user's latest message.
+    // Chat mode only — code mode is precision-focused, no persona/PSV/ToM.
+    // Sequential after the stream (MLX now free), fire-and-forget. Best-
+    // effort: any error is swallowed inside analyzeUserMentalModel.
+    if (req.mode === 'chat') {
+      const lastUser = [...req.messages].reverse().find((m) => m.role === 'user')
+      if (lastUser?.content) {
+        const recentContext = req.messages
+          .slice(-7, -1)
+          .filter((m) => m.role === 'user' || m.role === 'assistant')
+          .map((m) => ({ role: m.role as 'user' | 'assistant', content: m.content }))
+        void analyzeUserMentalModel({
+          conversationId: req.conversationId,
+          model: req.model,
+          userMessage: lastUser.content,
+          recentContext
+        })
+      }
+    }
   }
 }
 
