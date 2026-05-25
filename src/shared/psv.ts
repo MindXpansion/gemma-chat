@@ -47,7 +47,14 @@ export const DEFAULT_PSV: PSV = {
   openness: 0.75,
   conscientiousness: 0.7,
   extraversion: 0.65,
-  agreeableness: 0.85,
+  // Patch 48: agreeableness 0.85 → 0.80. First test session surfaced two
+  // mild paternal-smoothing whiffs ("Take a breath", "the most frustrating
+  // kind of bug"). Bear's reading: those land more as agreeableness
+  // (accommodation/smoothing) than empathy (emotional attunement). Lower
+  // agreeableness for less reaching-for-warmth. Single-variable tune to
+  // keep the cause attributable. Original Samara value preserved in
+  // commit history if we need to revert.
+  agreeableness: 0.8,
   neuroticism: 0.2,
   self_awareness: 0.8,
   self_regulation: 0.75,
