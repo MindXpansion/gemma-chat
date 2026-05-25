@@ -49,8 +49,9 @@ import {
   cleanFileContent,
   type ToolContext
 } from './tools'
-import { analyzeUserMentalModel, getLatestUMM } from './tom'
+import { analyzeUserMentalModel, getLatestUMM, getLatestUMMUuid } from './tom'
 import { selectStrategy, shiftPSV, DEFAULT_PSV } from '../shared/psv'
+import { writePSVState, upsertConversationState } from './conversation-state'
 import { scheduler, PRIORITY } from './scheduler'
 
 scheduler.register('user_chat')
@@ -242,6 +243,24 @@ async function handleChat(req: ChatRequest, channel: string): Promise<void> {
         console.log(
           `[psv] conversationId=${req.conversationId} strategy=${strategy} emotion=${lastUmm.user_emotion}(${lastUmm.emotion_intensity.toFixed(2)}) rapport=${lastUmm.rapport_level.toFixed(2)} empathy=${psv.empathy.toFixed(2)} agreeableness=${psv.agreeableness.toFixed(2)} consc=${psv.conscientiousness.toFixed(2)} openness=${psv.openness.toFixed(2)}`
         )
+        // Patch 62 (Tier 4.5): persist this shift + roll up the conversation
+        // hub. Fire-and-forget — the chat stream below must not wait on KG.
+        // Skips cleanly when the prior turn's KG write failed (no uuid cached).
+        const ummUuid = getLatestUMMUuid(req.conversationId)
+        if (ummUuid) {
+          void (async () => {
+            try {
+              await writePSVState(psv, strategy, ummUuid, req.conversationId)
+              await upsertConversationState(req.conversationId, {
+                current_strategy: strategy,
+                last_user_emotion: lastUmm.user_emotion,
+                rapport_observation: lastUmm.rapport_level
+              })
+            } catch (e) {
+              console.warn(`[psv] kg-write failed conversationId=${req.conversationId}: ${(e as Error).message}`)
+            }
+          })()
+        }
       }
       baseMessages.push({ role: 'system', content: chatSystemPrompt(req.enableTools, psv) })
     }

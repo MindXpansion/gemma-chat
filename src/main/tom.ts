@@ -183,13 +183,20 @@ let tomRunning = false
 
 // Patch 61 (Tier 4.3): in-memory cache of the LATEST UserMentalModel
 // per conversation. handleChat reads this at the start of turn N+1 to
-// adapt the PSV for that turn's response generation. Cleared on app
-// restart (acceptable — adaptation starts fresh each session); future
-// Tier 4.5 will persist this to the KG.
+// adapt the PSV for that turn's response generation.
+//
+// Patch 62 (Tier 4.5) adds a parallel cache of the KG :UserMentalModel.uuid
+// so the next-turn writePSVState can [:DROVE_SHIFT]->(psv) without a graph
+// re-lookup. KG is the source of truth on disk; these maps are hot-path cache.
 const latestUMMByConversation = new Map<string, UserMentalModel>()
+const latestUMMUuidByConversation = new Map<string, string>()
 
 export function getLatestUMM(conversationId: string): UserMentalModel | undefined {
   return latestUMMByConversation.get(conversationId)
+}
+
+export function getLatestUMMUuid(conversationId: string): string | undefined {
+  return latestUMMUuidByConversation.get(conversationId)
 }
 
 export async function analyzeUserMentalModel(input: ToMInput): Promise<void> {
@@ -234,6 +241,17 @@ export async function analyzeUserMentalModel(input: ToMInput): Promise<void> {
 
     // Patch 61 (Tier 4.3): cache for next turn's PSV adaptation.
     latestUMMByConversation.set(input.conversationId, parsed)
+
+    // Patch 62 (Tier 4.5): persist to gemma-chat-memory KG. Best-effort —
+    // failure must NOT break ToM caching/journaling above. If the write
+    // fails we'll just lack a [:DROVE_SHIFT] edge for the next PSVState.
+    try {
+      const { writeUserMentalModel } = await import('./conversation-state')
+      const { uuid } = await writeUserMentalModel(parsed, input.conversationId, input.userMessage)
+      latestUMMUuidByConversation.set(input.conversationId, uuid)
+    } catch (e) {
+      console.warn(`[tom] kg-write failed conversationId=${input.conversationId}: ${(e as Error).message}`)
+    }
 
     // Console summary — one line for quick scanning.
     console.log(
