@@ -133,6 +133,10 @@ export default function Heartbeat() {
   ).length
   const lastSupersedeAt = state?.lastSupersedeAt
 
+  // Patch 60 (Tier 1.6): sentinel 24h status counts.
+  const sentinelStatus = state?.sentinelStatusLast24h ?? { ok: 0, warn: 0, critical: 0 }
+  const lastAuditAt = state?.lastAuditAt
+
   return (
     <div className="anim-fade-in flex min-w-0 flex-1 flex-col">
       {/* Title bar */}
@@ -217,6 +221,22 @@ export default function Heartbeat() {
               {rollingPrimaries}/{HOUR_CAP}
             </span>
             <span className="text-ink-400">primaries</span>
+          </div>
+
+          {/* Patch 60 (Tier 1.6): sentinel 24h status counts. */}
+          <div
+            className="flex items-center gap-2 rounded-lg border border-white/10 bg-white/[0.04] px-2.5 py-1 text-[11.5px] text-ink-300"
+            title="Sentinel firings in the last 24h. Sentinels are scheduled read-only audits over Gemma's own KG."
+          >
+            <span className="text-ink-400">sentinels 24h</span>
+            <span className={`font-mono ${sentinelStatus.ok > 0 ? 'text-emerald-300' : 'text-ink-400/70'}`}>{sentinelStatus.ok} ok</span>
+            <span className="text-ink-400/60">·</span>
+            <span className={`font-mono ${sentinelStatus.warn > 0 ? 'text-amber-300' : 'text-ink-400/70'}`}>{sentinelStatus.warn} warn</span>
+            <span className="text-ink-400/60">·</span>
+            <span className={`font-mono ${sentinelStatus.critical > 0 ? 'text-red-400' : 'text-ink-400/70'}`}>{sentinelStatus.critical} crit</span>
+            {lastAuditAt && (
+              <span className="text-ink-400/70">· last {new Date(lastAuditAt).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}</span>
+            )}
           </div>
 
           {/* Patch 45 (Tier 1.4): revisions gauge — SUPERSEDES writes in last 24h. */}

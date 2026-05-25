@@ -8,6 +8,12 @@ import { TOOLS, findNextAction, runTool, type ToolContext, type ParsedAction } f
 import { ensureGemmaHome } from './gemma-fs'
 import { embedTexts } from './aios-voyage'
 import { runCypher, runCypherRaw } from './aios-neo4j'
+import {
+  loadSentinels,
+  interpolate,
+  comparatorFn,
+  type Sentinel
+} from './sentinels'
 import type {
   HeartbeatState,
   HeartbeatEvent,
@@ -96,6 +102,14 @@ const SUPERSEDE_JUDGE_CONFIDENCE_FLOOR = 0.6
 /** Hard wall-clock budget for the entire contradiction-check helper. */
 const SUPERSEDE_TIMEOUT_MS = 30_000
 
+// --- Patch 60 tunables (Tier 1.6: sentinel audit tick) -------------------
+
+/** Every Nth tick, run an audit (registered sentinels). */
+const AUDIT_EVERY_N_TICKS = 6
+/** Per-sentinel Cypher timeout (note: not actually enforced by Neo4j driver,
+ *  acts as a documented expectation). */
+const SENTINEL_QUERY_TIMEOUT_MS = 5_000
+
 /**
  * The offline-safe, $0 tool subset. Every name here resolves to a tool
  * that touches only the local machine — no network, no paid API.
@@ -161,7 +175,10 @@ let state: HeartbeatState = {
   ticksSinceReview: 0,
   minCadenceSeconds: MIN_CADENCE_BETWEEN_TICKS_SECONDS,
   supersedeLedger: [],
-  supersedesLast24h: 0
+  supersedesLast24h: 0,
+  ticksSinceAudit: 0,
+  sentinelLedger: [],
+  sentinelStatusLast24h: { ok: 0, warn: 0, critical: 0 }
 }
 let goals: HeartbeatGoal[] = []
 
@@ -191,7 +208,14 @@ async function loadState(): Promise<void> {
       lastReviewAttempt: p.lastReviewAttempt,
       lastSupersedeAt: p.lastSupersedeAt,
       supersedeLedger: Array.isArray(p.supersedeLedger) ? p.supersedeLedger : [],
-      supersedesLast24h: typeof p.supersedesLast24h === 'number' ? p.supersedesLast24h : 0
+      supersedesLast24h: typeof p.supersedesLast24h === 'number' ? p.supersedesLast24h : 0,
+      lastAuditAt: p.lastAuditAt,
+      ticksSinceAudit: typeof p.ticksSinceAudit === 'number' ? p.ticksSinceAudit : 0,
+      sentinelLedger: Array.isArray(p.sentinelLedger) ? p.sentinelLedger : [],
+      sentinelStatusLast24h:
+        p.sentinelStatusLast24h && typeof p.sentinelStatusLast24h === 'object'
+          ? p.sentinelStatusLast24h
+          : { ok: 0, warn: 0, critical: 0 }
     }
   } catch {
     // no state file yet — first run, defaults stand
@@ -1608,6 +1632,245 @@ async function runReview(
   return { status: 'ok', summary }
 }
 
+// --- Patch 60 (Tier 1.6) — audit tick + sentinel runner -------------------
+
+interface AuditOutcome {
+  status: 'ok' | 'skipped' | 'error'
+  summary: string
+  okCount: number
+  warnCount: number
+  criticalCount: number
+}
+
+function recordSentinelFire(name: string, severity: 'ok' | 'warn' | 'critical'): void {
+  const now = Date.now()
+  const ledger = state.sentinelLedger ?? []
+  ledger.push({ at: now, name, severity })
+  const cutoff = now - 24 * 60 * 60 * 1000
+  state.sentinelLedger = ledger.filter((e) => e.at >= cutoff)
+  // Recompute the 24h status counts from the ledger.
+  const counts = { ok: 0, warn: 0, critical: 0 }
+  for (const e of state.sentinelLedger) counts[e.severity]++
+  state.sentinelStatusLast24h = counts
+}
+
+async function runOneSentinel(
+  s: Sentinel,
+  tickUuid: string
+): Promise<'ok' | 'warn' | 'critical' | 'skipped'> {
+  const tStart = Date.now()
+  let rows: Array<Record<string, unknown>>
+  try {
+    rows = await runCypherRaw('gemma', s.query, s.params)
+  } catch (e) {
+    console.warn(
+      `[heartbeat][sentinel] tick=${tickUuid} name=${s.name} ERROR cypher: ${(e as Error).message}`
+    )
+    return 'skipped'
+  }
+  const elapsed = Date.now() - tStart
+  if (elapsed > SENTINEL_QUERY_TIMEOUT_MS) {
+    console.warn(
+      `[heartbeat][sentinel] tick=${tickUuid} name=${s.name} SLOW ms=${elapsed} (threshold ${SENTINEL_QUERY_TIMEOUT_MS})`
+    )
+  }
+  if (!rows[0] || rows[0].observed === undefined || rows[0].observed === null) {
+    console.warn(
+      `[heartbeat][sentinel] tick=${tickUuid} name=${s.name} ERROR no 'observed' column in first row`
+    )
+    return 'skipped'
+  }
+  const observedRaw = rows[0].observed
+  // Coerce non-scalar to string for storage; logged as warning.
+  if (
+    typeof observedRaw !== 'number' &&
+    typeof observedRaw !== 'string' &&
+    typeof observedRaw !== 'boolean'
+  ) {
+    console.warn(
+      `[heartbeat][sentinel] tick=${tickUuid} name=${s.name} ERROR observed is not scalar`
+    )
+    return 'skipped'
+  }
+  const observed = observedRaw as number | string
+  const crossed = comparatorFn(s.comparator)(observed, s.threshold)
+
+  if (!crossed) {
+    console.log(
+      `[heartbeat][sentinel] tick=${tickUuid} name=${s.name} ok observed=${observed} threshold=${s.threshold} ms=${elapsed}`
+    )
+    recordSentinelFire(s.name, 'ok')
+    return 'ok'
+  }
+
+  // Crossed — build summary, write :SentinelFinding, take action.
+  const summary = interpolate(s.summaryTemplate, {
+    name: s.name,
+    observed,
+    threshold: s.threshold,
+    comparator: s.comparator,
+    severity: s.severity
+  }).slice(0, 500)
+
+  const findingUuid = `sf_${Date.now()}_${rand()}`
+  let actionTaken: 'log_only' | 'journal_appended' | 'follow_up_enqueued' = s.actionOnCross
+  let followUpGoalId: string | undefined
+
+  // 1. Write :SentinelFinding for warn/critical (skip for log_only).
+  if (actionTaken !== 'log_only') {
+    try {
+      await runCypher(
+        'gemma',
+        `MATCH (t:HeartbeatTick {uuid: $tickUuid})
+         CREATE (f:SentinelFinding {
+           uuid: $uuid,
+           name: $name,
+           severity: $severity,
+           summary: $summary,
+           observed: $observed,
+           threshold: $threshold,
+           comparator: $comparator,
+           created_at: datetime(),
+           tick_id: $tickUuid,
+           query_ms: $queryMs,
+           action_taken: $actionTaken
+         })
+         MERGE (t)-[:PRODUCED]->(f)`,
+        {
+          tickUuid,
+          uuid: findingUuid,
+          name: s.name,
+          severity: s.severity,
+          summary,
+          observed,
+          threshold: s.threshold,
+          comparator: s.comparator,
+          queryMs: elapsed,
+          actionTaken
+        }
+      )
+    } catch (e) {
+      console.warn(
+        `[heartbeat][sentinel] tick=${tickUuid} name=${s.name} ERROR finding-write: ${(e as Error).message}`
+      )
+      // Continue — log the result even though DB write failed.
+    }
+  }
+
+  // 2. Side-effect per action.
+  if (actionTaken === 'follow_up_enqueued' && s.followUpPrompt) {
+    const promptText = interpolate(s.followUpPrompt, {
+      name: s.name,
+      observed,
+      threshold: s.threshold,
+      comparator: s.comparator,
+      severity: s.severity
+    })
+    // Enqueue as a primary goal (counts against the 7/hour cap — keeps
+    // the single autonomy budget honest; aligns with #97a deferral).
+    const goalId = `goal_${Date.now()}_sent_${rand()}`
+    goals.push({
+      id: goalId,
+      title: `[sentinel:${s.name}] ${summary.slice(0, 80)}`,
+      instruction: promptText,
+      status: 'queued',
+      createdAt: Date.now(),
+      kind: 'primary'
+    })
+    followUpGoalId = goalId
+    await saveGoals()
+    emitGoals()
+
+    // Patch the finding with the goal id (best-effort).
+    try {
+      await runCypher(
+        'gemma',
+        `MATCH (f:SentinelFinding {uuid: $uuid}) SET f.follow_up_goal_id = $goalId`,
+        { uuid: findingUuid, goalId: followUpGoalId }
+      )
+    } catch {
+      /* non-fatal */
+    }
+  }
+  // journal_appended: the :SentinelFinding write IS the journal — it
+  // appears in the operator-facing findings query (design §6.3) and the
+  // session-start journal Gemma reads. No extra file write needed; the
+  // design's "appendJournal" intent is satisfied by the KG node + log.
+
+  const sevTag: 'warn' | 'critical' = s.severity === 'critical' ? 'critical' : 'warn'
+  console.log(
+    `[heartbeat][sentinel] tick=${tickUuid} name=${s.name} ${sevTag} observed=${observed} threshold=${s.threshold} ms=${elapsed} action=${actionTaken}${followUpGoalId ? ` goal=${followUpGoalId}` : ''}`
+  )
+  recordSentinelFire(s.name, sevTag)
+  return sevTag
+}
+
+async function runAudit(tickNum: number): Promise<AuditOutcome> {
+  const sentinels = await loadSentinels()
+  if (sentinels.length === 0) {
+    return { status: 'skipped', summary: 'No sentinels registered.', okCount: 0, warnCount: 0, criticalCount: 0 }
+  }
+  const enabled = sentinels.filter((s) => s.enabled)
+  if (enabled.length === 0) {
+    return { status: 'skipped', summary: 'No enabled sentinels.', okCount: 0, warnCount: 0, criticalCount: 0 }
+  }
+  // Per-sentinel sub-cadence: only fire if (tickNum % cadenceTicks) === 0.
+  const due = enabled.filter((s) => tickNum % s.cadenceTicks === 0)
+  if (due.length === 0) {
+    return {
+      status: 'skipped',
+      summary: `No sentinels due this tick (registered ${enabled.length}).`,
+      okCount: 0,
+      warnCount: 0,
+      criticalCount: 0
+    }
+  }
+
+  // Open the audit-tick row.
+  const tickUuid = `htick_${Date.now()}_${rand()}`
+  try {
+    await runCypher(
+      'gemma',
+      `MERGE (t:HeartbeatTick {uuid: $tickUuid})
+         ON CREATE SET t.created_at = datetime(), t.tick_num = $tickNum, t.kind = 'audit'`,
+      { tickUuid, tickNum }
+    )
+  } catch (e) {
+    console.warn(`[heartbeat][sentinel] audit-tick row write failed: ${(e as Error).message}`)
+    // Continue — sentinels can still run and log; only the per-tick aggregation node is lost.
+  }
+
+  let okCount = 0
+  let warnCount = 0
+  let criticalCount = 0
+  for (const s of due) {
+    try {
+      const result = await runOneSentinel(s, tickUuid)
+      if (result === 'ok') okCount++
+      else if (result === 'warn') warnCount++
+      else if (result === 'critical') criticalCount++
+      // 'skipped' (error/parse) just doesn't count
+    } catch (e) {
+      console.warn(
+        `[heartbeat][sentinel] tick=${tickUuid} name=${s.name} UNCAUGHT: ${(e as Error).message}`
+      )
+    }
+  }
+
+  state.lastAuditAt = Date.now()
+
+  const summary =
+    `Audit: ${due.length} sentinel(s) due, ` +
+    `${okCount} ok / ${warnCount} warn / ${criticalCount} critical.`
+  return {
+    status: 'ok',
+    summary,
+    okCount,
+    warnCount,
+    criticalCount
+  }
+}
+
 // --- Tick orchestration -----------------------------------------------------
 
 /**
@@ -1675,6 +1938,20 @@ async function runTick(trigger: 'timer' | 'manual'): Promise<HeartbeatTickResult
       const r = await runReview(model, abort.signal, tickNum)
       state.ticksSinceReview = 0
       return await finalizeTick(tickNum, r.status, r.summary)
+    }
+
+    // Patch 60 (Tier 1.6): audit-tick branch. Fires above plan/consolidate
+    // but below in-progress phases (already handled above) and review.
+    // Only consumes the slot if at least one sentinel is due — otherwise
+    // counter stays elevated and we fall through to plan/consolidate.
+    const auditDue = (state.ticksSinceAudit ?? 0) >= AUDIT_EVERY_N_TICKS
+    if (auditDue) {
+      const r = await runAudit(tickNum)
+      if (r.status !== 'skipped') {
+        state.ticksSinceAudit = 0
+        return await finalizeTick(tickNum, r.status, r.summary)
+      }
+      // skipped (no sentinels / none due) — fall through, retry next tick
     }
 
     if (queuedPrimaries.length === 0 && canPromotePrimary()) {
@@ -1784,6 +2061,7 @@ async function runGoalPhase(
       await saveGoals()
       emitGoals()
       state.ticksSinceReview = (state.ticksSinceReview ?? 0) + 1
+      state.ticksSinceAudit = (state.ticksSinceAudit ?? 0) + 1
       await saveState()
       return await finalizeTick(tickNum, 'error', `Probe errored: ${r.finalText}`, journalPath)
     }
@@ -1812,6 +2090,7 @@ async function runGoalPhase(
       await saveGoals()
       emitGoals()
       state.ticksSinceReview = (state.ticksSinceReview ?? 0) + 1
+      state.ticksSinceAudit = (state.ticksSinceAudit ?? 0) + 1
       await saveState()
       return await finalizeTick(
         tickNum,
@@ -1832,6 +2111,7 @@ async function runGoalPhase(
       followUpNote = `; enqueued ${created.length} follow-up(s)`
     }
     state.ticksSinceReview = (state.ticksSinceReview ?? 0) + 1
+    state.ticksSinceAudit = (state.ticksSinceAudit ?? 0) + 1
     await saveState()
     return await finalizeTick(
       tickNum,
@@ -1900,6 +2180,7 @@ async function runPlanTick(
   await writeFile(journalPath, journal, 'utf-8')
 
   state.ticksSinceReview = (state.ticksSinceReview ?? 0) + 1
+  state.ticksSinceAudit = (state.ticksSinceAudit ?? 0) + 1
   await saveState()
   return await finalizeTick(tickNum, 'ok', `Proposed ${fresh.length} goal(s).`, journalPath)
 }

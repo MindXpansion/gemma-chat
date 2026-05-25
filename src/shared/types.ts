@@ -156,6 +156,19 @@ export interface HeartbeatState {
    *  ledger room). cadenceMinutes now acts as the MAX (idle) delay; this
    *  is the floor when she's actively researching. */
   minCadenceSeconds?: number
+  /** Patch 60 (Tier 1.6): ms timestamp of last audit-tick completion. */
+  lastAuditAt?: number
+  /** Patch 60: ticks elapsed since the last audit fire. */
+  ticksSinceAudit?: number
+  /** Patch 60: rolling 24h sentinel-firing counts by severity. */
+  sentinelStatusLast24h?: {
+    ok: number
+    warn: number
+    critical: number
+  }
+  /** Patch 60: ring-buffer ledger of {at, severity} for the last 24h.
+   *  Matches Patch 40 primaryGoalLedger + Patch 45 supersedeLedger pattern. */
+  sentinelLedger?: Array<{ at: number; name: string; severity: 'ok' | 'warn' | 'critical' }>
   /** Patch 45 (Tier 1.4): ms timestamp of the last SUPERSEDES write. */
   lastSupersedeAt?: number
   /** Patch 45: rolling-24h count of SUPERSEDES edges written. Computed
