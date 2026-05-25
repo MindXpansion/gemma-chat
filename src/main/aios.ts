@@ -8,7 +8,7 @@ import { join } from 'path'
  * Provides a persistent observations log (append-only) and a temporal
  * grounding tool. These are scoped to gemma-chat's own app-data directory,
  * NOT to the partnership KG or master Skills lib (HYBRID write boundaries
- * per about-partner.md). The observations file is shared across all
+ * per ~/.intelligence_partner/about-partner.md). The observations file is shared across all
  * conversations in this Gemma Chat install — one running log, not
  * per-conversation, so patterns can accumulate across sessions.
  */
@@ -26,7 +26,7 @@ const OBSERVATIONS_HEADER = `# Gemma Observations Log
 > Append-only log of observations, patterns, and things worth remembering
 > across sessions. Written by Gemma via the \`aios_observe\` tool.
 >
-> Per the HYBRID write boundaries (see about-partner.md): Gemma may add
+> Per the HYBRID write boundaries (see ~/.intelligence_partner/about-partner.md): Gemma may add
 > to this file freely. Bear may review and curate. Past entries are not
 > modified — only appended.
 

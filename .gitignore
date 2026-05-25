@@ -39,3 +39,8 @@ mlx-venv/
 
 # macOS iconset intermediates (the .icns is tracked)
 build/icon.iconset/
+
+# Patch 53 (security): personal partner-profile data lives outside the
+# repo under ~/.intelligence_partner/. Never commit copies here.
+about-partner.md
+partner-*.md

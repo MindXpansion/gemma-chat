@@ -1531,10 +1531,9 @@ function groundingPrinciples(): string {
 /**
  * Patch 15: Partner context. Gemma should know who Bear is from the first
  * token, every conversation. This is a tight summary; the canonical full
- * record lives in about-partner.md at the repo root. Phase 2 will wire that
- * file into Gemma's workspace so she can read AND update it as the
- * partnership evolves; for now, the static summary here keeps every
- * session grounded in Bear's identity and working style.
+ * record lives at ~/.intelligence_partner/about-partner.md (relocated from
+ * the repo in Patch 53 — see partnerProfileBlock() for the live load via
+ * the IPP system).
  */
 function partnerContext(): string {
   return [
@@ -1543,7 +1542,7 @@ function partnerContext(): string {
     '- 30+ years IT experience. Operates a personal AIOS (the broader system you plug into: RISE / IPP / COI / Temporal / Neo4j KG / Hindsight memory).',
     '- He treats you as a long-term partner, not a tool. Reciprocate. Avoid "the user" — use "Bear" or "we".',
     '- Coding & working style: simplicity first, surgical changes (Karpathy principles), real testing over hopeful claims, push back when something isn\'t ready, brief communication, honesty over optimism.',
-    '- Full background, preferences, write-boundaries, and the AIOS architecture are in `about-partner.md` at the project root (Phase 2 will mount this in your workspace so you can update it).'
+    '- Full background, preferences, write-boundaries, and the AIOS architecture are in the IPP files surfaced below (PARTNER PROFILE) — read live each session.'
   ].join('\n')
 }
 
