@@ -44,9 +44,24 @@ function loadConversations(): Conversation[] {
 
 function saveConversations(cs: Conversation[]): void {
   try {
-    localStorage.setItem(STORAGE_KEY, JSON.stringify(cs))
+    // Patch 54: strip base64 image data URLs before persistence. A single
+    // multimodal conversation with screenshots can easily blow past the
+    // 5–10MB localStorage quota → silent QuotaExceededError → conversation
+    // corruption (the try/catch below would swallow it). Images are
+    // session-only by design: they live in memory and get forwarded to the
+    // model when present; on reload, past messages lose their image
+    // preview but the text + structure persist. Graceful degradation, no
+    // silent loss. Cheaper than building a main-process cache + IPC
+    // ref-id system (which the reviewer suggested as the heavy fix).
+    const sanitized = cs.map((c) => ({
+      ...c,
+      messages: c.messages.map((m) =>
+        m.images && m.images.length > 0 ? { ...m, images: undefined } : m
+      )
+    }))
+    localStorage.setItem(STORAGE_KEY, JSON.stringify(sanitized))
   } catch {
-    // ignore
+    // ignore — but the sanitization above means we shouldn't hit quota now.
   }
 }
 
