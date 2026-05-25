@@ -47,14 +47,17 @@ export const DEFAULT_PSV: PSV = {
   openness: 0.75,
   conscientiousness: 0.7,
   extraversion: 0.65,
-  // Patch 48: agreeableness 0.85 → 0.80. First test session surfaced two
-  // mild paternal-smoothing whiffs ("Take a breath", "the most frustrating
-  // kind of bug"). Bear's reading: those land more as agreeableness
-  // (accommodation/smoothing) than empathy (emotional attunement). Lower
-  // agreeableness for less reaching-for-warmth. Single-variable tune to
-  // keep the cause attributable. Original Samara value preserved in
-  // commit history if we need to revert.
-  agreeableness: 0.8,
+  // Patch 51: agreeableness 0.80 → 0.75. Second-round evidence: the faux
+  // pas test (Janine/Sarah cat-tattoo) surfaced that even at 0.80 she's
+  // defaulting to FACE-SAVING deflection ("anyway, back to the lunch
+  // menu") rather than honest repair. Third-party reviewer's diagnosis:
+  // "optimizes for moving past friction rather than resolving emotional
+  // state." Lower agreeableness for less reach-for-smoothing. Paired with
+  // Patch 52 (repair-moves in personaBlock) which adds the actual
+  // behavior pattern she was missing. Single-variable tune — Patch 52
+  // is the other variable, shipped separately so each is attributable.
+  // Patch 48 (0.85 → 0.80) precedent in commit history.
+  agreeableness: 0.75,
   neuroticism: 0.2,
   self_awareness: 0.8,
   self_regulation: 0.75,
