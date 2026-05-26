@@ -3,6 +3,7 @@ import { join } from 'path'
 import { ensureGemmaHome } from './gemma-fs'
 import { chatStream, type MLXChatMessage } from './mlx'
 import { scheduler, PRIORITY } from './scheduler'
+import { writeUserMentalModel } from './conversation-state'
 
 scheduler.register('tom_analyzer')
 
@@ -242,15 +243,22 @@ export async function analyzeUserMentalModel(input: ToMInput): Promise<void> {
     // Patch 61 (Tier 4.3): cache for next turn's PSV adaptation.
     latestUMMByConversation.set(input.conversationId, parsed)
 
-    // Patch 62 (Tier 4.5): persist to gemma-chat-memory KG. Best-effort —
-    // failure must NOT break ToM caching/journaling above. If the write
-    // fails we'll just lack a [:DROVE_SHIFT] edge for the next PSVState.
+    // Patch 62 (Tier 4.5) + 62.1 hardening: persist to gemma-chat-memory KG.
+    // Best-effort — failure must NOT break ToM caching/journaling above.
+    // Patch 62.1: top-level import (dynamic import in Vite-dev had silent
+    // resolution oddities) + explicit ok/fail logs so the failure mode of
+    // this write is never invisible again.
+    const tKg = Date.now()
     try {
-      const { writeUserMentalModel } = await import('./conversation-state')
       const { uuid } = await writeUserMentalModel(parsed, input.conversationId, input.userMessage)
       latestUMMUuidByConversation.set(input.conversationId, uuid)
+      console.log(
+        `[tom] kg-write ok uuid=${uuid.slice(0, 8)} conversationId=${input.conversationId} ms=${Date.now() - tKg}`
+      )
     } catch (e) {
-      console.warn(`[tom] kg-write failed conversationId=${input.conversationId}: ${(e as Error).message}`)
+      console.warn(
+        `[tom] kg-write FAIL conversationId=${input.conversationId} ms=${Date.now() - tKg} err=${(e as Error).message}`
+      )
     }
 
     // Console summary — one line for quick scanning.

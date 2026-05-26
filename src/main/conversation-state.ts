@@ -25,7 +25,17 @@ import type { PSV } from '../shared/psv'
 import type { AdaptationStrategy } from '../shared/psv'
 import type { UserMentalModel } from './tom'
 
-const clamp01 = (n: number): number => Math.max(0, Math.min(1, n))
+// Patch 62.1 — accept undefined/null/NaN and coerce to 0.0. The previous
+// clamp01(undefined) returned NaN which the Neo4j JS driver rejects as a
+// param ('Unable to convert NaN to Neo4j Value'), silently failing the
+// CREATE clause and leaving us with a ConversationState hub but no UMM.
+const clamp01 = (n: unknown): number => {
+  const v = typeof n === 'number' && Number.isFinite(n) ? n : 0
+  return Math.max(0, Math.min(1, v))
+}
+
+const safeStr = (s: unknown, max: number): string =>
+  (typeof s === 'string' ? s : '').slice(0, max)
 
 export async function writeUserMentalModel(
   umm: UserMentalModel,
@@ -53,13 +63,15 @@ export async function writeUserMentalModel(
     {
       uuid,
       conversationId,
-      user_emotion: umm.user_emotion,
+      // Patch 62.1: defensive — the analyzer occasionally emits partial UMMs
+      // (LLM hiccup, regex parse miss). Coerce all fields rather than fail.
+      user_emotion: safeStr(umm.user_emotion, 64) || 'unknown',
       emotion_intensity: clamp01(umm.emotion_intensity),
-      user_intention: umm.user_intention,
-      knowledge_gap: (umm.knowledge_gap ?? '').slice(0, 500),
+      user_intention: safeStr(umm.user_intention, 64) || 'unknown',
+      knowledge_gap: safeStr(umm.knowledge_gap, 500),
       rapport_level: clamp01(umm.rapport_level),
       analyzer_confidence: clamp01(umm.analyzer_confidence),
-      message_text: messageText.slice(0, 1000)
+      message_text: safeStr(messageText, 1000)
     }
   )
   return { uuid }

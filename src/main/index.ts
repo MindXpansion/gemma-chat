@@ -250,6 +250,7 @@ async function handleChat(req: ChatRequest, channel: string): Promise<void> {
         const ummUuid = getLatestUMMUuid(req.conversationId)
         if (ummUuid) {
           void (async () => {
+            const tKg = Date.now()
             try {
               await writePSVState(psv, strategy, ummUuid, req.conversationId)
               await upsertConversationState(req.conversationId, {
@@ -257,10 +258,19 @@ async function handleChat(req: ChatRequest, channel: string): Promise<void> {
                 last_user_emotion: lastUmm.user_emotion,
                 rapport_observation: lastUmm.rapport_level
               })
+              console.log(
+                `[psv] kg-write ok conversationId=${req.conversationId} strategy=${strategy} ms=${Date.now() - tKg}`
+              )
             } catch (e) {
-              console.warn(`[psv] kg-write failed conversationId=${req.conversationId}: ${(e as Error).message}`)
+              console.warn(
+                `[psv] kg-write FAIL conversationId=${req.conversationId} ms=${Date.now() - tKg} err=${(e as Error).message}`
+              )
             }
           })()
+        } else {
+          console.log(
+            `[psv] kg-write SKIP conversationId=${req.conversationId} reason=no_prior_umm_uuid (Tier 4.5 needs at least 1 prior successful UMM write to anchor [:DROVE_SHIFT])`
+          )
         }
       }
       baseMessages.push({ role: 'system', content: chatSystemPrompt(req.enableTools, psv) })
