@@ -80,6 +80,10 @@ async function getConversationState(
 
 async function getRecentUmms(conversationId: string, limit = 20): Promise<UmmRow[]> {
   try {
+    // Patch 63.1: toInteger($limit) — Neo4j 5.x rejects JS-number params for
+    // LIMIT because they arrive as Float (20.0) and LIMIT requires Integer.
+    // Same fix in getRecentSentinelFindings below. Caller still passes a
+    // normal JS number; the Cypher coerces.
     const rows = await runCypherRaw(
       'gemma',
       `
@@ -97,7 +101,7 @@ async function getRecentUmms(conversationId: string, limit = 20): Promise<UmmRow
              p.empathy AS psv_empathy,
              p.agreeableness AS psv_agreeableness
       ORDER BY u.at DESC
-      LIMIT $limit
+      LIMIT toInteger($limit)
       `,
       { conversationId, limit }
     )
@@ -133,7 +137,7 @@ async function getRecentSentinelFindings(limit = 20): Promise<SentinelFindingRow
              f.threshold AS threshold,
              toString(f.created_at) AS created_at
       ORDER BY f.created_at DESC
-      LIMIT $limit
+      LIMIT toInteger($limit)
       `,
       { limit }
     )
