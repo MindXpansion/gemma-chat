@@ -14,8 +14,6 @@ interface Props {
   onNew: () => void
   onDelete: (id: string) => void
   onRename: (id: string, title: string) => void
-  // Patch 64: opens Settings → Heartbeat tab (no longer swaps the main view).
-  onOpenHeartbeat: () => void
 }
 
 export default function Sidebar({
@@ -24,8 +22,7 @@ export default function Sidebar({
   onSelect,
   onNew,
   onDelete,
-  onRename,
-  onOpenHeartbeat
+  onRename
 }: Props) {
   // Patch 47: inline rename — Electron's renderer doesn't support
   // window.prompt(), so the pencil button swaps in an <input> instead.
@@ -64,16 +61,6 @@ export default function Sidebar({
           New chat
         </button>
       </div>
-      <div className="no-drag px-2 pb-1">
-        <button
-          onClick={onOpenHeartbeat}
-          className="flex w-full items-center gap-2 rounded-lg px-3 py-2 text-left text-[13px] text-ink-200 transition-all duration-200 ease-out hover:bg-white/[0.03]"
-        >
-          <span className="text-[13px] text-emerald-400/90">♥</span>
-          Heartbeat
-        </button>
-      </div>
-
       <div className="no-drag min-h-0 flex-1 overflow-y-auto px-2 pb-4">
         {conversations.map((c) => {
           const isEditing = editingId === c.id

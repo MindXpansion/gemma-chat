@@ -301,7 +301,6 @@ export default function Chat({ model, onSwitchModel }: Props) {
         onNew={() => createConversation(activeConversation.mode)}
         onDelete={deleteConversation}
         onRename={renameConversation}
-        onOpenHeartbeat={() => setSettingsTab('heartbeat')}
       />
       <div className="flex min-w-0 flex-1">
         <div className="flex min-w-0 flex-1 flex-col">
