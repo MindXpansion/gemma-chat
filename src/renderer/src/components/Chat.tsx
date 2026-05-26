@@ -13,8 +13,7 @@ import Message from './Message'
 import Sidebar from './Sidebar'
 import Canvas from './Canvas'
 import ConfirmCard from './ConfirmCard'
-import Heartbeat from './Heartbeat'
-import SettingsModal from './SettingsModal'
+import SettingsModal, { type TabId as SettingsTabId } from './SettingsModal'
 
 interface Props {
   model: string
@@ -87,8 +86,10 @@ export default function Chat({ model, onSwitchModel }: Props) {
     return loaded.length ? loaded : [newConversation()]
   })
   const [activeId, setActiveId] = useState<string>(() => conversations[0].id)
-  const [view, setView] = useState<'chat' | 'heartbeat'>('chat')
-  const [settingsOpen, setSettingsOpen] = useState(false)
+  // Patch 64: collapsed `view: 'chat' | 'heartbeat'` + `settingsOpen` into
+  // one state. settingsTab is null when modal is closed; otherwise it's the
+  // active tab. Heartbeat now lives inside the modal as the 'heartbeat' tab.
+  const [settingsTab, setSettingsTab] = useState<SettingsTabId | null>(null)
   const [streaming, setStreaming] = useState(false)
   const [pendingConfirm, setPendingConfirm] = useState<{
     id: string
@@ -296,22 +297,12 @@ export default function Chat({ model, onSwitchModel }: Props) {
       <Sidebar
         conversations={conversations}
         activeId={activeId}
-        view={view}
-        onSelect={(id) => {
-          setActiveId(id)
-          setView('chat')
-        }}
-        onNew={() => {
-          createConversation(activeConversation.mode)
-          setView('chat')
-        }}
+        onSelect={(id) => setActiveId(id)}
+        onNew={() => createConversation(activeConversation.mode)}
         onDelete={deleteConversation}
         onRename={renameConversation}
-        onOpenHeartbeat={() => setView('heartbeat')}
+        onOpenHeartbeat={() => setSettingsTab('heartbeat')}
       />
-      {view === 'heartbeat' ? (
-        <Heartbeat />
-      ) : (
       <div className="flex min-w-0 flex-1">
         <div className="flex min-w-0 flex-1 flex-col">
           <Header
@@ -321,12 +312,13 @@ export default function Chat({ model, onSwitchModel }: Props) {
             onToggleMode={toggleMode}
             onToggleCanvas={toggleCanvas}
             onSwitchModel={onSwitchModel}
-            onOpenSettings={() => setSettingsOpen(true)}
+            onOpenSettings={() => setSettingsTab('observability')}
           />
-          {settingsOpen && (
+          {settingsTab && (
             <SettingsModal
               conversationId={activeId}
-              onClose={() => setSettingsOpen(false)}
+              initialTab={settingsTab}
+              onClose={() => setSettingsTab(null)}
             />
           )}
           <MessageList
@@ -370,7 +362,6 @@ export default function Chat({ model, onSwitchModel }: Props) {
           />
         )}
       </div>
-      )}
     </div>
   )
 }

@@ -12,13 +12,14 @@
 
 import { useEffect, useState } from 'react'
 import ObservabilityTab from './settings/ObservabilityTab'
+import Heartbeat from './Heartbeat'
 
-type TabId = 'observability' | 'models' | 'heartbeat' | 'sentinels' | 'hitl' | 'about'
+export type TabId = 'observability' | 'models' | 'heartbeat' | 'sentinels' | 'hitl' | 'about'
 
 const TABS: Array<{ id: TabId; label: string; stub?: boolean }> = [
   { id: 'observability', label: 'Observability' },
+  { id: 'heartbeat', label: 'Heartbeat' },
   { id: 'models', label: 'Models', stub: true },
-  { id: 'heartbeat', label: 'Heartbeat', stub: true },
   { id: 'sentinels', label: 'Sentinels', stub: true },
   { id: 'hitl', label: 'Approvals', stub: true },
   { id: 'about', label: 'About', stub: true }
@@ -26,11 +27,12 @@ const TABS: Array<{ id: TabId; label: string; stub?: boolean }> = [
 
 interface Props {
   conversationId: string
+  initialTab?: TabId
   onClose: () => void
 }
 
-export default function SettingsModal({ conversationId, onClose }: Props) {
-  const [tab, setTab] = useState<TabId>('observability')
+export default function SettingsModal({ conversationId, initialTab = 'observability', onClose }: Props) {
+  const [tab, setTab] = useState<TabId>(initialTab)
 
   // Escape to close
   useEffect(() => {
@@ -94,6 +96,13 @@ export default function SettingsModal({ conversationId, onClose }: Props) {
           <div className="min-h-0 flex-1 overflow-y-auto p-4">
             {tab === 'observability' ? (
               <ObservabilityTab conversationId={conversationId} />
+            ) : tab === 'heartbeat' ? (
+              // Patch 64: full-bleed Heartbeat panel inside the tab.
+              // Negative margin offsets the parent's p-4 so the heartbeat
+              // chrome reaches the edges (it has its own padding).
+              <div className="-m-4 h-[calc(100%+2rem)]">
+                <Heartbeat />
+              </div>
             ) : (
               <StubPanel id={tab} />
             )}
@@ -107,12 +116,11 @@ export default function SettingsModal({ conversationId, onClose }: Props) {
 function StubPanel({ id }: { id: TabId }) {
   const copy: Record<TabId, string> = {
     observability: '',
+    heartbeat: '',
     models: 'Model provider config + posture-gated cloud integrations. Patch 65 (#132).',
-    heartbeat:
-      'Migrate the existing Heartbeat panel into this tab (cadence, journal, goals). Patch 64.',
     sentinels:
-      'Full sentinel editor — enable/disable, edit thresholds, validate YAMLs. Patch 64.',
-    hitl: 'Approval queue: proposals from Mission / heartbeat that need a "go" before they execute. Block D HITL.',
+      'Full sentinel editor — enable/disable, edit thresholds, validate YAMLs. Patch 65.',
+    hitl: 'Approval queue: proposals from Mission / heartbeat that need a "go" before they execute. Patch 65.',
     about: 'App version, model versions, KG stats, link to source.'
   }
   return (

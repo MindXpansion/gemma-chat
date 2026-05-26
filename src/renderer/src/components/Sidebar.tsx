@@ -10,18 +10,17 @@ interface Conversation {
 interface Props {
   conversations: Conversation[]
   activeId: string
-  view: 'chat' | 'heartbeat'
   onSelect: (id: string) => void
   onNew: () => void
   onDelete: (id: string) => void
   onRename: (id: string, title: string) => void
+  // Patch 64: opens Settings → Heartbeat tab (no longer swaps the main view).
   onOpenHeartbeat: () => void
 }
 
 export default function Sidebar({
   conversations,
   activeId,
-  view,
   onSelect,
   onNew,
   onDelete,
@@ -68,11 +67,7 @@ export default function Sidebar({
       <div className="no-drag px-2 pb-1">
         <button
           onClick={onOpenHeartbeat}
-          className={`flex w-full items-center gap-2 rounded-lg px-3 py-2 text-left text-[13px] transition-all duration-200 ease-out ${
-            view === 'heartbeat'
-              ? 'bg-white/[0.07] text-white'
-              : 'text-ink-200 hover:bg-white/[0.03]'
-          }`}
+          className="flex w-full items-center gap-2 rounded-lg px-3 py-2 text-left text-[13px] text-ink-200 transition-all duration-200 ease-out hover:bg-white/[0.03]"
         >
           <span className="text-[13px] text-emerald-400/90">♥</span>
           Heartbeat
@@ -105,7 +100,7 @@ export default function Sidebar({
                 <button
                   onClick={() => onSelect(c.id)}
                   className={`w-full truncate rounded-lg px-3 py-2 pr-14 text-left text-[13px] transition-all duration-200 ease-out ${
-                    view === 'chat' && activeId === c.id
+                    activeId === c.id
                       ? 'bg-white/[0.07] text-white'
                       : 'text-ink-200 hover:bg-white/[0.03]'
                   }`}

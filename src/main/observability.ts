@@ -87,8 +87,14 @@ async function getRecentUmms(conversationId: string, limit = 20): Promise<UmmRow
     const rows = await runCypherRaw(
       'gemma',
       `
+      // Patch 64: collapse to one row per UMM. A single UMM occasionally has
+      // multiple [:DROVE_SHIFT] edges (fast double-send / re-render race)
+      // and the prior OPTIONAL MATCH produced a Cartesian product. Take the
+      // most-recent PSVState per UMM via ORDER + head(collect).
       MATCH (u:UserMentalModel {conversationId: $conversationId})
       OPTIONAL MATCH (u)-[:DROVE_SHIFT]->(p:PSVState)
+      WITH u, p ORDER BY p.at DESC
+      WITH u, head(collect(p)) AS p
       RETURN u.uuid AS uuid,
              toString(u.at) AS at,
              u.user_emotion AS user_emotion,
