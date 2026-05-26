@@ -88,6 +88,42 @@ export type StreamChunk =
   | { type: 'done' }
   | { type: 'error'; error: string }
 
+/**
+ * Patch 67 (Block D #132) — Provider abstraction.
+ *
+ * A Provider is the *runtime* that serves a model: mlx-vlm today, Ollama next,
+ * posture-gated cloud APIs later. ModelInfo references a provider by id; the
+ * Models tab in Settings groups by provider. Adding a new provider = append a
+ * Provider entry + a new runtime adapter; the type system fans out naturally.
+ *
+ * Bear's binding rule: **100% local by default.** Cloud providers, when added,
+ * must be `runtime: 'cloud'` and start `enabled: false` until the user
+ * explicitly flips a posture flag.
+ */
+export type ProviderId = 'mlx-vlm' | 'ollama' | 'openai' | 'anthropic'
+
+export interface Provider {
+  id: ProviderId
+  label: string
+  /** local = bytes on disk, no network. cloud = remote API, network required. */
+  runtime: 'local' | 'cloud'
+  /** Whether the provider is wired up and usable. Disabled providers may still
+   *  appear in the registry (as "coming soon") but emit no models. */
+  enabled: boolean
+  /** Short one-liner shown in the Models tab header. */
+  description: string
+}
+
+export const PROVIDERS: Provider[] = [
+  {
+    id: 'mlx-vlm',
+    label: 'MLX-VLM (local)',
+    runtime: 'local',
+    enabled: true,
+    description: "Apple-silicon native, runs Gemma 4 weights locally via mlx_vlm. Phronesis's default."
+  }
+]
+
 export interface ModelInfo {
   /** HuggingFace repo ID — used internally for mlx_vlm */
   name: string
@@ -97,6 +133,8 @@ export interface ModelInfo {
   sizeBytes: number
   description: string
   recommended?: boolean
+  /** Patch 67: which Provider serves this model. */
+  providerId: ProviderId
 }
 
 export const AVAILABLE_MODELS: ModelInfo[] = [
@@ -105,7 +143,8 @@ export const AVAILABLE_MODELS: ModelInfo[] = [
     label: 'Gemma 4 E2B',
     size: '1.5 GB',
     sizeBytes: 1_500_000_000,
-    description: 'Edge-sized. Fast & lightweight. Text + image + audio. Runs on 8GB+ Macs.'
+    description: 'Edge-sized. Fast & lightweight. Text + image + audio. Runs on 8GB+ Macs.',
+    providerId: 'mlx-vlm'
   },
   {
     name: 'mlx-community/gemma-4-e4b-it-4bit',
@@ -113,25 +152,41 @@ export const AVAILABLE_MODELS: ModelInfo[] = [
     size: '3 GB',
     sizeBytes: 3_000_000_000,
     description: 'Best all-rounder. Text + image + audio. Runs on 8GB+ Macs.',
-    recommended: true
+    recommended: true,
+    providerId: 'mlx-vlm'
   },
   {
     name: 'mlx-community/gemma-4-26b-a4b-it-4bit',
     label: 'Gemma 4 27B MoE',
     size: '16 GB',
     sizeBytes: 16_000_000_000,
-    description: 'Mixture-of-Experts (26B, 4B active). 16GB+ RAM recommended.'
+    description: 'Mixture-of-Experts (26B, 4B active). 16GB+ RAM recommended.',
+    providerId: 'mlx-vlm'
   },
   {
     name: 'mlx-community/gemma-4-31b-it-4bit',
     label: 'Gemma 4 31B',
     size: '18 GB',
     sizeBytes: 18_000_000_000,
-    description: 'Frontier dense model. Best quality. 32GB+ RAM recommended.'
+    description: 'Frontier dense model. Best quality. 32GB+ RAM recommended.',
+    providerId: 'mlx-vlm'
   }
 ]
 
 export const DEFAULT_MODEL = 'mlx-community/gemma-4-e4b-it-4bit'
+
+/**
+ * Patch 67: Disk + activity status for the Models tab.
+ * `downloaded` is true if HuggingFace cache has the model dir;
+ * `isActive` is true if it's the currently-loaded model in the MLX server.
+ */
+export interface ModelStatus {
+  name: string
+  providerId: ProviderId
+  downloaded: boolean
+  sizeBytesOnDisk?: number
+  isActive: boolean
+}
 
 /**
  * Patch 34: Autonomous Heartbeat. A main-process timer fires self-directed

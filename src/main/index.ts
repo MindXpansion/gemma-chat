@@ -29,7 +29,8 @@ app.setName('Phronesis')
 
 import { join } from 'path'
 import { electronApp, optimizer, is } from '@electron-toolkit/utils'
-import { AVAILABLE_MODELS } from '@shared/types'
+import { AVAILABLE_MODELS, PROVIDERS } from '@shared/types'
+import { getModelStatuses, deleteModelFromCache } from './models'
 import {
   locateMLX,
   installMLX,
@@ -811,6 +812,24 @@ app.whenReady().then(async () => {
 
   ipcMain.handle('models:list-local', async () => {
     return listLocalModels()
+  })
+
+  // Patch 67 (Block D #132): Provider abstraction + Models tab.
+  ipcMain.handle('providers:list', async () => PROVIDERS)
+
+  ipcMain.handle('models:status', async () => getModelStatuses(currentModel))
+
+  ipcMain.handle('model:delete', async (_e, name: string) => {
+    // If the model the user wants to delete is the one currently loaded in
+    // the MLX server, stop the server first so we're not yanking a file out
+    // from under a running process.
+    if (currentModel === name) {
+      send('setup:status', { stage: 'starting-mlx', message: `Unloading ${name} before delete…` })
+      await stopServer()
+      currentModel = null
+    }
+    const res = await deleteModelFromCache(name)
+    return res
   })
 
   ipcMain.handle('chat:send', async (_e, req: ChatRequest) => {

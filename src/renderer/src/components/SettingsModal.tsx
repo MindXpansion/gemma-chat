@@ -14,6 +14,7 @@ import { useEffect, useState } from 'react'
 import ObservabilityTab from './settings/ObservabilityTab'
 import SentinelsTab from './settings/SentinelsTab'
 import ApprovalsTab from './settings/ApprovalsTab'
+import ModelsTab from './settings/ModelsTab'
 import Heartbeat from './Heartbeat'
 
 export type TabId = 'observability' | 'models' | 'heartbeat' | 'sentinels' | 'hitl' | 'about'
@@ -23,7 +24,7 @@ const TABS: Array<{ id: TabId; label: string; stub?: boolean }> = [
   { id: 'heartbeat', label: 'Heartbeat' },
   { id: 'sentinels', label: 'Sentinels' },
   { id: 'hitl', label: 'Approvals' },
-  { id: 'models', label: 'Models', stub: true },
+  { id: 'models', label: 'Models' },
   { id: 'about', label: 'About', stub: true }
 ]
 
@@ -109,6 +110,8 @@ export default function SettingsModal({ conversationId, initialTab = 'observabil
               <SentinelsTab />
             ) : tab === 'hitl' ? (
               <ApprovalsTab />
+            ) : tab === 'models' ? (
+              <ModelsTab />
             ) : (
               <StubPanel id={tab} />
             )}
@@ -125,7 +128,7 @@ function StubPanel({ id }: { id: TabId }) {
     heartbeat: '',
     sentinels: '',
     hitl: '',
-    models: 'Model provider config + posture-gated cloud integrations. Patch 67 (#132).',
+    models: '',
     about: 'App version, model versions, KG stats, link to source.'
   }
   return (

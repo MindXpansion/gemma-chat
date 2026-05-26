@@ -11,7 +11,9 @@ import type {
   HeartbeatJournalEntry,
   HeartbeatGoal,
   Mission,
-  MissionEvent
+  MissionEvent,
+  Provider,
+  ModelStatus
 } from '../shared/types'
 import type {
   ObservabilitySnapshot,
@@ -204,7 +206,13 @@ const api = {
   approvalsResolve: (uuid: string, resolution: ApprovalResolution): Promise<boolean> =>
     ipcRenderer.invoke('approvals:resolve', { uuid, resolution }),
   approvalsDefer: (uuid: string, hours: number): Promise<boolean> =>
-    ipcRenderer.invoke('approvals:defer', { uuid, hours })
+    ipcRenderer.invoke('approvals:defer', { uuid, hours }),
+
+  // Patch 67 (Block D #132): Provider abstraction + Models tab.
+  providersList: (): Promise<Provider[]> => ipcRenderer.invoke('providers:list'),
+  modelsStatus: (): Promise<ModelStatus[]> => ipcRenderer.invoke('models:status'),
+  modelDelete: (name: string): Promise<{ ok: boolean; reason?: string }> =>
+    ipcRenderer.invoke('model:delete', name)
 }
 
 export type MountMode = 'ro' | 'rw-confirm' | 'rw-free'
