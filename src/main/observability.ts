@@ -20,6 +20,8 @@ import type {
   SentinelRegistryRow,
   SentinelDetail,
   SentinelDryRun,
+  ApprovalItem,
+  ApprovalResolution,
   ObservabilitySnapshot
 } from '../shared/observability-types'
 
@@ -30,6 +32,8 @@ export type {
   SentinelRegistryRow,
   SentinelDetail,
   SentinelDryRun,
+  ApprovalItem,
+  ApprovalResolution,
   ObservabilitySnapshot
 }
 
@@ -327,4 +331,108 @@ export async function getObservabilitySnapshot(
     getRecentSentinelFindings()
   ])
   return { conversationState, recentUmms, sentinelRegistry, recentFindings }
+}
+
+// ─── Patch 66 / Block D #138 — Approvals queue ──────────────────────────
+//
+// V1 producer is :SentinelFinding only. The queue surfaces critical AND
+// warn findings that are NOT yet resolved AND whose defer_until is in
+// the past (or null). Two new optional properties on the existing
+// SentinelFinding node — no schema migration required (Neo4j is
+// schemaless on properties); the constraint/indexes from Patch 60 are
+// untouched.
+//
+// Future producers (Mission proposals, Tier 5/6 cost gates, etc.) will
+// either write to :SentinelFinding too (cheap) or earn their own label
+// with a UNION query here. Don't pre-build that; widen when the second
+// producer materializes.
+
+export async function getApprovalsQueue(): Promise<ApprovalItem[]> {
+  try {
+    const rows = await runCypherRaw(
+      'gemma',
+      `
+      MATCH (f:SentinelFinding)
+      WHERE f.severity IN ['warn', 'critical']
+        AND f.resolved_at IS NULL
+        AND (f.defer_until IS NULL OR f.defer_until < datetime())
+      RETURN f.uuid AS uuid,
+             f.name AS name,
+             f.severity AS severity,
+             coalesce(f.summary, '') AS summary,
+             f.observed AS observed,
+             f.threshold AS threshold,
+             toString(f.created_at) AS created_at,
+             toString(f.defer_until) AS defer_until,
+             f.follow_up_goal_id AS follow_up_goal_id
+      ORDER BY
+        CASE f.severity WHEN 'critical' THEN 0 ELSE 1 END,
+        f.created_at DESC
+      LIMIT toInteger(50)
+      `,
+      {}
+    )
+    return rows.map((r) => ({
+      uuid: String(r.uuid),
+      source: 'sentinel' as const,
+      name: String(r.name),
+      severity: String(r.severity ?? 'info'),
+      summary: String(r.summary ?? ''),
+      observed: r.observed == null
+        ? null
+        : typeof r.observed === 'number'
+          ? r.observed
+          : String(r.observed),
+      threshold: r.threshold == null
+        ? null
+        : typeof r.threshold === 'number'
+          ? r.threshold
+          : String(r.threshold),
+      created_at: String(r.created_at ?? ''),
+      defer_until: r.defer_until ? String(r.defer_until) : null,
+      follow_up_goal_id: (r.follow_up_goal_id as string | null) ?? null
+    }))
+  } catch (e) {
+    console.warn(`[observability] getApprovalsQueue failed: ${(e as Error).message}`)
+    return []
+  }
+}
+
+export async function resolveApproval(
+  uuid: string,
+  resolution: ApprovalResolution
+): Promise<boolean> {
+  try {
+    const rows = await runCypherRaw(
+      'gemma',
+      `
+      MATCH (f:SentinelFinding {uuid: $uuid})
+      SET f.resolved_at = datetime(), f.resolution = $resolution
+      RETURN f.uuid AS uuid
+      `,
+      { uuid, resolution }
+    )
+    return rows.length > 0
+  } catch (e) {
+    console.warn(`[observability] resolveApproval failed: ${(e as Error).message}`)
+    return false
+  }
+}
+
+export async function deferApproval(uuid: string, hours: number): Promise<boolean> {
+  try {
+    const rows = await runCypherRaw(
+      'gemma',
+      `
+      MATCH (f:SentinelFinding {uuid: $uuid})
+      SET f.defer_until = datetime() + duration({hours: toInteger($hours)})
+      RETURN f.uuid AS uuid
+      `,
+      { uuid, hours }
+    )
+    return rows.length > 0
+  } catch (e) {
+    console.warn(`[observability] deferApproval failed: ${(e as Error).message}`)
+    return false
+  }
 }

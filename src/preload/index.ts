@@ -16,7 +16,9 @@ import type {
 import type {
   ObservabilitySnapshot,
   SentinelDetail,
-  SentinelDryRun
+  SentinelDryRun,
+  ApprovalItem,
+  ApprovalResolution
 } from '../shared/observability-types'
 
 const api = {
@@ -195,7 +197,14 @@ const api = {
   sentinelDryRun: (name: string): Promise<SentinelDryRun> =>
     ipcRenderer.invoke('sentinel:dry-run', name),
   sentinelSetEnabled: (name: string, enabled: boolean): Promise<boolean> =>
-    ipcRenderer.invoke('sentinel:set-enabled', { name, enabled })
+    ipcRenderer.invoke('sentinel:set-enabled', { name, enabled }),
+
+  // Patch 66 (Block D #138): Approvals queue.
+  approvalsList: (): Promise<ApprovalItem[]> => ipcRenderer.invoke('approvals:list'),
+  approvalsResolve: (uuid: string, resolution: ApprovalResolution): Promise<boolean> =>
+    ipcRenderer.invoke('approvals:resolve', { uuid, resolution }),
+  approvalsDefer: (uuid: string, hours: number): Promise<boolean> =>
+    ipcRenderer.invoke('approvals:defer', { uuid, hours })
 }
 
 export type MountMode = 'ro' | 'rw-confirm' | 'rw-free'

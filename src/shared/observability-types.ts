@@ -68,6 +68,21 @@ export interface SentinelDryRun {
   error?: string
 }
 
+export interface ApprovalItem {
+  uuid: string
+  source: 'sentinel'
+  name: string
+  severity: string
+  summary: string
+  observed: number | string | null
+  threshold: number | string | null
+  created_at: string
+  defer_until: string | null
+  follow_up_goal_id: string | null
+}
+
+export type ApprovalResolution = 'resolved' | 'dismissed'
+
 export interface ObservabilitySnapshot {
   conversationState: ConversationStateRow | null
   recentUmms: UmmRow[]

@@ -56,7 +56,10 @@ import {
   getObservabilitySnapshot,
   getSentinelDetail,
   dryRunSentinel,
-  setSentinelEnabled
+  setSentinelEnabled,
+  getApprovalsQueue,
+  resolveApproval,
+  deferApproval
 } from './observability'
 import { scheduler, PRIORITY } from './scheduler'
 
@@ -899,6 +902,17 @@ app.whenReady().then(async () => {
   ipcMain.handle('sentinel:dry-run', async (_e, name: string) => dryRunSentinel(name))
   ipcMain.handle('sentinel:set-enabled', async (_e, { name, enabled }: { name: string; enabled: boolean }) =>
     setSentinelEnabled(name, enabled)
+  )
+
+  // Patch 66 (Block D #138): Approvals queue.
+  ipcMain.handle('approvals:list', async () => getApprovalsQueue())
+  ipcMain.handle(
+    'approvals:resolve',
+    async (_e, { uuid, resolution }: { uuid: string; resolution: 'resolved' | 'dismissed' }) =>
+      resolveApproval(uuid, resolution)
+  )
+  ipcMain.handle('approvals:defer', async (_e, { uuid, hours }: { uuid: string; hours: number }) =>
+    deferApproval(uuid, hours)
   )
 
   // Patch 34: Autonomous Heartbeat controls.

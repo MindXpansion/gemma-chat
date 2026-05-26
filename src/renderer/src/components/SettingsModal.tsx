@@ -13,6 +13,7 @@
 import { useEffect, useState } from 'react'
 import ObservabilityTab from './settings/ObservabilityTab'
 import SentinelsTab from './settings/SentinelsTab'
+import ApprovalsTab from './settings/ApprovalsTab'
 import Heartbeat from './Heartbeat'
 
 export type TabId = 'observability' | 'models' | 'heartbeat' | 'sentinels' | 'hitl' | 'about'
@@ -21,8 +22,8 @@ const TABS: Array<{ id: TabId; label: string; stub?: boolean }> = [
   { id: 'observability', label: 'Observability' },
   { id: 'heartbeat', label: 'Heartbeat' },
   { id: 'sentinels', label: 'Sentinels' },
+  { id: 'hitl', label: 'Approvals' },
   { id: 'models', label: 'Models', stub: true },
-  { id: 'hitl', label: 'Approvals', stub: true },
   { id: 'about', label: 'About', stub: true }
 ]
 
@@ -106,6 +107,8 @@ export default function SettingsModal({ conversationId, initialTab = 'observabil
               </div>
             ) : tab === 'sentinels' ? (
               <SentinelsTab />
+            ) : tab === 'hitl' ? (
+              <ApprovalsTab />
             ) : (
               <StubPanel id={tab} />
             )}
@@ -121,8 +124,8 @@ function StubPanel({ id }: { id: TabId }) {
     observability: '',
     heartbeat: '',
     sentinels: '',
-    models: 'Model provider config + posture-gated cloud integrations. Patch 66 (#132).',
-    hitl: 'Approval queue: proposals from Mission / heartbeat that need a "go" before they execute. Patch 66.',
+    hitl: '',
+    models: 'Model provider config + posture-gated cloud integrations. Patch 67 (#132).',
     about: 'App version, model versions, KG stats, link to source.'
   }
   return (
