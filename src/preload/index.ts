@@ -13,6 +13,7 @@ import type {
   Mission,
   MissionEvent
 } from '../shared/types'
+import type { ObservabilitySnapshot } from '../shared/observability-types'
 
 const api = {
   startSetup: (model: string): Promise<void> => ipcRenderer.invoke('setup:start', model),
@@ -178,7 +179,11 @@ const api = {
     const listener = (_: IpcRendererEvent, ev: MissionEvent): void => cb(ev)
     ipcRenderer.on('mission:event', listener)
     return () => ipcRenderer.removeListener('mission:event', listener)
-  }
+  },
+
+  // Patch 63 (Block D #130): Settings Dashboard observability snapshot.
+  observabilitySnapshot: (conversationId: string): Promise<ObservabilitySnapshot> =>
+    ipcRenderer.invoke('observability:snapshot', conversationId)
 }
 
 export type MountMode = 'ro' | 'rw-confirm' | 'rw-free'

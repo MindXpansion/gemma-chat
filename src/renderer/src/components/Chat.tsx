@@ -14,6 +14,7 @@ import Sidebar from './Sidebar'
 import Canvas from './Canvas'
 import ConfirmCard from './ConfirmCard'
 import Heartbeat from './Heartbeat'
+import SettingsModal from './SettingsModal'
 
 interface Props {
   model: string
@@ -87,6 +88,7 @@ export default function Chat({ model, onSwitchModel }: Props) {
   })
   const [activeId, setActiveId] = useState<string>(() => conversations[0].id)
   const [view, setView] = useState<'chat' | 'heartbeat'>('chat')
+  const [settingsOpen, setSettingsOpen] = useState(false)
   const [streaming, setStreaming] = useState(false)
   const [pendingConfirm, setPendingConfirm] = useState<{
     id: string
@@ -319,7 +321,14 @@ export default function Chat({ model, onSwitchModel }: Props) {
             onToggleMode={toggleMode}
             onToggleCanvas={toggleCanvas}
             onSwitchModel={onSwitchModel}
+            onOpenSettings={() => setSettingsOpen(true)}
           />
+          {settingsOpen && (
+            <SettingsModal
+              conversationId={activeId}
+              onClose={() => setSettingsOpen(false)}
+            />
+          )}
           <MessageList
             messages={activeConversation.messages}
             streaming={streaming}
@@ -427,7 +436,8 @@ function Header({
   canvasOpen,
   onToggleMode,
   onToggleCanvas,
-  onSwitchModel
+  onSwitchModel,
+  onOpenSettings
 }: {
   model: string
   mode: AgentMode
@@ -435,6 +445,7 @@ function Header({
   onToggleMode: () => void
   onToggleCanvas: () => void
   onSwitchModel: (model: string) => void
+  onOpenSettings: () => void
 }) {
   const [pickerOpen, setPickerOpen] = useState(false)
   const pickerRef = useRef<HTMLDivElement>(null)
@@ -465,6 +476,16 @@ function Header({
         </ModePill>
       </div>
       <div className="no-drag flex shrink-0 items-center justify-end gap-2">
+        <button
+          onClick={onOpenSettings}
+          title="Settings"
+          className="flex h-7 w-7 items-center justify-center rounded-md text-ink-400 transition hover:bg-white/[0.05] hover:text-white"
+        >
+          <svg viewBox="0 0 16 16" className="h-3.5 w-3.5" fill="none" stroke="currentColor" strokeWidth="1.5">
+            <circle cx="8" cy="8" r="2" />
+            <path d="M8 1.5v2M8 12.5v2M1.5 8h2M12.5 8h2M3.4 3.4l1.4 1.4M11.2 11.2l1.4 1.4M3.4 12.6l1.4-1.4M11.2 4.8l1.4-1.4" strokeLinecap="round" />
+          </svg>
+        </button>
         <div className="relative" ref={pickerRef}>
           <button
             onClick={() => setPickerOpen((o) => !o)}

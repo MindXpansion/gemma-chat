@@ -52,6 +52,7 @@ import {
 import { analyzeUserMentalModel, getLatestUMM, getLatestUMMUuid } from './tom'
 import { selectStrategy, shiftPSV, DEFAULT_PSV } from '../shared/psv'
 import { writePSVState, upsertConversationState } from './conversation-state'
+import { getObservabilitySnapshot } from './observability'
 import { scheduler, PRIORITY } from './scheduler'
 
 scheduler.register('user_chat')
@@ -871,6 +872,11 @@ app.whenReady().then(async () => {
       const fs = await import('./gemma-fs')
       return fs.setMountMode(id, mode)
     }
+  )
+
+  // Patch 63 (Block D #130): Settings Dashboard — observability snapshot.
+  ipcMain.handle('observability:snapshot', async (_e, conversationId: string) =>
+    getObservabilitySnapshot(conversationId)
   )
 
   // Patch 34: Autonomous Heartbeat controls.
