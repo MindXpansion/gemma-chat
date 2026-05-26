@@ -25,7 +25,7 @@ const TABS: Array<{ id: TabId; label: string; stub?: boolean }> = [
   { id: 'sentinels', label: 'Sentinels' },
   { id: 'hitl', label: 'Approvals' },
   { id: 'models', label: 'Models' },
-  { id: 'about', label: 'About', stub: true }
+  { id: 'about', label: 'About' }
 ]
 
 interface Props {

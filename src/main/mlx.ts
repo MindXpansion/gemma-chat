@@ -32,6 +32,14 @@ function modelsDir(): string {
   return join(dataDir(), 'models')
 }
 
+/** Patch 67.1: exposed so models.ts can scan the same HF cache the MLX
+ *  subprocess writes to. Without this, the Models tab scans the SYSTEM
+ *  default (~/.cache/huggingface/hub) which is the wrong location for
+ *  this app and reports false "not downloaded" for every model. */
+export function hfHubDir(): string {
+  return join(modelsDir(), 'hub')
+}
+
 // ---------------------------------------------------------------------------
 // System Python detection
 // ---------------------------------------------------------------------------

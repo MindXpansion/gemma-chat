@@ -13,13 +13,15 @@
 
 import { promises as fs } from 'fs'
 import { join } from 'path'
-import { homedir } from 'os'
 import { AVAILABLE_MODELS, type ModelStatus, type ProviderId } from '@shared/types'
+import { hfHubDir } from './mlx'
 
+/** The HF cache the MLX subprocess actually reads/writes to. mlx.ts forces
+ *  HF_HOME=<userData>/mlx/models for the child, so the canonical hub dir is
+ *  <userData>/mlx/models/hub. Scanning ~/.cache/huggingface/hub would miss
+ *  every model unless the user happens to have a duplicate system cache. */
 function hubDir(): string {
-  const hfHome = process.env.HF_HOME
-  if (hfHome) return join(hfHome, 'hub')
-  return join(homedir(), '.cache', 'huggingface', 'hub')
+  return hfHubDir()
 }
 
 /** "mlx-community/gemma-4-e4b-it-4bit" -> "models--mlx-community--gemma-4-e4b-it-4bit" */
@@ -109,6 +111,12 @@ export async function deleteModelFromCache(name: string): Promise<{ ok: boolean;
   }
 
   const target = join(hubDir(), dirName)
+  // Sanity: target must be strictly inside hubDir to defeat any pathological
+  // dirName that survived the regex (defense in depth, belt-and-suspenders).
+  const root = hubDir()
+  if (!target.startsWith(root + '/')) {
+    return { ok: false, reason: 'path escaped hub root' }
+  }
   try {
     const st = await fs.stat(target)
     if (!st.isDirectory()) return { ok: false, reason: 'cache entry is not a directory' }
