@@ -52,7 +52,12 @@ import {
 import { analyzeUserMentalModel, getLatestUMM, getLatestUMMUuid } from './tom'
 import { selectStrategy, shiftPSV, DEFAULT_PSV } from '../shared/psv'
 import { writePSVState, upsertConversationState } from './conversation-state'
-import { getObservabilitySnapshot } from './observability'
+import {
+  getObservabilitySnapshot,
+  getSentinelDetail,
+  dryRunSentinel,
+  setSentinelEnabled
+} from './observability'
 import { scheduler, PRIORITY } from './scheduler'
 
 scheduler.register('user_chat')
@@ -887,6 +892,13 @@ app.whenReady().then(async () => {
   // Patch 63 (Block D #130): Settings Dashboard — observability snapshot.
   ipcMain.handle('observability:snapshot', async (_e, conversationId: string) =>
     getObservabilitySnapshot(conversationId)
+  )
+
+  // Patch 65 (Block D #137): Sentinels tab — per-sentinel detail + dry-run + toggle.
+  ipcMain.handle('sentinel:detail', async (_e, name: string) => getSentinelDetail(name))
+  ipcMain.handle('sentinel:dry-run', async (_e, name: string) => dryRunSentinel(name))
+  ipcMain.handle('sentinel:set-enabled', async (_e, { name, enabled }: { name: string; enabled: boolean }) =>
+    setSentinelEnabled(name, enabled)
   )
 
   // Patch 34: Autonomous Heartbeat controls.

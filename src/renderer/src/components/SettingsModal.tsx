@@ -12,6 +12,7 @@
 
 import { useEffect, useState } from 'react'
 import ObservabilityTab from './settings/ObservabilityTab'
+import SentinelsTab from './settings/SentinelsTab'
 import Heartbeat from './Heartbeat'
 
 export type TabId = 'observability' | 'models' | 'heartbeat' | 'sentinels' | 'hitl' | 'about'
@@ -19,8 +20,8 @@ export type TabId = 'observability' | 'models' | 'heartbeat' | 'sentinels' | 'hi
 const TABS: Array<{ id: TabId; label: string; stub?: boolean }> = [
   { id: 'observability', label: 'Observability' },
   { id: 'heartbeat', label: 'Heartbeat' },
+  { id: 'sentinels', label: 'Sentinels' },
   { id: 'models', label: 'Models', stub: true },
-  { id: 'sentinels', label: 'Sentinels', stub: true },
   { id: 'hitl', label: 'Approvals', stub: true },
   { id: 'about', label: 'About', stub: true }
 ]
@@ -103,6 +104,8 @@ export default function SettingsModal({ conversationId, initialTab = 'observabil
               <div className="-m-4 h-[calc(100%+2rem)]">
                 <Heartbeat />
               </div>
+            ) : tab === 'sentinels' ? (
+              <SentinelsTab />
             ) : (
               <StubPanel id={tab} />
             )}
@@ -117,10 +120,9 @@ function StubPanel({ id }: { id: TabId }) {
   const copy: Record<TabId, string> = {
     observability: '',
     heartbeat: '',
-    models: 'Model provider config + posture-gated cloud integrations. Patch 65 (#132).',
-    sentinels:
-      'Full sentinel editor — enable/disable, edit thresholds, validate YAMLs. Patch 65.',
-    hitl: 'Approval queue: proposals from Mission / heartbeat that need a "go" before they execute. Patch 65.',
+    sentinels: '',
+    models: 'Model provider config + posture-gated cloud integrations. Patch 66 (#132).',
+    hitl: 'Approval queue: proposals from Mission / heartbeat that need a "go" before they execute. Patch 66.',
     about: 'App version, model versions, KG stats, link to source.'
   }
   return (

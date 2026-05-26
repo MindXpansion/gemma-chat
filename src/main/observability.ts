@@ -9,13 +9,17 @@
  * are all O(small) — UMM stream limited to 20, sentinel findings to 20.
  */
 
-import { loadSentinels, type Sentinel } from './sentinels'
+import { readFile, writeFile } from 'fs/promises'
+import yaml from 'js-yaml'
+import { loadSentinels, comparatorFn, interpolate, type Sentinel } from './sentinels'
 import { runCypherRaw } from './aios-neo4j'
 import type {
   ConversationStateRow,
   UmmRow,
   SentinelFindingRow,
   SentinelRegistryRow,
+  SentinelDetail,
+  SentinelDryRun,
   ObservabilitySnapshot
 } from '../shared/observability-types'
 
@@ -24,6 +28,8 @@ export type {
   UmmRow,
   SentinelFindingRow,
   SentinelRegistryRow,
+  SentinelDetail,
+  SentinelDryRun,
   ObservabilitySnapshot
 }
 
@@ -169,11 +175,145 @@ async function getSentinelRegistry(): Promise<SentinelRegistryRow[]> {
       severity: s.severity,
       description: s.description,
       cadence_ticks: s.cadenceTicks,
-      file_path: s.filePath
+      file_path: s.filePath,
+      enabled: s.enabled
     }))
   } catch (e) {
     console.warn(`[observability] getSentinelRegistry failed: ${(e as Error).message}`)
     return []
+  }
+}
+
+async function findSentinelByName(name: string): Promise<Sentinel | null> {
+  const all = await loadSentinels()
+  return all.find((s) => s.name === name) ?? null
+}
+
+export async function getSentinelDetail(name: string): Promise<SentinelDetail | null> {
+  try {
+    const s = await findSentinelByName(name)
+    if (!s) return null
+    const findingRows = await runCypherRaw(
+      'gemma',
+      `
+      MATCH (f:SentinelFinding {name: $name})
+      RETURN f.name AS name, f.severity AS severity, coalesce(f.summary,'') AS summary,
+             f.observed AS observed, f.threshold AS threshold,
+             toString(f.created_at) AS created_at
+      ORDER BY f.created_at DESC LIMIT toInteger(10)
+      `,
+      { name }
+    )
+    const recent_findings: SentinelFindingRow[] = findingRows.map((r) => ({
+      name: String(r.name),
+      severity: String(r.severity ?? 'info'),
+      summary: String(r.summary ?? ''),
+      observed: r.observed == null ? null : Number(r.observed),
+      threshold: r.threshold == null ? null : Number(r.threshold),
+      created_at: String(r.created_at ?? '')
+    }))
+    return {
+      name: s.name,
+      severity: s.severity,
+      description: s.description,
+      cadence_ticks: s.cadenceTicks,
+      file_path: s.filePath,
+      enabled: s.enabled,
+      query: s.query,
+      comparator: s.comparator,
+      threshold: s.threshold,
+      summary_template: s.summaryTemplate,
+      follow_up_prompt: s.followUpPrompt ?? null,
+      action_on_cross: s.actionOnCross,
+      recent_findings
+    }
+  } catch (e) {
+    console.warn(`[observability] getSentinelDetail failed: ${(e as Error).message}`)
+    return null
+  }
+}
+
+/**
+ * Dry-run a sentinel: execute its Cypher and compute the cross verdict
+ * WITHOUT writing a SentinelFinding to the KG or affecting the audit
+ * cadence. Gives Bear instant feedback on what the sentinel sees right
+ * now. Real findings still only come from the heartbeat audit tick.
+ */
+export async function dryRunSentinel(name: string): Promise<SentinelDryRun> {
+  const t0 = Date.now()
+  try {
+    const s = await findSentinelByName(name)
+    if (!s) {
+      return { ok: false, observed: null, crossed: false, summary: '', elapsed_ms: 0, error: `sentinel '${name}' not found` }
+    }
+    const rows = await runCypherRaw('gemma', s.query, s.params)
+    const elapsed_ms = Date.now() - t0
+    const observedRaw = rows[0]?.observed
+    if (observedRaw == null) {
+      return {
+        ok: false,
+        observed: null,
+        crossed: false,
+        summary: '',
+        elapsed_ms,
+        error: "query returned no 'observed' column"
+      }
+    }
+    const observed =
+      typeof observedRaw === 'number' || typeof observedRaw === 'string' || typeof observedRaw === 'boolean'
+        ? observedRaw
+        : String(observedRaw)
+    const cmp = comparatorFn(s.comparator)
+    const crossed = typeof observed === 'number' && typeof s.threshold === 'number'
+      ? cmp(observed, s.threshold)
+      : observed === s.threshold
+    const summary = interpolate(s.summaryTemplate, {
+      observed,
+      threshold: s.threshold,
+      name: s.name
+    })
+    return { ok: true, observed, crossed, summary, elapsed_ms }
+  } catch (e) {
+    return {
+      ok: false,
+      observed: null,
+      crossed: false,
+      summary: '',
+      elapsed_ms: Date.now() - t0,
+      error: (e as Error).message
+    }
+  }
+}
+
+/**
+ * Toggle a sentinel's `enabled` field by editing its YAML in place.
+ * No file rename — runAudit honors the `enabled` boolean on its own
+ * (heartbeat.ts:1813 `sentinels.filter(s => s.enabled)`).
+ *
+ * Limitation: js-yaml.dump loses comments. Sentinel YAMLs are small
+ * and machine-tidy so this is acceptable; the operator can always
+ * hand-edit if they need rich comments.
+ */
+export async function setSentinelEnabled(name: string, enabled: boolean): Promise<boolean> {
+  try {
+    const s = await findSentinelByName(name)
+    if (!s) {
+      console.warn(`[observability] setSentinelEnabled: '${name}' not found`)
+      return false
+    }
+    const raw = await readFile(s.filePath, 'utf-8')
+    const doc = yaml.load(raw) as Record<string, unknown>
+    if (!doc || typeof doc !== 'object') {
+      console.warn(`[observability] setSentinelEnabled: '${name}' YAML did not parse to object`)
+      return false
+    }
+    doc.enabled = enabled
+    const out = yaml.dump(doc, { lineWidth: 120, noRefs: true })
+    await writeFile(s.filePath, out, 'utf-8')
+    return true
+  } catch (e) {
+    console.warn(`[observability] setSentinelEnabled failed: ${(e as Error).message}`)
+    return false
   }
 }
 

@@ -45,6 +45,27 @@ export interface SentinelRegistryRow {
   description: string
   cadence_ticks: number
   file_path: string
+  enabled: boolean
+}
+
+export interface SentinelDetail extends SentinelRegistryRow {
+  query: string
+  comparator: 'gt' | 'gte' | 'lt' | 'lte' | 'eq' | 'neq'
+  threshold: number | string
+  summary_template: string
+  follow_up_prompt: string | null
+  action_on_cross: 'log_only' | 'journal_appended' | 'follow_up_enqueued'
+  /** Last N findings for THIS sentinel, newest first. */
+  recent_findings: SentinelFindingRow[]
+}
+
+export interface SentinelDryRun {
+  ok: boolean
+  observed: number | string | boolean | null
+  crossed: boolean
+  summary: string
+  elapsed_ms: number
+  error?: string
 }
 
 export interface ObservabilitySnapshot {

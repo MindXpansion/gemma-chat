@@ -13,7 +13,11 @@ import type {
   Mission,
   MissionEvent
 } from '../shared/types'
-import type { ObservabilitySnapshot } from '../shared/observability-types'
+import type {
+  ObservabilitySnapshot,
+  SentinelDetail,
+  SentinelDryRun
+} from '../shared/observability-types'
 
 const api = {
   startSetup: (model: string): Promise<void> => ipcRenderer.invoke('setup:start', model),
@@ -183,7 +187,15 @@ const api = {
 
   // Patch 63 (Block D #130): Settings Dashboard observability snapshot.
   observabilitySnapshot: (conversationId: string): Promise<ObservabilitySnapshot> =>
-    ipcRenderer.invoke('observability:snapshot', conversationId)
+    ipcRenderer.invoke('observability:snapshot', conversationId),
+
+  // Patch 65 (Block D #137): Sentinels tab.
+  sentinelDetail: (name: string): Promise<SentinelDetail | null> =>
+    ipcRenderer.invoke('sentinel:detail', name),
+  sentinelDryRun: (name: string): Promise<SentinelDryRun> =>
+    ipcRenderer.invoke('sentinel:dry-run', name),
+  sentinelSetEnabled: (name: string, enabled: boolean): Promise<boolean> =>
+    ipcRenderer.invoke('sentinel:set-enabled', { name, enabled })
 }
 
 export type MountMode = 'ro' | 'rw-confirm' | 'rw-free'
