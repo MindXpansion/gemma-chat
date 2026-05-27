@@ -1,7 +1,7 @@
 import { EventEmitter } from 'events'
 import { readFile, writeFile } from 'fs/promises'
 import { join } from 'path'
-import { chatStream, type MLXChatMessage } from './mlx'
+import { chatStream, SAMPLING_PROFILES, type MLXChatMessage } from './mlx'
 import { HEARTBEAT_TOOLS, runProbe, ticksDir, stamp, researchDir } from './heartbeat'
 import type { Mission, MissionStep, MissionEvent } from '../shared/types'
 import { scheduler, PRIORITY } from './scheduler'
@@ -25,7 +25,12 @@ scheduler.register('mission_decompose')
  * write capability are later layers — L1 proves the loop safely.
  */
 
-const DECOMPOSE_TEMP = 0.7
+/** Patch 70: decompose now uses the toolSynth profile (temp 0.6, top_k 20,
+ *  top_p 0.9). Pre-Patch-70 was a bare temp=0.7. The decomposer parses
+ *  structured "STEP: ..." lines from the model output, so tighter sampling
+ *  improves format adherence. See docs/baselines/sampling-baseline-2026-05-26.md
+ *  for rollback. */
+
 /** A whole mission is aborted if it runs past this. */
 const MISSION_TIMEOUT_MS = 30 * 60 * 1000
 /** Cap the decomposed plan — keeps an unattended run bounded. */
@@ -140,7 +145,14 @@ async function decompose(
   let buffer = ''
   await scheduler.acquire('mission_decompose', PRIORITY.MISSION)
   try {
-    for await (const chunk of chatStream({ model, messages, signal, temperature: DECOMPOSE_TEMP })) {
+    for await (const chunk of chatStream({
+      model,
+      messages,
+      signal,
+      temperature: SAMPLING_PROFILES.toolSynth.temperature,
+      top_k: SAMPLING_PROFILES.toolSynth.top_k,
+      top_p: SAMPLING_PROFILES.toolSynth.top_p
+    })) {
       if (chunk.content) buffer += chunk.content
       if (chunk.done) break
     }

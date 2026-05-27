@@ -2,7 +2,7 @@ import { app } from 'electron'
 import { EventEmitter } from 'events'
 import { mkdir, readFile, writeFile, readdir, stat } from 'fs/promises'
 import { join } from 'path'
-import { chatStream, type MLXChatMessage } from './mlx'
+import { chatStream, SAMPLING_PROFILES, pickAgenticProfile, type MLXChatMessage } from './mlx'
 import { scheduler, PRIORITY } from './scheduler'
 import { TOOLS, findNextAction, runTool, type ToolContext, type ParsedAction } from './tools'
 import { ensureGemmaHome } from './gemma-fs'
@@ -47,9 +47,10 @@ import type {
 
 // --- Tunables ---------------------------------------------------------------
 
-/** Chat parity (0.7). Lower temperatures make the model deterministically
- *  emit a stop token right after a <|tool_response>, ending a tick early. */
-const HEARTBEAT_TEMP = 0.7
+/** Patch 70: sampling moved to per-turn profiles via SAMPLING_PROFILES +
+ *  pickAgenticProfile(). Pre-Patch-70 value was 0.7 across all heartbeat
+ *  turns; see docs/baselines/sampling-baseline-2026-05-26.md for rollback. */
+
 /** A runaway tick is aborted after this long. */
 const TICK_TIMEOUT_MS = 6 * 60 * 1000
 const MIN_CADENCE_MINUTES = 5
@@ -561,7 +562,20 @@ async function collectStream(
   let buffer = ''
   await scheduler.acquire(callerId, PRIORITY.HEARTBEAT)
   try {
-    for await (const chunk of chatStream({ model, messages, signal, temperature: HEARTBEAT_TEMP })) {
+    // Patch 70 (Option B): per-turn profile. After a tool_response the model
+    // is about to synthesize a structured reply — use the tighter toolSynth
+    // profile. Otherwise it's an exploration turn — use the heartbeat profile.
+    const profileName = pickAgenticProfile(messages)
+    const profile = SAMPLING_PROFILES[profileName]
+    console.log(`[heartbeat] sampling caller=${callerId} profile=${profileName} temp=${profile.temperature} top_k=${profile.top_k ?? '-'} top_p=${profile.top_p ?? '-'}`)
+    for await (const chunk of chatStream({
+      model,
+      messages,
+      signal,
+      temperature: profile.temperature,
+      top_k: profile.top_k,
+      top_p: profile.top_p
+    })) {
       if (chunk.content) {
         buffer += chunk.content
         if (untilAction) {

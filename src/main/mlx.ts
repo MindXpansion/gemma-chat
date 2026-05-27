@@ -545,6 +545,48 @@ export interface MLXChatOptions {
   messages: MLXChatMessage[]
   signal?: AbortSignal
   temperature?: number
+  /** Patch 70: optional sampling truncation. Pass-through to mlx-vlm's
+   *  OpenAI-compat server. Omit either to leave it unset (server default = no
+   *  truncation, which is the pre-Patch-70 baseline — see
+   *  docs/baselines/sampling-baseline-2026-05-26.md). */
+  top_k?: number
+  top_p?: number
+}
+
+/**
+ * Patch 70: named sampling profiles. Three intents, three tunings:
+ *
+ *   • chat        — exactly the pre-Patch-70 baseline (temp 0.7, no
+ *                   top-k/top-p). Preserves the user-facing chat feel.
+ *   • heartbeat   — for free-form heartbeat/mission research turns. Slight
+ *                   top-k/top-p truncation that lets the agent wander but
+ *                   shaves the worst tail tokens.
+ *   • toolSynth   — for turns that emit a tool call or parse structured
+ *                   output (ToM analyzer, mission decompose, the model turn
+ *                   immediately after a tool_response). Tighter sampling to
+ *                   improve format adherence.
+ *
+ * Numbers chosen against Gemma 4's author defaults (temp 1.0, top_k 64,
+ * top_p 0.95 per the model's generation_config.json) — heartbeat sits at
+ * roughly half the author truncation, tool-synth at roughly a third.
+ */
+export const SAMPLING_PROFILES = {
+  chat: { temperature: 0.7 } as { temperature: number; top_k?: number; top_p?: number },
+  heartbeat: { temperature: 0.7, top_k: 40, top_p: 0.95 },
+  toolSynth: { temperature: 0.6, top_k: 20, top_p: 0.9 }
+} as const
+
+export type SamplingProfileName = keyof typeof SAMPLING_PROFILES
+
+/**
+ * Patch 70 (Option B): inside heartbeat/mission tick loops, decide which
+ * profile to use for the NEXT model turn based on the last message in the
+ * conversation. If the model is about to respond to a `tool` result, it's
+ * synthesis (tighter); otherwise it's exploration (heartbeat profile).
+ */
+export function pickAgenticProfile(messages: MLXChatMessage[]): SamplingProfileName {
+  const last = messages[messages.length - 1]
+  return last?.role === 'tool' ? 'toolSynth' : 'heartbeat'
 }
 
 export async function* chatStream(
@@ -586,6 +628,10 @@ export async function* chatStream(
       stream: true,
       stream_options: { include_usage: true },
       temperature: opts.temperature ?? 0.7,
+      // Patch 70: forward top_k/top_p ONLY when explicitly set. Omitting them
+      // preserves the pre-Patch-70 baseline (server default = no truncation).
+      ...(opts.top_k != null ? { top_k: opts.top_k } : {}),
+      ...(opts.top_p != null ? { top_p: opts.top_p } : {}),
       max_tokens: 8192
     }),
     signal: opts.signal

@@ -1,7 +1,7 @@
 import { mkdir, writeFile } from 'fs/promises'
 import { join } from 'path'
 import { ensureGemmaHome } from './gemma-fs'
-import { chatStream, type MLXChatMessage } from './mlx'
+import { chatStream, SAMPLING_PROFILES, type MLXChatMessage } from './mlx'
 import { scheduler, PRIORITY } from './scheduler'
 import { writeUserMentalModel } from './conversation-state'
 
@@ -152,7 +152,18 @@ async function collect(
   let buf = ''
   await scheduler.acquire('tom_analyzer', PRIORITY.TOM)
   try {
-    for await (const chunk of chatStream({ model, messages, signal })) {
+    // Patch 70: tool-synth profile. The ToM analyzer's output is parsed line
+    // by line into a structured UserMentalModel — exactly the case where
+    // sampling tightness pays off (cf. Patch 68 parse-failed diagnosis,
+    // where the model invented "clarifying" outside the closed enum).
+    for await (const chunk of chatStream({
+      model,
+      messages,
+      signal,
+      temperature: SAMPLING_PROFILES.toolSynth.temperature,
+      top_k: SAMPLING_PROFILES.toolSynth.top_k,
+      top_p: SAMPLING_PROFILES.toolSynth.top_p
+    })) {
       if (chunk.content) buf += chunk.content
       if (chunk.done) break
     }
