@@ -410,7 +410,29 @@ async function handleChat(req: ChatRequest, channel: string): Promise<void> {
       // Patch 57: gate MLX access via the scheduler. USER_CHAT is priority 1
       // (highest); per-round acquire/release lets heartbeat/ToM slip between
       // tool rounds rather than waiting for the whole multi-round conversation.
+      const tAcquireStart = Date.now()
       await scheduler.acquire('user_chat', PRIORITY.USER_CHAT)
+      const acquireWaitedMs = Date.now() - tAcquireStart
+      // Patch 71: dead-man timer reset on dispatch.
+      //
+      // Bug: the preload's 90s dead-man timer (sendChat in src/preload/index.ts)
+      // starts when the user sends, then resets on every chunk received. If
+      // the scheduler queues user_chat behind a long-running heartbeat probe,
+      // we can burn 30-50s of the budget BEFORE MLX even starts working.
+      // Patch 69 instrumentation proved this: waited_ms=48507 + held_ms=41495
+      // = 90s total, first_token_seen=false. MLX never wedged — the timer
+      // simply ran out of budget while waiting in the queue.
+      //
+      // Fix: emit an activity chunk immediately after dispatch. The renderer
+      // resets the dead-man timer on any chunk, so this gives user_chat a
+      // FRESH 90s budget once it actually has the lock — same effective TTFT
+      // budget regardless of how long it queued. Architecturally the right
+      // fix is preemption (Patch 72) so user_chat doesn't queue at all when
+      // heartbeat is mid-tick; this patch buys safety until that lands.
+      if (acquireWaitedMs > 100) {
+        console.log(`[chat] dispatch id=${reqId} acquire_waited_ms=${acquireWaitedMs} — emitting reset activity`)
+      }
+      emit({ type: 'activity', activity: { kind: 'thinking', chars: 0 } })
       try {
       streamLoop: for await (const chunk of chatStream({
         model: req.model,
