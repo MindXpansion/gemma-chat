@@ -66,7 +66,7 @@ const ANALYZER_SYSTEM = [
   '',
   '  USER_EMOTION: <single lowercase word, or "neutral">',
   '  EMOTION_INTENSITY: <0.0–1.0>',
-  '  USER_INTENTION: <debugging | exploring | venting | planning | asking | celebrating | directing | other>',
+  '  USER_INTENTION: <pick EXACTLY one: debugging | exploring | venting | planning | asking | celebrating | directing | other>',
   '  KNOWLEDGE_GAP: <one sentence — what does this user appear NOT to know that is relevant? "none" if no gap.>',
   '  RAPPORT_LEVEL: <0.0–1.0>',
   '  ANALYZER_CONFIDENCE: <0.0–1.0 — how sure are you about this whole read>',
@@ -75,7 +75,8 @@ const ANALYZER_SYSTEM = [
   '- USER_EMOTION examples: frustrated, curious, tired, excited, focused, anxious, grateful, neutral.',
   '- EMOTION_INTENSITY: 0.1 is barely-there, 0.5 is clearly present, 0.9 is overwhelming.',
   '- RAPPORT_LEVEL: 0.3 is transactional, 0.6 is friendly working relationship, 0.9 is warm partner energy.',
-  '- ANALYZER_CONFIDENCE: lower this if the message is short, ambiguous, or you are guessing.'
+  '- ANALYZER_CONFIDENCE: lower this if the message is short, ambiguous, or you are guessing.',
+  '- USER_INTENTION must be ONE of the eight listed values verbatim. If none fit precisely, use "other". Do NOT invent new categories (no "clarifying", "thanking", "agreeing" — fold those into asking/celebrating/other respectively).'
 ].join('\n')
 
 export async function tomDir(): Promise<string> {
@@ -96,13 +97,17 @@ function parseToM(raw: string): UserMentalModel | null {
       const v = parseFloat(m[1])
       if (Number.isFinite(v) && v >= 0 && v <= 1) out.emotion_intensity = v
     } else if ((m = line.match(/^USER_INTENTION\s*:\s*(\w+)/i))) {
-      const verb = m[1].toLowerCase() as UserIntention
-      if (
-        ['debugging', 'exploring', 'venting', 'planning', 'asking', 'celebrating', 'directing', 'other'].includes(
-          verb
-        )
-      ) {
-        out.user_intention = verb
+      const verb = m[1].toLowerCase()
+      const legal = ['debugging', 'exploring', 'venting', 'planning', 'asking', 'celebrating', 'directing', 'other']
+      if (legal.includes(verb)) {
+        out.user_intention = verb as UserIntention
+      } else {
+        // Patch 68: defense in depth. The prompt forbids invented categories
+        // ("clarifying", "thanking", "agreeing", etc.) but the model still
+        // deviates. Coerce to 'other' rather than dropping the field, which
+        // would null the whole UMM and lose the rest of the analyzer's read.
+        console.warn(`[tom] coerced out-of-enum USER_INTENTION="${verb}" -> "other"`)
+        out.user_intention = 'other'
       }
     } else if ((m = line.match(/^KNOWLEDGE_GAP\s*:\s*(.+)$/i))) {
       out.knowledge_gap = m[1].trim().slice(0, 500)
