@@ -233,6 +233,24 @@ async function handleChat(req: ChatRequest, channel: string): Promise<void> {
 
   const emit = (chunk: StreamChunk): void => send(channel, chunk)
 
+  // Patch 69: chat request telemetry. Short id keyed off start time so we can
+  // correlate request-start / first-token / aborted lines in the terminal
+  // when the 90s timeout next fires.
+  const reqId = `r${Date.now().toString(36).slice(-6)}`
+  const reqStartMs = Date.now()
+  let firstTokenLogged = false
+  console.log(
+    `[chat] request-start id=${reqId} conv=${req.conversationId} model=${req.model} mode=${req.mode} messages=${req.messages.length}`
+  )
+  const onAbort = (): void => {
+    console.warn(`[chat] aborted id=${reqId} reason=abort-signal elapsed_ms=${Date.now() - reqStartMs}`)
+  }
+  abort.signal.addEventListener('abort', onAbort, { once: true })
+  // Patch 69: status carried from try/catch into finally for a single end log.
+  let endStatus: 'done' | 'error' | 'aborted' = 'done'
+  let endErrName: string | undefined
+  let endErrMsg: string | undefined
+
   try {
     const baseMessages: MLXChatMessage[] = []
 
@@ -403,6 +421,13 @@ async function handleChat(req: ChatRequest, channel: string): Promise<void> {
           if (firstToken) {
             firstToken = false
             emit({ type: 'activity', activity: { kind: 'generating', chars: 0 } })
+            // Patch 69: first-token latency. If this never logs but no abort
+            // either, the MLX server accepted the request and produced
+            // nothing — the wedge signature.
+            if (!firstTokenLogged) {
+              firstTokenLogged = true
+              console.log(`[chat] first-token id=${reqId} ms=${Date.now() - reqStartMs}`)
+            }
           }
           buffer += chunk.content
 
@@ -618,13 +643,33 @@ async function handleChat(req: ChatRequest, channel: string): Promise<void> {
     })
   } catch (e) {
     emit({ type: 'activity', activity: { kind: 'idle' } })
-    if ((e as Error).name === 'AbortError') {
+    const errName = (e as Error).name
+    const errMsg = (e as Error).message
+    // Patch 69: capture error context for the finally-block end log.
+    // first_token_seen=false at finally is the MLX-wedge signature.
+    endStatus = errName === 'AbortError' ? 'aborted' : 'error'
+    endErrName = errName
+    endErrMsg = errMsg
+    if (errName === 'AbortError') {
       emit({ type: 'done' })
     } else {
-      emit({ type: 'error', error: (e as Error).message })
+      emit({ type: 'error', error: errMsg })
     }
   } finally {
     chatAbortControllers.delete(req.conversationId)
+    abort.signal.removeEventListener('abort', onAbort)
+    // Patch 69: single end-of-request log, regardless of path. ToM analysis
+    // below still runs for errored turns (capturing user emotion on a
+    // failed reply is informative — frustration spikes, etc.).
+    if (endStatus === 'done') {
+      console.log(
+        `[chat] request-end id=${reqId} status=done elapsed_ms=${Date.now() - reqStartMs} first_token_seen=${firstTokenLogged}`
+      )
+    } else {
+      console.warn(
+        `[chat] request-end id=${reqId} status=${endStatus} name=${endErrName} elapsed_ms=${Date.now() - reqStartMs} first_token_seen=${firstTokenLogged} msg="${(endErrMsg ?? '').slice(0, 200).replace(/\n/g, ' ')}"`
+      )
+    }
     // Patch 49 (Tier 4.2): fire ToM analysis on the user's latest message.
     // Chat mode only — code mode is precision-focused, no persona/PSV/ToM.
     // Sequential after the stream (MLX now free), fire-and-forget. Best-

@@ -136,6 +136,13 @@ class AgentScheduler {
         `[scheduler] release mismatch: running='${this.running?.callerId ?? 'none'}' releaser='${callerId}'`
       )
     }
+    // Patch 69: log how long the caller held the lock. A long hold by
+    // tom_analyzer / heartbeat right before a USER_CHAT timeout is the
+    // signature we're hunting.
+    if (this.running) {
+      const heldMs = Date.now() - this.running.startedAt
+      console.log(`[scheduler] release caller=${callerId} held_ms=${heldMs}`)
+    }
     this.running = null
     this.emitChange()
     this.tryDispatch()
@@ -162,6 +169,14 @@ class AgentScheduler {
     // Lowest priority number first, FIFO within priority.
     this.waiters.sort((a, b) => a.priority - b.priority || a.queuedAt - b.queuedAt)
     const next = this.waiters.shift()!
+
+    // Patch 69: dispatch telemetry. waited_ms tells us when a USER_CHAT was
+    // queued behind a slower caller (TOM / HEARTBEAT / MISSION) — the
+    // smoking-gun signal for the 90s-timeout investigation.
+    const waitedMs = Date.now() - next.queuedAt
+    console.log(
+      `[scheduler] dispatch caller=${next.callerId} priority=${next.priority} waited_ms=${waitedMs} queue_depth=${this.waiters.length}`
+    )
 
     this.running = {
       callerId: next.callerId,
