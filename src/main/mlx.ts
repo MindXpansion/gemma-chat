@@ -554,25 +554,34 @@ export interface MLXChatOptions {
 }
 
 /**
- * Patch 70: named sampling profiles. Three intents, three tunings:
+ * Patch 70 + Patch 71.2: named sampling profiles. Three intents, three tunings:
  *
  *   • chat        — exactly the pre-Patch-70 baseline (temp 0.7, no
  *                   top-k/top-p). Preserves the user-facing chat feel.
- *   • heartbeat   — for free-form heartbeat/mission research turns. Slight
- *                   top-k/top-p truncation that lets the agent wander but
- *                   shaves the worst tail tokens.
+ *   • heartbeat   — for free-form heartbeat/mission research turns. Bare
+ *                   temp 0.7, no truncation. Reverted from Patch 70's
+ *                   top_k=40/top_p=0.95 in 71.2 after measuring a severe
+ *                   regression: pre-Patch-70 narrate turns were 3-28s,
+ *                   post-Patch-70 they ran 2-4 MINUTES because top_k was
+ *                   squeezing the EOS token out of the sampling pool and
+ *                   the model literally couldn't terminate. See
+ *                   docs/baselines/sampling-baseline-2026-05-26.md +
+ *                   commit message for Patch 71.2 for the journal evidence.
  *   • toolSynth   — for turns that emit a tool call or parse structured
  *                   output (ToM analyzer, mission decompose, the model turn
  *                   immediately after a tool_response). Tighter sampling to
- *                   improve format adherence.
+ *                   improve format adherence. Unchanged from Patch 70 — the
+ *                   EOS-suppression issue doesn't bite here because tool
+ *                   outputs are inherently short.
  *
  * Numbers chosen against Gemma 4's author defaults (temp 1.0, top_k 64,
- * top_p 0.95 per the model's generation_config.json) — heartbeat sits at
- * roughly half the author truncation, tool-synth at roughly a third.
+ * top_p 0.95 per the model's generation_config.json). Author defaults work
+ * for them partly because temp=1.0 gives EOS more probability mass; we run
+ * cooler so EOS truncation matters more.
  */
 export const SAMPLING_PROFILES = {
   chat: { temperature: 0.7 } as { temperature: number; top_k?: number; top_p?: number },
-  heartbeat: { temperature: 0.7, top_k: 40, top_p: 0.95 },
+  heartbeat: { temperature: 0.7 } as { temperature: number; top_k?: number; top_p?: number },
   toolSynth: { temperature: 0.6, top_k: 20, top_p: 0.9 }
 } as const
 
