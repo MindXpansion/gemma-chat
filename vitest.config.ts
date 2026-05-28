@@ -25,12 +25,16 @@ export default defineConfig({
       reporter: ['text', 'html', 'json-summary'],
       include: ['src/main/**/*.ts', 'src/shared/**/*.ts', 'src/preload/**/*.ts'],
       exclude: ['src/**/*.d.ts', 'src/**/index.ts', 'src/renderer/**'],
-      // Targets are deliberately modest while we build up. Adjust per phase.
+      // Floor — locks in the post-Wave-A gain. Per-module coverage is much
+      // higher (shared/ ~100%, scheduler 100%, env-loader 97%, observability
+      // 71%, models 88%, sentinels 94%) but the global number is dragged
+      // down by the still-uncovered giants (mlx.ts, heartbeat.ts, tools.ts,
+      // index.ts at 0%). Wave B and beyond will lift this.
       thresholds: {
-        lines: 5,
-        functions: 5,
-        branches: 5,
-        statements: 5
+        lines: 12,
+        functions: 10,
+        branches: 12,
+        statements: 12
       }
     }
   },
