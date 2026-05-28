@@ -15,7 +15,26 @@ Sub-agents adding fixtures must update this file in the same commit.
 
 ## test/fixtures/mission/ (mission decomposer outputs)
 
-*Empty — populate during Wave B (B2 agent).*
+Synthesized per the decompose system prompt in `src/main/mission.ts` (Wave B2;
+live-MLX-captured fixtures are deferred to Wave C2 which owns the MLX
+subprocess). Each fixture targets a specific parser code path:
+
+- `clean-three-step.txt` — happy-path 3-step plan, exactly matches the prompt's
+  required `STEP: <sentence>` format. Catches a regression that broke basic
+  parsing (e.g. tightening the regex too far).
+- `single-step.txt` — minimum viable plan (1 STEP). Catches a regex that
+  required at least 2 matches before yielding any.
+- `with-prose-noise.txt` — STEP lines surrounded by preamble + trailing
+  commentary. Catches a parser that anchored at start-of-buffer instead of
+  start-of-line.
+- `numbered-bulleted.txt` — STEP lines prefixed with `1.`, `-`, `  *` etc.
+  Catches a regex that stopped accepting the leading `[\s\-*\d.]*` prefix.
+- `malformed-no-steps.txt` — model gave up and emitted only prose. Catches a
+  parser that synthesized fake steps instead of returning [] so the engine
+  can mark the mission `stuck`.
+- `oversized-twelve-steps.txt` — 12 STEP lines, exercises the MAX_STEPS=10
+  cap. Catches a regression that removed the `.slice(0, MAX_STEPS)`
+  truncation.
 
 ---
 

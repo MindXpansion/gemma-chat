@@ -1,0 +1,1 @@
+STEP: Use gemma_kg_schema to inspect the structure of the knowledge graph.

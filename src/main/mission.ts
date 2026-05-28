@@ -108,7 +108,12 @@ export function getMissions(): Mission[] {
 
 // --- Decomposition ----------------------------------------------------------
 
-function decomposeSystemPrompt(): string {
+/** Exported for tests (Wave B2). The system prompt the decomposer turn
+ *  uses — the contract that produces the `STEP: …` lines that
+ *  parseMissionSteps consumes. Kept as a function (not a const) so the
+ *  HEARTBEAT_TOOLS list is resolved at call time and stays in sync with
+ *  whatever offline tools the heartbeat layer currently exposes. */
+export function decomposeSystemPrompt(): string {
   return [
     "You are Gemma, an AI assistant running 100% locally on Bear's Mac, planning how to accomplish a mission Bear has assigned you.",
     '',
@@ -159,6 +164,23 @@ async function decompose(
   } finally {
     scheduler.release('mission_decompose')
   }
+  return parseMissionSteps(buffer)
+}
+
+/**
+ * Parse the decomposer's raw model output into an ordered list of step
+ * instructions. Extracted from `decompose` so it is testable without paying
+ * the cost of a live MLX round-trip (Wave B2). Truncates to MAX_STEPS so the
+ * caller can rely on the cap regardless of how chatty the model was.
+ *
+ * Matches lines like:
+ *   STEP: do the thing
+ *   - STEP: do the thing
+ *   3. STEP: do the thing
+ *   step: do the thing  (case-insensitive)
+ * Blank STEP lines (no instruction text) are dropped.
+ */
+export function parseMissionSteps(buffer: string): string[] {
   const steps: string[] = []
   for (const m of buffer.matchAll(/^[\s\-*\d.]*STEP\s*:\s*(.+)$/gim)) {
     const t = m[1].trim()
@@ -167,11 +189,16 @@ async function decompose(
   return steps.slice(0, MAX_STEPS)
 }
 
+/** Exposed for tests (Wave B2). Bounded plan length — the run engine caps
+ *  the decomposed step list at this many entries. */
+export const MAX_MISSION_STEPS = MAX_STEPS
+
 // --- Execution --------------------------------------------------------------
 
 /** Mission objective + the summaries of completed steps — context the
- *  current step's probe sees so the mission stays coherent. */
-function missionNotes(mission: Mission): string {
+ *  current step's probe sees so the mission stays coherent.
+ *  Exported for tests (Wave B2). */
+export function missionNotes(mission: Mission): string {
   const done = mission.steps.filter((s) => s.status === 'done' && s.summary)
   const lines = [`Mission objective: ${mission.objective}`]
   if (done.length > 0) {
