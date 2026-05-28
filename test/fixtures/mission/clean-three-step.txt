@@ -1,0 +1,3 @@
+STEP: Use gemma_kg_schema to inspect the structure of the knowledge graph and identify any :ConversationState nodes.
+STEP: Use gemma_kg_query to count how many :ConversationState nodes exist and list their conversationIds.
+STEP: Use fs_write to save the summary to ~/Documents/kg-conversation-state-report.md describing what was found.

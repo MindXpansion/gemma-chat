@@ -1,0 +1,12 @@
+STEP: Use gemma_kg_schema to list all node labels.
+STEP: Use gemma_kg_schema to list all relationship types.
+STEP: Use gemma_kg_query to count nodes of each label.
+STEP: Use gemma_kg_query to count relationships of each type.
+STEP: Use gemma_kg_query to find the 5 most-connected nodes.
+STEP: Use gemma_kg_query to find any orphan nodes.
+STEP: Use gemma_kg_query to find any nodes missing required properties.
+STEP: Use gemma_kg_query to find duplicate Decision nodes.
+STEP: Use gemma_kg_query to find Decisions with no rationale.
+STEP: Use gemma_kg_query to look up the oldest Decision node.
+STEP: Use gemma_kg_query to look up the newest Decision node.
+STEP: Use fs_write to save the report to ~/Documents/kg-audit.md.

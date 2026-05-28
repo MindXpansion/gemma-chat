@@ -1,0 +1,6 @@
+Sure! Here's the plan I came up with for the mission:
+
+STEP: Use gemma_kg_schema to enumerate the labels and relationship types available in the partnership KG.
+STEP: Use gemma_kg_query to count the number of :Decision nodes and group them by status.
+
+These two steps should give you a good overview before you decide how to proceed.

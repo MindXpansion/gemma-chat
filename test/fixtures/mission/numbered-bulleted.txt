@@ -1,0 +1,4 @@
+1. STEP: Use fs_read to read the contents of ~/Documents/notes.md.
+2. STEP: Use gemma_kg_query to find any :Note nodes that reference today.
+- STEP: Use fs_write to append a summary line to ~/Documents/notes.md.
+  * STEP: Use gemma_kg_query to confirm the new :Note node was created.
