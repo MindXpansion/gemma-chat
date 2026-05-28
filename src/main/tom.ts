@@ -85,7 +85,10 @@ export async function tomDir(): Promise<string> {
   return dir
 }
 
-function parseToM(raw: string): UserMentalModel | null {
+// Exported for unit testing — the parser is pure logic over model output,
+// and the test suite needs to exercise it against captured real outputs
+// (including out-of-enum deviation cases like Patch 68's "clarifying").
+export function parseToM(raw: string): UserMentalModel | null {
   const out: Partial<UserMentalModel> = {}
   for (const rawLine of raw.split('\n')) {
     const line = rawLine.trim()
