@@ -1,0 +1,9 @@
+name: valid-minimal
+description: minimal valid sentinel — all required fields, severity-default action.
+enabled: false
+severity: info
+query: |
+  MATCH (n) RETURN count(n) AS observed
+threshold: 0
+comparator: gte
+summary_template: "{name} observed {observed}"

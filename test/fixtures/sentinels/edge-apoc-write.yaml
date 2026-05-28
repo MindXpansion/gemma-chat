@@ -1,0 +1,10 @@
+name: apoc-bad
+description: APOC write proc must be rejected.
+enabled: true
+severity: warn
+query: |
+  CALL apoc.periodic.iterate('RETURN 1', 'RETURN 1', {}) YIELD batches
+  RETURN batches AS observed
+threshold: 1
+comparator: gte
+summary_template: never

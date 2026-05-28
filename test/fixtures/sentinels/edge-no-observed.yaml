@@ -1,0 +1,10 @@
+name: missing-observed-alias
+description: |
+  Query returns a count but doesn't alias as 'observed'. Must be rejected.
+enabled: true
+severity: info
+query: |
+  MATCH (n) RETURN count(n) AS total
+threshold: 0
+comparator: gte
+summary_template: never

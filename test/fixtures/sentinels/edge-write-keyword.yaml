@@ -1,0 +1,11 @@
+name: tries-to-write
+description: |
+  A sentinel that attempts to CREATE a node. Must be rejected by the
+  read-only guard.
+enabled: true
+severity: warn
+query: |
+  CREATE (x:Bad) RETURN 1 AS observed
+threshold: 1
+comparator: gte
+summary_template: should never load

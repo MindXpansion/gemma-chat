@@ -1,0 +1,18 @@
+name: orphan-node-rate
+description: |
+  Share of nodes in gemma-chat-memory with no relationships.
+  Spikes indicate ingestion failure (consolidate-tick wrote an :Observation
+  but failed to attach [:ABOUT] / [:PRODUCED]) or schema drift.
+enabled: true
+severity: warn
+cadence_ticks: 4
+query: |
+  MATCH (n)
+  WITH count(n) AS total,
+       count { (m) WHERE NOT (m)--() } AS orphans
+  RETURN toFloat(orphans) / total AS observed
+threshold: 0.05
+comparator: gt
+summary_template: |
+  Orphan-node ratio {observed} exceeded {threshold} — consolidate-tick attachments may be failing.
+action_on_cross: journal_appended

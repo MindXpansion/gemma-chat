@@ -1,0 +1,30 @@
+name: calibration-high-confidence-drift
+description: |
+  Of observations Gemma rated 0.8+ confidence and that are >3 days old,
+  what fraction were later superseded? A well-calibrated Gemma should have
+  <10% supersede-rate in this bucket. A spike means her high-confidence
+  writes are becoming unreliable — worth her attention next tick.
+enabled: true
+severity: critical
+cadence_ticks: 12
+query: |
+  MATCH (o:HeartbeatObservation)
+  WHERE o.confidence >= 0.8
+    AND o.created_at < datetime() - duration('P3D')
+  WITH count(*) AS total,
+       count(CASE WHEN o.superseded_at IS NOT NULL THEN 1 END) AS superseded
+  RETURN CASE
+           WHEN total < 20 THEN 0.0
+           ELSE toFloat(superseded) / total
+         END AS observed
+threshold: 0.15
+comparator: gt
+summary_template: |
+  High-confidence (>=0.8) observations show {observed} supersede-rate (threshold {threshold}). Calibration appears to be drifting upward — Gemma may be over-confident.
+action_on_cross: follow_up_enqueued
+follow_up_prompt: |
+  Sentinel calibration-high-confidence-drift fired. Investigate which topics dominate the recent supersessions of high-confidence observations. Use gemma_kg_query to run:
+    MATCH (new)-[r:SUPERSEDES]->(old:HeartbeatObservation)
+    WHERE old.confidence >= 0.8 AND r.created_at > datetime() - duration('P7D')
+    RETURN old.topic, count(*) AS revisions ORDER BY revisions DESC LIMIT 10;
+  Then propose ONE concrete adjustment — e.g. lower the prompt's confidence ceiling, or add a topic-specific dampener.

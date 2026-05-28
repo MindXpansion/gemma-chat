@@ -1,0 +1,9 @@
+name: Bad_Name_With_Capitals
+description: name must be kebab-case lowercase
+enabled: true
+severity: info
+query: |
+  MATCH (n) RETURN count(n) AS observed
+threshold: 0
+comparator: gte
+summary_template: never

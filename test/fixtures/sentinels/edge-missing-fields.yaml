@@ -1,0 +1,4 @@
+name: missing-fields
+description: missing several required fields below
+enabled: true
+severity: warn

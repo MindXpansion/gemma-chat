@@ -1,0 +1,10 @@
+name: malformed
+description: |
+  Unbalanced quoting and bad indentation below.
+enabled: true
+severity: "warn
+query: |
+  MATCH (n) RETURN count(n) AS observed
+   threshold: 5
+comparator: gt
+summary_template: nope
