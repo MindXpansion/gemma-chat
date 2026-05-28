@@ -28,16 +28,17 @@ export default defineConfig({
       // preload surface. The src/main/index.ts exclusion stands (Electron
       // app bootstrap, not unit-testable).
       exclude: ['src/**/*.d.ts', 'src/main/index.ts', 'src/renderer/**'],
-      // Floor — locks in the post-Wave-B3 gain. Per-module coverage is much
-      // higher (shared/ ~100%, scheduler 100%, env-loader 97%, observability
-      // 71%, models 88%, sentinels 94%, preload 100%) but the global number
-      // is dragged down by the still-uncovered giants (mlx.ts, heartbeat.ts,
-      // tools.ts at 0%). Wave C and beyond will lift this.
+      // Floor — locks in the post-Wave-B-merge gains. Per-module coverage:
+      //   shared/ ~100%, scheduler 100%, env-loader 97%, preload 100%,
+      //   conversation-state 100%, tom 92%, sentinels 94%, models 88%,
+      //   aios-neo4j 84%, observability 71%, mission 63%
+      // Global is dragged down by mlx.ts/heartbeat.ts/tools.ts/gemma-fs.ts
+      // (all 0-5%) — Wave C territory.
       thresholds: {
-        lines: 16,
-        functions: 22,
-        branches: 13,
-        statements: 16
+        lines: 22,
+        functions: 25,
+        branches: 16,
+        statements: 22
       }
     }
   },
