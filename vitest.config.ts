@@ -24,17 +24,20 @@ export default defineConfig({
       provider: 'v8',
       reporter: ['text', 'html', 'json-summary'],
       include: ['src/main/**/*.ts', 'src/shared/**/*.ts', 'src/preload/**/*.ts'],
-      exclude: ['src/**/*.d.ts', 'src/**/index.ts', 'src/renderer/**'],
-      // Floor — locks in the post-Wave-A gain. Per-module coverage is much
+      // Note: src/preload/index.ts IS covered (Wave B3) — it's the entire
+      // preload surface. The src/main/index.ts exclusion stands (Electron
+      // app bootstrap, not unit-testable).
+      exclude: ['src/**/*.d.ts', 'src/main/index.ts', 'src/renderer/**'],
+      // Floor — locks in the post-Wave-B3 gain. Per-module coverage is much
       // higher (shared/ ~100%, scheduler 100%, env-loader 97%, observability
-      // 71%, models 88%, sentinels 94%) but the global number is dragged
-      // down by the still-uncovered giants (mlx.ts, heartbeat.ts, tools.ts,
-      // index.ts at 0%). Wave B and beyond will lift this.
+      // 71%, models 88%, sentinels 94%, preload 100%) but the global number
+      // is dragged down by the still-uncovered giants (mlx.ts, heartbeat.ts,
+      // tools.ts at 0%). Wave C and beyond will lift this.
       thresholds: {
-        lines: 12,
-        functions: 10,
-        branches: 12,
-        statements: 12
+        lines: 16,
+        functions: 22,
+        branches: 13,
+        statements: 16
       }
     }
   },
