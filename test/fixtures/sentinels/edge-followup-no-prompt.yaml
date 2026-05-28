@@ -1,0 +1,12 @@
+name: followup-needs-prompt
+description: |
+  action_on_cross: follow_up_enqueued must have a follow_up_prompt. Missing
+  prompt should make this YAML reject.
+enabled: true
+severity: warn
+action_on_cross: follow_up_enqueued
+query: |
+  MATCH (n) RETURN count(n) AS observed
+threshold: 1
+comparator: gt
+summary_template: should never load
